@@ -1,0 +1,250 @@
+# Docker Deployment Guide für Rclone GUI
+
+## 🐋 Lokales Docker Build und Run
+
+### Build des Images
+```bash
+# Image bauen
+docker build -t rclone-gui:latest .
+
+# Mit spezifischen Tags
+docker build -t rclone-gui:v1.0.0 -t rclone-gui:latest .
+```
+
+### Lokales Ausführen
+```bash
+# Einfacher Start
+docker run -p 8080:8080 rclone-gui:latest
+
+# Mit persistentem Volume für Konfiguration
+docker run -d \
+  --name rclone-gui \
+  -p 8080:8080 \
+  -v $(pwd)/data:/app/data \
+  -e RCLONE_GUI_DEFAULT_PATH=/data \
+  rclone-gui:latest
+
+# Mit Docker Compose (siehe docker-compose.yml)
+docker-compose up -d
+```
+
+## 🚀 GitHub Container Registry (GHCR) Deployment
+
+### 1. Repository Vorbereitung
+
+Erstellen Sie diese Dateien in Ihrem GitHub Repository:
+
+#### `.github/workflows/docker-build.yml`
+```yaml
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=raw,value=latest,enable={{is_default_branch}}
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+```
+
+### 2. GitHub Repository Setup
+
+1. **Repository erstellen/klonen:**
+   ```bash
+   git clone https://github.com/IHR_USERNAME/rclone-gui.git
+   cd rclone-gui
+   ```
+
+2. **Code hochladen:**
+   ```bash
+   git add .
+   git commit -m "Initial commit with Docker support"
+   git push origin main
+   ```
+
+3. **Container Registry aktivieren:**
+   - Gehen Sie zu Ihrem GitHub Repository
+   - Settings → Actions → General
+   - Scroll zu "Workflow permissions"
+   - Wählen Sie "Read and write permissions"
+   - Aktivieren Sie "Allow GitHub Actions to create and approve pull requests"
+
+### 3. Automatisches Building
+
+Nach dem Push wird automatisch ein Docker Image erstellt und in der GitHub Container Registry veröffentlicht:
+
+- **Image URL:** `ghcr.io/IHR_USERNAME/rclone-gui:latest`
+- **Verfügbare Tags:** `latest`, `main`, Versions-Tags (z.B. `v1.0.0`)
+
+### 4. Image verwenden
+
+```bash
+# Public Image pullen und starten
+docker run -d \
+  --name rclone-gui \
+  -p 8080:8080 \
+  -v ./data:/app/data \
+  ghcr.io/IHR_USERNAME/rclone-gui:latest
+
+# Oder mit Docker Compose
+docker-compose up -d
+```
+
+## 📋 docker-compose.yml Beispiel
+
+```yaml
+version: '3.8'
+
+services:
+  rclone-gui:
+    image: ghcr.io/IHR_USERNAME/rclone-gui:latest
+    container_name: rclone-gui
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - RCLONE_GUI_DEFAULT_PATH=/data
+      - RUST_LOG=info
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+```
+
+## 🔒 Private Repository
+
+Falls Ihr Repository privat ist:
+
+```bash
+# Login zur GitHub Container Registry
+echo "IHR_GITHUB_TOKEN" | docker login ghcr.io -u IHR_USERNAME --password-stdin
+
+# Image pullen
+docker pull ghcr.io/IHR_USERNAME/rclone-gui:latest
+```
+
+## 🏷️ Releases und Versioning
+
+1. **Release erstellen:**
+   ```bash
+   git tag v1.0.0
+   git push origin v1.0.0
+   ```
+
+2. **GitHub Release erstellen:**
+   - Gehen Sie zu Releases in Ihrem Repository
+   - "Create a new release"
+   - Tag: `v1.0.0`
+   - Release title: `Version 1.0.0`
+   - Beschreibung der Änderungen
+
+3. **Automatische Docker Images:**
+   - `ghcr.io/IHR_USERNAME/rclone-gui:v1.0.0`
+   - `ghcr.io/IHR_USERNAME/rclone-gui:1.0`
+   - `ghcr.io/IHR_USERNAME/rclone-gui:latest`
+
+## 🛠️ Entwicklung mit Docker
+
+```bash
+# Development Build
+docker build -t rclone-gui:dev .
+
+# Mit Volume für Live-Entwicklung
+docker run -it \
+  -p 8080:8080 \
+  -v $(pwd):/app \
+  rclone-gui:dev
+
+# Debug Mode
+docker run -it \
+  -p 8080:8080 \
+  -e RUST_LOG=debug \
+  rclone-gui:dev
+```
+
+## 📝 Umgebungsvariablen
+
+| Variable | Standard | Beschreibung |
+|----------|----------|--------------|
+| `RCLONE_GUI_DEFAULT_PATH` | `/data` | Standard-Pfad für File Browser |
+| `RUST_LOG` | `info` | Log-Level (error, warn, info, debug, trace) |
+
+## 🔧 Troubleshooting
+
+```bash
+# Container Logs anzeigen
+docker logs rclone-gui
+
+# In Container einsteigen
+docker exec -it rclone-gui sh
+
+# Volume-Inhalte prüfen
+docker run --rm -v rclone-gui_data:/data alpine ls -la /data
+
+# Image Informationen
+docker inspect ghcr.io/IHR_USERNAME/rclone-gui:latest
+```
+
+## 🌐 Multi-Platform Support
+
+Das Docker Image wird automatisch für folgende Plattformen gebaut:
+- `linux/amd64` (Intel/AMD 64-bit)
+- `linux/arm64` (ARM 64-bit, z.B. Apple M1, Raspberry Pi 4+)
+
+## 📚 Weiterführende Links
+
+- [GitHub Container Registry Dokumentation](https://docs.github.com/en/packages/working-with-a-github-packages-registry/working-with-the-container-registry)
+- [Docker Multi-platform Builds](https://docs.docker.com/build/building/multi-platform/)
+- [GitHub Actions Docker Guide](https://docs.github.com/en/actions/publishing-packages/publishing-docker-images)

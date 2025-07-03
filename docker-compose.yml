@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  rclone-gui:
+    build: .
+    container_name: rclone-gui
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    environment:
+      - RCLONE_GUI_DEFAULT_PATH=/data
+      - RUST_LOG=info
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Alternative: Use pre-built image from GitHub Container Registry
+  # rclone-gui:
+  #   image: ghcr.io/IHR_USERNAME/rclone-gui:latest
+  #   container_name: rclone-gui
+  #   ports:
+  #     - "8080:8080"
+  #   volumes:
+  #     - ./data:/app/data
+  #     - ./logs:/app/logs
+  #   environment:
+  #     - RCLONE_GUI_DEFAULT_PATH=/data
+  #     - RUST_LOG=info
+  #   restart: unless-stopped

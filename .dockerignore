@@ -1,0 +1,37 @@
+# Git
+.git/
+.gitignore
+
+# Build artifacts
+target/
+Cargo.lock
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker files
+Dockerfile
+.dockerignore
+Docker.info
+
+# Documentation
+README.md
+*.md
+
+# Configuration (will be created at runtime)
+rclone.conf
+data/cfg/rclone.conf
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
