@@ -64,7 +64,7 @@ async fn execute_sync(job_id: String, sync_request: SyncRequest, sync_jobs: Sync
         }
     }
 
-    // Build basic rclone arguments
+    // Build basic rclone arguments with only valid flags
     let mut args = vec![
         "copy",
         "--config", config_path,
@@ -80,20 +80,25 @@ async fn execute_sync(job_id: String, sync_request: SyncRequest, sync_jobs: Sync
         "--contimeout=60s",           // 60s Verbindungs-Timeout
         "--ignore-checksum",          // Checksum-Probleme ignorieren
         "--size-only",                // Nur Größe vergleichen
-        "--multi-thread-streams=4",   // Multi-threading für große Dateien
-        "--webdav-chunk-size=8M",     // WebDAV Chunk-Größe
-        "--s3-chunk-size=8M",         // S3 Chunk-Größe
-        "--s3-upload-part-size=8M",   // S3 Upload Part-Größe
     ];
 
-    // Add chunking parameters if specified
-    let chunk_size_str;
-    let s3_chunk_str;
+    // Add multi-threading based on chunk size selection
+    let multi_thread_str;
     if let Some(chunk_size) = &sync_request.chunk_size {
-        chunk_size_str = format!("--webdav-chunk-size={}", chunk_size);
-        s3_chunk_str = format!("--s3-chunk-size={}", chunk_size);
-        args.push(&chunk_size_str);
-        args.push(&s3_chunk_str);
+        // Use chunk size to determine multi-threading level
+        let streams = match chunk_size.as_str() {
+            "8M" => "2",   // Kleinere Chunks = weniger Streams
+            "16M" => "4",  // Mittlere Chunks = mittlere Streams
+            "32M" => "6",  // Größere Chunks = mehr Streams
+            "64M" => "8",  // Sehr große Chunks = viele Streams
+            "128M" => "8", // Maximum Streams
+            _ => "4",      // Default
+        };
+        multi_thread_str = format!("--multi-thread-streams={}", streams);
+        args.push(&multi_thread_str);
+    } else {
+        // Default multi-threading
+        args.push("--multi-thread-streams=4");
     }
 
     let mut child = match Command::new("rclone")

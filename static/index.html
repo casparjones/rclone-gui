@@ -114,6 +114,20 @@
             background: #f8f9fa;
         }
 
+        .file-item.selected {
+            background: #e3f2fd;
+            border-left: 4px solid #2196f3;
+        }
+
+        .file-item.parent-folder {
+            background: #fff3e0;
+            font-weight: bold;
+        }
+
+        .file-item.parent-folder:hover {
+            background: #ffe0b2;
+        }
+
         .file-icon {
             margin-right: 10px;
             font-size: 18px;
@@ -357,30 +371,38 @@
                 </select>
             </div>
             <div class="form-group">
-                <label>Remote Path:</label>
-                <div class="breadcrumb" id="remote-breadcrumb"></div>
+                <label>Remote Navigation:</label>
+                <div style="margin-bottom: 10px;">
+                    <strong>📂 Aktueller Ordner:</strong> <span class="breadcrumb" id="remote-breadcrumb"></span>
+                </div>
+                <div style="margin: 10px 0; padding: 10px; background: #e8f5e8; border-radius: 4px; border-left: 4px solid #4caf50;">
+                    <strong>🎯 Upload-Ziel:</strong> <span id="selected-remote-path">/</span>
+                </div>
                 <div class="file-list" id="remote-file-list"></div>
+                <small style="color: #666; margin-top: 5px; display: block;">
+                    💡 <strong>Einfach-Klick:</strong> Ordner als Upload-Ziel auswählen &nbsp;•&nbsp; <strong>Doppel-Klick:</strong> In Ordner hinein navigieren
+                </small>
             </div>
             <div class="form-group">
                 <label>
                     <input type="checkbox" id="use-chunking" checked> 
-                    Chunking für große Dateien aktivieren
+                    Multi-Threading für große Dateien aktivieren
                 </label>
                 <small style="display: block; color: #666; margin-top: 5px;">
                     Empfohlen für Dateien > 100MB oder bei Upload-Problemen
                 </small>
             </div>
             <div class="form-group">
-                <label>Chunk-Größe:</label>
+                <label>Performance-Level:</label>
                 <select id="chunk-size">
-                    <option value="8M">8 MB (Standard)</option>
-                    <option value="16M">16 MB</option>
-                    <option value="32M">32 MB</option>
-                    <option value="64M">64 MB</option>
-                    <option value="128M">128 MB</option>
+                    <option value="8M">Konservativ (2 Streams)</option>
+                    <option value="16M">Standard (4 Streams)</option>
+                    <option value="32M">Aggressiv (6 Streams)</option>
+                    <option value="64M">Maximum (8 Streams)</option>
+                    <option value="128M">Ultra (8 Streams)</option>
                 </select>
                 <small style="display: block; color: #666; margin-top: 5px;">
-                    Kleinere Chunks = Stabiler, Größere Chunks = Schneller
+                    Höhere Levels = Schneller aber mehr Serverlast
                 </small>
             </div>
             <div class="form-group">

@@ -146,33 +146,8 @@ impl ConfigManager {
                     additional_fields: HashMap::new(),
                 };
 
-                // Check if password needs to be migrated (plain text to obscured)
-                if let Some(ref password) = config.password {
-                    if !password.is_empty() && !self.is_password_obscured(password) {
-                        // Migrate plain text password to obscured
-                        tracing::warn!("Migrating plain text password for config: {}", section_name);
-                        match self.obscure_password(password).await {
-                            Ok(obscured) => {
-                                config.password = Some(obscured);
-                                // Save the updated config back to file
-                                let request = ConfigRequest {
-                                    name: config.name.clone(),
-                                    config_type: config.config_type.clone(),
-                                    url: config.url.clone(),
-                                    username: config.username.clone(),
-                                    password: config.password.clone(),
-                                    additional_fields: Some(config.additional_fields.clone()),
-                                };
-                                if let Err(e) = self.save_to_file(&request).await {
-                                    tracing::error!("Failed to save migrated config: {}", e);
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to obscure password for {}: {}", section_name, e);
-                            }
-                        }
-                    }
-                }
+                // Note: Passwords are loaded as-is from the config file
+                // New passwords will be automatically obscured when saved
 
                 if let Some(section_map) = conf.get_map_ref().get(&section_name) {
                     for (key, value) in section_map.iter() {
@@ -277,13 +252,4 @@ impl ConfigManager {
         Ok(revealed.trim().to_string())
     }
 
-    /// Check if a password is already obscured by rclone
-    fn is_password_obscured(&self, password: &str) -> bool {
-        // rclone obscured passwords are typically base64-like strings
-        // This is a heuristic check - obscured passwords are usually longer
-        // and contain specific patterns
-        password.len() > 16 && 
-        password.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/' || c == '=') &&
-        !password.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_uppercase() || c.is_ascii_digit())
-    }
 }

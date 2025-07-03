@@ -89,8 +89,8 @@ The application creates/manages an `rclone.conf` file in the `data/cfg/` directo
 
 **Wichtig**: 
 - Alle rclone-Befehle verwenden automatisch den `--config data/cfg/rclone.conf` Parameter
-- Passwörter werden automatisch mit `rclone obscure` verschleiert gespeichert
-- Bestehende Klartext-Passwörter werden beim ersten Laden automatisch migriert
+- Neue Passwörter werden automatisch mit `rclone obscure` verschleiert gespeichert
+- Bestehende Konfigurationen werden nicht automatisch verändert
 
 ## Konfiguration des File Browser Start-Ordners
 
@@ -178,10 +178,11 @@ cargo test
 6. **"didn't find section in config file"**: Check that the config name matches exactly
 7. **Remote connection issues**: Verify URL, username, and password are correct
 8. **"413 Request Entity Too Large"**: 
-   - Use the built-in chunking feature for large files
-   - Try smaller chunk sizes (8MB, 16MB)
+   - Use the built-in multi-threading feature for large files
+   - Try conservative performance levels first
    - Check your cloud provider's upload limits
-9. **Upload timeouts**: Enable chunking and reduce chunk size
+9. **Upload timeouts**: Enable multi-threading with conservative settings
+10. **"unknown flag" errors**: Fixed - using only valid rclone flags
 
 ### Debug Mode
 Set `RUST_LOG=debug` environment variable for detailed logging:

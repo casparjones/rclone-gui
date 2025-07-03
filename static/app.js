@@ -1,6 +1,7 @@
 // Global variables
 let currentPath = window.DEFAULT_PATH || '/mnt/home';
 let currentRemotePath = '/';
+let selectedRemotePath = '/';  // Der aktuell ausgewählte Ordner für den Upload
 let currentSyncSource = '';
 let currentSyncJobId = '';
 let configs = [];
@@ -208,16 +209,16 @@ function suggestChunkSize(sourcePath) {
     // This is a simple heuristic - in a real implementation,
     // you might want to check actual file sizes
     const fileName = sourcePath.split('/').pop().toLowerCase();
-    const chunkSizeSelect = document.getElementById('chunk-size');
+    const performanceSelect = document.getElementById('chunk-size');
     
     if (fileName.includes('video') || fileName.includes('.mp4') || fileName.includes('.avi') || fileName.includes('.mkv')) {
-        chunkSizeSelect.value = '32M';
-        showAlert('sync-alert', 'Video-Datei erkannt: 32MB Chunks empfohlen', 'success');
+        performanceSelect.value = '32M';
+        showAlert('sync-alert', 'Video-Datei erkannt: Aggressives Multi-Threading empfohlen', 'success');
     } else if (fileName.includes('iso') || fileName.includes('.zip') || fileName.includes('.tar')) {
-        chunkSizeSelect.value = '64M';
-        showAlert('sync-alert', 'Große Archiv-Datei erkannt: 64MB Chunks empfohlen', 'success');
+        performanceSelect.value = '64M';
+        showAlert('sync-alert', 'Große Archiv-Datei erkannt: Maximum Performance empfohlen', 'success');
     } else {
-        chunkSizeSelect.value = '8M';
+        performanceSelect.value = '16M';
     }
 }
 
@@ -225,6 +226,13 @@ function closeSyncModal() {
     document.getElementById('sync-modal').style.display = 'none';
     currentSyncSource = '';
     currentRemotePath = '/';
+    selectedRemotePath = '/';
+    document.getElementById('selected-remote-path').textContent = '/';
+    
+    // Alle Auswahlen entfernen
+    document.querySelectorAll('#remote-file-list .file-item').forEach(item => {
+        item.classList.remove('selected');
+    });
 }
 
 function updateRemoteSelect() {
@@ -247,6 +255,10 @@ async function loadRemoteFiles(remotePath = '/') {
     
     currentRemotePath = remotePath;
     
+    // Wenn wir in einen neuen Ordner navigieren, setze ihn auch als ausgewählt
+    selectedRemotePath = remotePath;
+    document.getElementById('selected-remote-path').textContent = remotePath;
+    
     try {
         const response = await fetch(`/api/files/remote?remote=${remoteName}&path=${encodeURIComponent(remotePath)}`);
         const result = await response.json();
@@ -265,17 +277,39 @@ async function loadRemoteFiles(remotePath = '/') {
 function displayRemoteFiles(files) {
     const remoteFileList = document.getElementById('remote-file-list');
     
-    if (files.length === 0) {
-        remoteFileList.innerHTML = '<p>No files found.</p>';
-        return;
+    // Filter nur Ordner
+    const folders = files.filter(file => file.is_dir);
+    
+    let html = '';
+    
+    // Parent-Ordner (..) hinzufügen, wenn nicht im Root
+    if (currentRemotePath !== '/') {
+        const parentPath = getParentPath(currentRemotePath);
+        html += `
+            <div class="file-item parent-folder" 
+                 onclick="selectRemoteFolder('${parentPath}')" 
+                 ondblclick="loadRemoteFiles('${parentPath}')">
+                <div class="file-icon">⬆️</div>
+                <div class="file-name">.. (zurück zu ${parentPath === '/' ? 'Root' : parentPath.split('/').pop()})</div>
+            </div>
+        `;
     }
     
-    remoteFileList.innerHTML = files.map(file => `
-        <div class="file-item" ${file.is_dir ? `onclick="loadRemoteFiles('${file.path}')"` : ''}>
-            <div class="file-icon">${file.is_dir ? '📁' : '📄'}</div>
-            <div class="file-name">${file.name}</div>
+    // Ordner hinzufügen
+    html += folders.map(folder => `
+        <div class="file-item" 
+             onclick="selectRemoteFolder('${folder.path}')" 
+             ondblclick="loadRemoteFiles('${folder.path}')">
+            <div class="file-icon">📁</div>
+            <div class="file-name">${folder.name}</div>
         </div>
     `).join('');
+    
+    if (folders.length === 0 && currentRemotePath === '/') {
+        html = '<p>Keine Ordner gefunden.</p>';
+    }
+    
+    remoteFileList.innerHTML = html;
 }
 
 function updateRemoteBreadcrumb(path) {
@@ -293,6 +327,37 @@ function updateRemoteBreadcrumb(path) {
     remoteBreadcrumb.innerHTML = breadcrumbHTML;
 }
 
+function selectRemoteFolder(folderPath) {
+    // Vorherige Auswahl entfernen
+    document.querySelectorAll('#remote-file-list .file-item').forEach(item => {
+        item.classList.remove('selected');
+    });
+    
+    // Aktuelle Auswahl markieren
+    event.target.closest('.file-item').classList.add('selected');
+    
+    // Ausgewählten Pfad aktualisieren
+    selectedRemotePath = folderPath;
+    document.getElementById('selected-remote-path').textContent = folderPath;
+}
+
+function getParentPath(path) {
+    if (path === '/' || path === '') {
+        return '/';
+    }
+    
+    // Entferne trailing slash falls vorhanden
+    path = path.replace(/\/$/, '');
+    
+    // Finde das letzte '/' und schneide alles danach ab
+    const lastSlash = path.lastIndexOf('/');
+    if (lastSlash <= 0) {
+        return '/';
+    }
+    
+    return path.substring(0, lastSlash);
+}
+
 async function startSync() {
     const remoteName = document.getElementById('sync-remote').value;
     
@@ -301,15 +366,15 @@ async function startSync() {
         return;
     }
     
-    const useChunking = document.getElementById('use-chunking').checked;
-    const chunkSize = document.getElementById('chunk-size').value;
+    const useMultiThreading = document.getElementById('use-chunking').checked;
+    const performanceLevel = document.getElementById('chunk-size').value;
     
     const syncRequest = {
         source_path: currentSyncSource,
         remote_name: remoteName,
-        remote_path: currentRemotePath,
-        use_chunking: useChunking,
-        chunk_size: useChunking ? chunkSize : null
+        remote_path: selectedRemotePath,  // Verwende den ausgewählten Pfad
+        use_chunking: useMultiThreading,
+        chunk_size: useMultiThreading ? performanceLevel : null
     };
     
     try {
