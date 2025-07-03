@@ -28,7 +28,6 @@ README.md
 # Configuration (will be created at runtime)
 rclone.conf
 data/cfg/rclone.conf
-.env
 
 # Logs
 *.log
