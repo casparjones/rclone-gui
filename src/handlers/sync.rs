@@ -5,7 +5,7 @@ use tokio::sync::Mutex;
 use tokio::process::Command;
 use tokio::fs;
 use uuid::Uuid;
-use chrono;
+use chrono::{self, Utc};
 use tracing::{info, warn, error, debug};
 use serde_json;
 use crate::models::{ApiResponse, SyncRequest, SyncProgress};
@@ -47,12 +47,17 @@ pub async fn start_sync(Json(sync_request): Json<SyncRequest>) -> ResponseJson<A
     info!("   Source: {}", sync_request.source_path);
     info!("   Remote: {}:{}", sync_request.remote_name, sync_request.remote_path);
 
+    let source_name = sync_request.source_path.split('/').last().unwrap_or(&sync_request.source_path).to_string();
+    let start_time = Utc::now().timestamp();
+    
     let progress = SyncProgress {
         id: job_id.clone(),
         progress: 0.0,
         status: "Starting".to_string(),
         transferred: 0,
         total: 0,
+        source_name,
+        start_time,
     };
 
     {

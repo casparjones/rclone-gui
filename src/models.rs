@@ -36,6 +36,8 @@ pub struct SyncProgress {
     pub status: String,
     pub transferred: u64,
     pub total: u64,
+    pub source_name: String,
+    pub start_time: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

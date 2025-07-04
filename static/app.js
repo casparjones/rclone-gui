@@ -728,6 +728,18 @@ function displaySyncJobs(jobs) {
                            job.status === 'Failed' ? 'badge-error' : 
                            job.status === 'Running' ? 'badge-warning' : 'badge-info';
         
+        // Calculate elapsed time
+        const elapsedSeconds = Math.floor(Date.now() / 1000) - job.start_time;
+        const elapsedTime = formatDuration(elapsedSeconds);
+        
+        // Calculate estimated remaining time
+        let estimatedTimeRemaining = '';
+        if (job.status === 'Running' && job.progress > 0) {
+            const totalEstimatedSeconds = (elapsedSeconds / job.progress) * 100;
+            const remainingSeconds = Math.max(0, totalEstimatedSeconds - elapsedSeconds);
+            estimatedTimeRemaining = formatDuration(Math.floor(remainingSeconds));
+        }
+        
         // Add action buttons for completed/failed jobs
         const isCompleted = job.status === 'Completed' || job.status === 'Failed' || job.status.includes('Error');
         const actionButtons = isCompleted ? `
@@ -752,10 +764,10 @@ function displaySyncJobs(jobs) {
                 <div class="card-body py-4 px-5">
                     <div class="flex items-center justify-between mb-3">
                         <div>
-                            <div class="font-semibold text-lg">Job ID: ${job.id.substring(0, 8)}...</div>
+                            <div class="font-semibold text-lg">${job.source_name || 'Unknown'}</div>
                             <div class="flex items-center space-x-2 mt-1">
                                 <span class="badge ${statusColor}">${job.status}</span>
-                                <span class="text-sm text-base-content/70">${job.progress.toFixed(1)}%</span>
+                                <span class="text-sm text-base-content/70">ID: ${job.id.substring(0, 8)}...</span>
                             </div>
                         </div>
                         <div class="text-right">
@@ -771,6 +783,11 @@ function displaySyncJobs(jobs) {
                     <div class="flex justify-between text-sm text-base-content/70 mt-2">
                         <span>Transferred: ${formatBytes(job.transferred)}</span>
                         <span>Total: ${formatBytes(job.total)}</span>
+                    </div>
+                    
+                    <div class="flex justify-between text-sm text-base-content/70 mt-1">
+                        <span>Elapsed: ${elapsedTime}</span>
+                        <span>${estimatedTimeRemaining ? 'Remaining: ' + estimatedTimeRemaining : ''}</span>
                     </div>
                     
                     ${actionButtons}
@@ -837,6 +854,20 @@ function formatBytes(bytes) {
         return Math.round(bytes / Math.pow(k, i)) + ' ' + sizes[i];
     } else {
         return parseFloat((bytes / Math.pow(k, i)).toFixed(0)) + ' ' + sizes[i];
+    }
+}
+
+function formatDuration(seconds) {
+    if (seconds < 60) {
+        return `${seconds}s`;
+    } else if (seconds < 3600) {
+        const minutes = Math.floor(seconds / 60);
+        const remainingSeconds = seconds % 60;
+        return remainingSeconds > 0 ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
+    } else {
+        const hours = Math.floor(seconds / 3600);
+        const minutes = Math.floor((seconds % 3600) / 60);
+        return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
     }
 }
 
