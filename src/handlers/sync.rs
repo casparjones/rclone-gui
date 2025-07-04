@@ -205,23 +205,40 @@ async fn execute_sync(job_id: String, sync_request: SyncRequest, sync_jobs: Sync
             "128M" => "8",
             _ => "4",
         };
+        
+        // Limit WebDAV chunk size to max 100M to avoid 413 errors
+        let webdav_chunk = match chunk_size.as_str() {
+            "8M" => "8M",
+            "16M" => "16M", 
+            "32M" => "32M",
+            "64M" => "64M",
+            "128M" => "100M",  // Cap at 100M for WebDAV safety
+            _ => "50M",
+        };
+        
         multi_thread_streams_str = format!("--multi-thread-streams={}", streams);
         multi_thread_cutoff_str = format!("--multi-thread-cutoff={}", chunk_size);
-        webdav_chunk_size_str = format!("--webdav-nextcloud-chunk-size={}", chunk_size);
+        webdav_chunk_size_str = format!("--webdav-nextcloud-chunk-size={}", webdav_chunk);
+        
+        // Log the actual parameter values being set
+        info!("🔧 Setting rclone parameters:");
+        info!("   multi_thread_streams_str: {}", multi_thread_streams_str);
+        info!("   multi_thread_cutoff_str: {}", multi_thread_cutoff_str);
+        info!("   webdav_chunk_size_str: {}", webdav_chunk_size_str);
         
         args.push(&multi_thread_streams_str);
         args.push(&multi_thread_cutoff_str);
         args.push(&webdav_chunk_size_str);
         
-        info!("🔧 Using chunk size: {} (streams: {}, webdav-chunk: {})", 
-            chunk_size, streams, chunk_size);
+        info!("🔧 Using chunk size: {} (streams: {}, multi-thread-cutoff: {}, webdav-chunk: {})", 
+            chunk_size, streams, chunk_size, webdav_chunk);
     } else {
         // Default settings
         args.push("--multi-thread-streams=4");
         args.push("--multi-thread-cutoff=250M");
-        args.push("--webdav-nextcloud-chunk-size=100M");
+        args.push("--webdav-nextcloud-chunk-size=50M");
         
-        info!("🔧 Using default settings (streams: 4, cutoff: 250M, webdav-chunk: 100M)");
+        info!("🔧 Using default settings (streams: 4, cutoff: 250M, webdav-chunk: 50M)");
     }
 
     // Print the full rclone command being executed (debug only)

@@ -87,7 +87,17 @@ impl ConfigManager {
         let mut conf = Ini::new();
 
         for (_, config) in configs.iter() {
-            conf.set(&config.name, "type", Some(config.config_type.clone()));
+            // Handle WebDAV subtypes and set appropriate type and vendor
+            let (actual_type, vendor) = match config.config_type.as_str() {
+                "webdav-nextcloud" => ("webdav", Some("nextcloud")),
+                "webdav-owncloud" => ("webdav", Some("owncloud")),
+                "webdav-sharepoint" => ("webdav", Some("sharepoint")),
+                "webdav-fastmail" => ("webdav", Some("fastmail")),
+                "webdav-other" => ("webdav", Some("other")),
+                _ => (config.config_type.as_str(), None),
+            };
+
+            conf.set(&config.name, "type", Some(actual_type.to_string()));
 
             if let Some(url) = &config.url {
                 conf.set(&config.name, "url", Some(url.clone()));
@@ -103,6 +113,11 @@ impl ConfigManager {
                     // when they were saved initially
                     conf.set(&config.name, "pass", Some(password.clone()));
                 }
+            }
+
+            // Set vendor for WebDAV configurations
+            if let Some(vendor_value) = vendor {
+                conf.set(&config.name, "vendor", Some(vendor_value.to_string()));
             }
 
             for (key, value) in &config.additional_fields {
@@ -137,9 +152,12 @@ impl ConfigManager {
         let mut configs = Vec::new();
 
         for section_name in conf.sections() {
+                let rclone_type = conf.get(&section_name, "type").unwrap_or("".to_string());
+                let vendor = conf.get(&section_name, "vendor");
+                
                 let mut config = RcloneConfig {
                     name: section_name.to_string(),
-                    config_type: conf.get(&section_name, "type").unwrap_or("".to_string()),
+                    config_type: Self::get_ui_config_type(&rclone_type, vendor.as_deref()),
                     url: conf.get(&section_name, "url"),
                     username: conf.get(&section_name, "user"),
                     password: conf.get(&section_name, "pass"),
@@ -151,7 +169,7 @@ impl ConfigManager {
 
                 if let Some(section_map) = conf.get_map_ref().get(&section_name) {
                     for (key, value) in section_map.iter() {
-                        if !matches!(key.as_str(), "type" | "url" | "user" | "pass") {
+                        if !matches!(key.as_str(), "type" | "url" | "user" | "pass" | "vendor") {
                             if let Some(value) = value {
                                 config.additional_fields.insert(key.to_string(), value.to_string());
                             }
@@ -163,6 +181,19 @@ impl ConfigManager {
         }
 
         Ok(configs)
+    }
+
+    /// Helper function to map rclone type and vendor back to UI subtype
+    fn get_ui_config_type(rclone_type: &str, vendor: Option<&str>) -> String {
+        match (rclone_type, vendor) {
+            ("webdav", Some("nextcloud")) => "webdav-nextcloud".to_string(),
+            ("webdav", Some("owncloud")) => "webdav-owncloud".to_string(),
+            ("webdav", Some("sharepoint")) => "webdav-sharepoint".to_string(),
+            ("webdav", Some("fastmail")) => "webdav-fastmail".to_string(),
+            ("webdav", Some("other")) => "webdav-other".to_string(),
+            ("webdav", _) => "webdav-other".to_string(), // fallback for webdav without vendor
+            (other_type, _) => other_type.to_string(),
+        }
     }
 
     async fn save_to_file(&self, config_request: &ConfigRequest) -> anyhow::Result<()> {
@@ -179,7 +210,17 @@ impl ConfigManager {
             conf.load(config_path).map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
         }
 
-        conf.set(&config_request.name, "type", Some(config_request.config_type.clone()));
+        // Handle WebDAV subtypes and set appropriate type and vendor
+        let (actual_type, vendor) = match config_request.config_type.as_str() {
+            "webdav-nextcloud" => ("webdav", Some("nextcloud")),
+            "webdav-owncloud" => ("webdav", Some("owncloud")),
+            "webdav-sharepoint" => ("webdav", Some("sharepoint")),
+            "webdav-fastmail" => ("webdav", Some("fastmail")),
+            "webdav-other" => ("webdav", Some("other")),
+            _ => (config_request.config_type.as_str(), None),
+        };
+
+        conf.set(&config_request.name, "type", Some(actual_type.to_string()));
 
         if let Some(url) = &config_request.url {
             conf.set(&config_request.name, "url", Some(url.clone()));
@@ -194,6 +235,11 @@ impl ConfigManager {
                 // Password should already be obscured when passed to this method
                 conf.set(&config_request.name, "pass", Some(password.clone()));
             }
+        }
+
+        // Set vendor for WebDAV configurations
+        if let Some(vendor_value) = vendor {
+            conf.set(&config_request.name, "vendor", Some(vendor_value.to_string()));
         }
 
         if let Some(additional_fields) = &config_request.additional_fields {
