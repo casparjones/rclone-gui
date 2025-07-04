@@ -297,15 +297,18 @@
                 <div class="form-control">
                     <label class="label">
                         <span class="label-text font-semibold">Performance Level</span>
-                        <span class="label-text-alt">Higher = Faster but more server load</span>
+                        <span class="label-text-alt">Sets chunk size for WebDAV + multi-threading</span>
                     </label>
                     <select id="chunk-size" class="select select-bordered w-full">
-                        <option value="8M">🐢 Conservative (2 Streams)</option>
-                        <option value="16M" selected>⚡ Standard (4 Streams)</option>
-                        <option value="32M">🚀 Aggressive (6 Streams)</option>
-                        <option value="64M">💨 Maximum (8 Streams)</option>
-                        <option value="128M">🔥 Ultra (8 Streams)</option>
+                        <option value="8M">🐢 Conservative (2 Streams, 8M chunks)</option>
+                        <option value="16M" selected>⚡ Standard (4 Streams, 16M chunks)</option>
+                        <option value="32M">🚀 Aggressive (6 Streams, 32M chunks)</option>
+                        <option value="64M">💨 Maximum (8 Streams, 64M chunks)</option>
+                        <option value="128M">🔥 Ultra (8 Streams, 128M chunks)</option>
                     </select>
+                    <div class="text-sm text-base-content/70 mt-1">
+                        💡 Optimized for Nextcloud WebDAV uploads with chunked transfer
+                    </div>
                 </div>
             </div>
             
