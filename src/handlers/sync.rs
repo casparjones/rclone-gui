@@ -370,38 +370,7 @@ fn parse_json_stats(json: &serde_json::Value) -> Option<(f64, u64, u64)> {
     // rclone JSON stats structure with --stats-log-level NOTICE
     // Use the correct fields for accurate progress tracking
     
-    // Check for direct stats fields in the JSON object
-    if let (Some(transferred), Some(total_size)) = (
-        json.get("bytes").and_then(|v| v.as_u64()),
-        json.get("totalBytes").and_then(|v| v.as_u64())
-    ) {
-        // Check transfer completion status
-        let transfers_completed = json.get("transfers").and_then(|v| v.as_u64()).unwrap_or(0);
-        let transferring_list = json.get("transferring").and_then(|v| v.as_array());
-        let is_transferring = transferring_list.map_or(false, |arr| !arr.is_empty());
-        
-        // Calculate accurate percentage
-        let percent = if total_size > 0 {
-            if transferred == total_size && transfers_completed >= 1 && !is_transferring {
-                // Transfer is definitely complete
-                100.0
-            } else {
-                // Calculate based on bytes transferred
-                (transferred as f64 / total_size as f64) * 100.0
-            }
-        } else {
-            0.0
-        };
-        
-        debug!(
-            "📊 JSON stats: bytes={}, totalBytes={}, transfers={}, transferring={}, percent={:.1}%",
-            transferred, total_size, transfers_completed, is_transferring, percent
-        );
-        
-        return Some((percent, transferred, total_size));
-    }
-    
-    // Check for nested stats object
+    // First check for nested stats object (most common location)
     if let Some(stats) = json.get("stats") {
         if let (Some(transferred), Some(total_size)) = (
             stats.get("bytes").and_then(|v| v.as_u64()),
@@ -427,7 +396,40 @@ fn parse_json_stats(json: &serde_json::Value) -> Option<(f64, u64, u64)> {
             );
             
             return Some((percent, transferred, total_size));
+        } else {
+            debug!("⚠️ Stats object found but missing bytes/totalBytes fields");
         }
+    }
+    
+    // Fallback: Check for direct stats fields in the JSON object
+    if let (Some(transferred), Some(total_size)) = (
+        json.get("bytes").and_then(|v| v.as_u64()),
+        json.get("totalBytes").and_then(|v| v.as_u64())
+    ) {
+        // Check transfer completion status
+        let transfers_completed = json.get("transfers").and_then(|v| v.as_u64()).unwrap_or(0);
+        let transferring_list = json.get("transferring").and_then(|v| v.as_array());
+        let is_transferring = transferring_list.map_or(false, |arr| !arr.is_empty());
+        
+        // Calculate accurate percentage
+        let percent = if total_size > 0 {
+            if transferred == total_size && transfers_completed >= 1 && !is_transferring {
+                // Transfer is definitely complete
+                100.0
+            } else {
+                // Calculate based on bytes transferred
+                (transferred as f64 / total_size as f64) * 100.0
+            }
+        } else {
+            0.0
+        };
+        
+        debug!(
+            "📊 Direct JSON stats: bytes={}, totalBytes={}, transfers={}, transferring={}, percent={:.1}%",
+            transferred, total_size, transfers_completed, is_transferring, percent
+        );
+        
+        return Some((percent, transferred, total_size));
     }
     
     // Check for alternative field names (rclone variations)
