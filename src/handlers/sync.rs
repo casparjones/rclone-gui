@@ -16,6 +16,30 @@ lazy_static::lazy_static! {
     static ref SYNC_JOBS: SyncJobs = Arc::new(Mutex::new(HashMap::new()));
 }
 
+/// Ensure the log directory exists and create a new log file with an initial entry
+async fn create_initial_log(job_id: &str, sync_request: &SyncRequest) -> tokio::io::Result<()> {
+    fs::create_dir_all("data/log").await?;
+
+    let remote_target = format!("{}:{}", sync_request.remote_name, sync_request.remote_path);
+    let log_file_path = format!("data/log/{}.log", job_id);
+    let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+
+    let initial_log = format!(
+        "[{}] Job {} started\n[{}] Source: {}\n[{}] Remote: {}\n[{}] Target: {}\n[{}] Starting rclone operation...\n\n",
+        timestamp,
+        job_id,
+        timestamp,
+        sync_request.source_path,
+        timestamp,
+        sync_request.remote_name,
+        timestamp,
+        remote_target,
+        timestamp
+    );
+
+    fs::write(&log_file_path, initial_log).await
+}
+
 pub async fn start_sync(Json(sync_request): Json<SyncRequest>) -> ResponseJson<ApiResponse<String>> {
     let job_id = Uuid::new_v4().to_string();
     
@@ -26,10 +50,15 @@ pub async fn start_sync(Json(sync_request): Json<SyncRequest>) -> ResponseJson<A
         transferred: 0,
         total: 0,
     };
-    
+
     {
         let mut jobs = SYNC_JOBS.lock().await;
         jobs.insert(job_id.clone(), progress);
+    }
+
+    // Immediately create the log file so it is visible in the UI
+    if let Err(e) = create_initial_log(&job_id, &sync_request).await {
+        eprintln!("Failed to create initial log for {}: {}", job_id, e);
     }
 
     let job_id_clone = job_id.clone();
@@ -108,31 +137,12 @@ async fn execute_sync(job_id: String, sync_request: SyncRequest, sync_jobs: Sync
     let remote_target = format!("{}:{}", sync_request.remote_name, sync_request.remote_path);
     let config_path = "data/cfg/rclone.conf";
     
-    // Ensure log directory exists
-    if let Err(e) = fs::create_dir_all("data/log").await {
-        eprintln!("Failed to create log directory: {}", e);
-    }
-    
     let log_file_path = format!("data/log/{}.log", job_id);
-    
-    // Create initial log entry with timestamp
-    let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
-    let initial_log = format!(
-        "[{}] Job {} started\n[{}] Source: {}\n[{}] Remote: {}\n[{}] Target: {}\n[{}] Starting rclone operation...\n\n",
-        timestamp,
-        job_id,
-        timestamp,
-        sync_request.source_path,
-        timestamp,
-        sync_request.remote_name,
-        timestamp,
-        remote_target,
-        timestamp
-    );
-    
-    // Write initial log entry
-    if let Err(e) = fs::write(&log_file_path, &initial_log).await {
-        eprintln!("Failed to create initial log file: {}", e);
+
+    // Ensure log directory and initial log exist in case start_sync didn't
+    // manage to create them (e.g. on crash)
+    if let Err(e) = create_initial_log(&job_id, &sync_request).await {
+        eprintln!("Failed to ensure initial log: {}", e);
     }
     
     {
