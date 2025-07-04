@@ -36,6 +36,9 @@ async fn main() {
     // Load environment variables with detailed feedback
     load_environment_config();
     
+    // Clean up any leftover log files from previous runs
+    cleanup_orphaned_log_files().await;
+    
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
@@ -59,8 +62,12 @@ async fn main() {
         .route("/api/files/local", get(handlers::files::list_local_files))
         .route("/api/files/remote", get(handlers::files::list_remote_files))
         .route("/api/sync", post(handlers::sync::start_sync))
-        .route("/api/sync/:job_id", get(get_sync_progress_handler))
         .route("/api/sync", get(handlers::sync::list_sync_jobs))
+        .route("/api/sync-log/:job_id", get(get_sync_log_handler))
+        .route("/api/sync-delete/:job_id", delete(delete_sync_job_handler))
+        .route("/api/sync/:job_id/log", get(get_sync_log_handler))
+        .route("/api/sync/:job_id", get(get_sync_progress_handler))
+        .route("/api/sync/:job_id", delete(delete_sync_job_handler))
         .nest_service("/static", ServeDir::new("static"))
         .layer(Extension(config_manager))
         .layer(
@@ -84,6 +91,14 @@ async fn delete_config_handler(
 
 async fn get_sync_progress_handler(Path(job_id): Path<String>) -> axum::response::Json<models::ApiResponse<models::SyncProgress>> {
     handlers::sync::get_sync_progress(job_id).await
+}
+
+async fn get_sync_log_handler(Path(job_id): Path<String>) -> axum::response::Json<models::ApiResponse<String>> {
+    handlers::sync::get_sync_log(job_id).await
+}
+
+async fn delete_sync_job_handler(Path(job_id): Path<String>) -> axum::response::Json<models::ApiResponse<String>> {
+    handlers::sync::delete_sync_job(job_id).await
 }
 
 async fn get_config_for_edit_handler(
@@ -169,4 +184,48 @@ fn load_environment_config() {
     }
     
     println!("");
+}
+
+/// Clean up any orphaned log files from previous application runs
+async fn cleanup_orphaned_log_files() {
+    use tokio::fs;
+    
+    let log_dir = "data/log";
+    
+    // Create log directory if it doesn't exist
+    if let Err(e) = fs::create_dir_all(log_dir).await {
+        eprintln!("Warning: Could not create log directory: {}", e);
+        return;
+    }
+    
+    match fs::read_dir(log_dir).await {
+        Ok(mut entries) => {
+            let mut removed_count = 0;
+            
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let path = entry.path();
+                
+                // Only remove .log files, keep .gitkeep and other files
+                if let Some(extension) = path.extension() {
+                    if extension == "log" {
+                        if let Err(e) = fs::remove_file(&path).await {
+                            eprintln!("Warning: Could not remove orphaned log file {:?}: {}", path, e);
+                        } else {
+                            removed_count += 1;
+                            println!("🧹 Removed orphaned log file: {:?}", path.file_name().unwrap_or_default());
+                        }
+                    }
+                }
+            }
+            
+            if removed_count > 0 {
+                println!("🗑️  Cleaned up {} orphaned log files from previous runs", removed_count);
+            } else {
+                println!("✅ No orphaned log files found");
+            }
+        }
+        Err(e) => {
+            eprintln!("Warning: Could not read log directory: {}", e);
+        }
+    }
 }

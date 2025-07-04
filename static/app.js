@@ -167,6 +167,14 @@ async function deleteConfig(name) {
         const result = await response.json();
         
         if (result.success) {
+            // Clear cache for deleted remote
+            clearRemoteCache(name);
+            
+            // Clear last selected remote if it was this one
+            if (getLastSelectedRemote() === name) {
+                clearLastSelectedRemote();
+            }
+            
             showAlert('config-alert', 'Configuration deleted successfully!', 'success');
             loadConfigs();
         } else {
@@ -301,6 +309,93 @@ function updateRemoteSelect() {
         option.textContent = config.name;
         remoteSelect.appendChild(option);
     });
+    
+    // Auto-select logic
+    if (configs.length === 1) {
+        // Only one remote - auto-select it
+        remoteSelect.value = configs[0].name;
+        saveLastSelectedRemote(configs[0].name);
+        loadRemoteFiles('/'); // Load root folder immediately
+    } else if (configs.length > 1) {
+        // Multiple remotes - try to restore last selected
+        const lastRemote = getLastSelectedRemote();
+        if (lastRemote && configs.some(config => config.name === lastRemote)) {
+            remoteSelect.value = lastRemote;
+            loadRemoteFiles('/'); // Load root folder for restored remote
+        }
+    }
+}
+
+function saveLastSelectedRemote(remoteName) {
+    localStorage.setItem('rclone-gui-last-remote', remoteName);
+}
+
+function getLastSelectedRemote() {
+    return localStorage.getItem('rclone-gui-last-remote');
+}
+
+function clearLastSelectedRemote() {
+    localStorage.removeItem('rclone-gui-last-remote');
+}
+
+function onRemoteSelectChange() {
+    const remoteName = document.getElementById('sync-remote').value;
+    if (remoteName) {
+        saveLastSelectedRemote(remoteName);
+        loadRemoteFiles('/'); // Reset to root when changing remote
+    }
+}
+
+// Cache management for remote folders
+function getCacheKey(remoteName, remotePath) {
+    return `rclone-cache-${remoteName}-${remotePath}`;
+}
+
+function saveRemoteFolderCache(remoteName, remotePath, folders) {
+    const cacheKey = getCacheKey(remoteName, remotePath);
+    const cacheData = {
+        folders: folders,
+        timestamp: Date.now(),
+        remoteName: remoteName,
+        remotePath: remotePath
+    };
+    localStorage.setItem(cacheKey, JSON.stringify(cacheData));
+}
+
+function getRemoteFolderCache(remoteName, remotePath) {
+    const cacheKey = getCacheKey(remoteName, remotePath);
+    const cached = localStorage.getItem(cacheKey);
+    
+    if (!cached) return null;
+    
+    try {
+        const cacheData = JSON.parse(cached);
+        const cacheAge = Date.now() - cacheData.timestamp;
+        
+        // Cache is valid for 5 minutes (300000 ms)
+        if (cacheAge < 300000) {
+            return cacheData.folders;
+        } else {
+            // Remove expired cache
+            localStorage.removeItem(cacheKey);
+            return null;
+        }
+    } catch (e) {
+        // Invalid cache data, remove it
+        localStorage.removeItem(cacheKey);
+        return null;
+    }
+}
+
+function clearRemoteCache(remoteName = null) {
+    const keys = Object.keys(localStorage);
+    keys.forEach(key => {
+        if (key.startsWith('rclone-cache-')) {
+            if (!remoteName || key.startsWith(`rclone-cache-${remoteName}-`)) {
+                localStorage.removeItem(key);
+            }
+        }
+    });
 }
 
 async function loadRemoteFiles(remotePath = '/') {
@@ -315,26 +410,89 @@ async function loadRemoteFiles(remotePath = '/') {
     selectedRemotePath = remotePath;
     document.getElementById('selected-remote-path').textContent = remotePath;
     
+    // Check cache first
+    const cachedFolders = getRemoteFolderCache(remoteName, remotePath);
+    
+    if (cachedFolders) {
+        // Show cached data immediately
+        displayRemoteFiles(cachedFolders);
+        updateRemoteBreadcrumb(remotePath);
+        
+        // Still fetch fresh data in background to update cache
+        loadRemoteFilesInBackground(remoteName, remotePath);
+    } else {
+        // No cache - show loading spinner and fetch data
+        showRemoteLoadingSpinner();
+        await loadRemoteFilesFromServer(remoteName, remotePath);
+    }
+}
+
+async function loadRemoteFilesFromServer(remoteName, remotePath) {
     try {
         const response = await fetch(`/api/files/remote?remote=${remoteName}&path=${encodeURIComponent(remotePath)}`);
         const result = await response.json();
         
         if (result.success) {
-            displayRemoteFiles(result.data);
+            // Filter only directories for our use case
+            const folders = result.data.filter(file => file.is_dir);
+            
+            // Save to cache
+            saveRemoteFolderCache(remoteName, remotePath, folders);
+            
+            // Display the folders
+            displayRemoteFiles(folders);
             updateRemoteBreadcrumb(remotePath);
         } else {
             showAlert('sync-alert', 'Error loading remote files: ' + result.error, 'error');
+            hideRemoteLoadingSpinner();
         }
     } catch (error) {
         showAlert('sync-alert', 'Error loading remote files: ' + error.message, 'error');
+        hideRemoteLoadingSpinner();
     }
+}
+
+async function loadRemoteFilesInBackground(remoteName, remotePath) {
+    try {
+        const response = await fetch(`/api/files/remote?remote=${remoteName}&path=${encodeURIComponent(remotePath)}`);
+        const result = await response.json();
+        
+        if (result.success) {
+            const folders = result.data.filter(file => file.is_dir);
+            
+            // Update cache with fresh data
+            saveRemoteFolderCache(remoteName, remotePath, folders);
+            
+            // Update display if user is still on the same path
+            if (currentRemotePath === remotePath && document.getElementById('sync-remote').value === remoteName) {
+                displayRemoteFiles(folders);
+            }
+        }
+    } catch (error) {
+        // Silent fail for background updates
+        console.warn('Background folder refresh failed:', error);
+    }
+}
+
+function showRemoteLoadingSpinner() {
+    const remoteFileList = document.getElementById('remote-file-list');
+    remoteFileList.innerHTML = `
+        <div class="flex items-center justify-center py-8">
+            <span class="loading loading-spinner loading-md mr-2"></span>
+            <span class="text-base-content/70">Loading folders...</span>
+        </div>
+    `;
+}
+
+function hideRemoteLoadingSpinner() {
+    // This is called implicitly when displayRemoteFiles() updates the innerHTML
 }
 
 function displayRemoteFiles(files) {
     const remoteFileList = document.getElementById('remote-file-list');
     
-    // Filter nur Ordner
-    const folders = files.filter(file => file.is_dir);
+    // Filter nur Ordner (falls noch nicht gefiltert)
+    const folders = Array.isArray(files) ? files.filter(file => file.is_dir || !file.hasOwnProperty('is_dir')) : files;
     
     let html = '';
     
@@ -471,12 +629,38 @@ async function startSync() {
 }
 
 function openProgressModal() {
+    // Reset icon to spinning state
+    setProgressModalIcon('loading');
     document.getElementById('progress-modal').showModal();
 }
 
 function closeProgressModal() {
     document.getElementById('progress-modal').close();
     currentSyncJobId = '';
+}
+
+function setProgressModalIcon(state) {
+    const iconContainer = document.getElementById('upload-progress-icon');
+    
+    if (state === 'loading') {
+        iconContainer.innerHTML = `
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-accent inline mr-2 animate-spin" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+            </svg>
+        `;
+    } else if (state === 'completed') {
+        iconContainer.innerHTML = `
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-success inline mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+        `;
+    } else if (state === 'error') {
+        iconContainer.innerHTML = `
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-error inline mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+        `;
+    }
 }
 
 async function monitorProgress() {
@@ -507,6 +691,15 @@ function updateProgressDisplay(progress) {
         <p>Transferred: ${formatBytes(progress.transferred)}</p>
         <p>Total: ${formatBytes(progress.total)}</p>
     `;
+    
+    // Update icon based on status
+    if (progress.status === 'Completed') {
+        setProgressModalIcon('completed');
+    } else if (progress.status === 'Failed' || progress.status.includes('Error')) {
+        setProgressModalIcon('error');
+    } else {
+        setProgressModalIcon('loading');
+    }
 }
 
 async function loadSyncJobs() {
@@ -535,6 +728,25 @@ function displaySyncJobs(jobs) {
                            job.status === 'Failed' ? 'badge-error' : 
                            job.status === 'Running' ? 'badge-warning' : 'badge-info';
         
+        // Add action buttons for completed/failed jobs
+        const isCompleted = job.status === 'Completed' || job.status === 'Failed' || job.status.includes('Error');
+        const actionButtons = isCompleted ? `
+            <div class="flex items-center space-x-2 mt-3">
+                <button onclick="viewSyncLog('${job.id}')" class="btn btn-info btn-sm">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                    </svg>
+                    View Log
+                </button>
+                <button onclick="deleteSyncJob('${job.id}')" class="btn btn-error btn-sm">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                    </svg>
+                    Delete
+                </button>
+            </div>
+        ` : '';
+        
         return `
             <div class="card bg-base-100 shadow-sm">
                 <div class="card-body py-4 px-5">
@@ -560,6 +772,8 @@ function displaySyncJobs(jobs) {
                         <span>Transferred: ${formatBytes(job.transferred)}</span>
                         <span>Total: ${formatBytes(job.total)}</span>
                     </div>
+                    
+                    ${actionButtons}
                 </div>
             </div>
         `;
@@ -642,4 +856,91 @@ async function persistConfigs() {
     } catch (error) {
         showAlert('config-alert', 'Error saving configurations: ' + error.message, 'error');
     }
+}
+
+async function viewSyncLog(jobId) {
+    try {
+        const response = await fetch(`/api/sync-log/${jobId}`);
+        
+        if (!response.ok) {
+            if (response.status === 404) {
+                showToast('Log file not available - this job was created before logging was enabled. Please restart the server and try a new sync operation.', 'info');
+                return;
+            }
+            throw new Error(`HTTP error! status: ${response.status}`);
+        }
+        
+        const result = await response.json();
+        
+        if (result.success) {
+            // Create and show log modal
+            showLogModal(jobId, result.data);
+        } else {
+            showToast('Error loading log: ' + result.error, 'error');
+        }
+    } catch (error) {
+        showToast('Error loading log: ' + error.message, 'error');
+    }
+}
+
+async function deleteSyncJob(jobId) {
+    if (!confirm('Are you sure you want to delete this job and its log file?')) {
+        return;
+    }
+    
+    try {
+        const response = await fetch(`/api/sync-delete/${jobId}`, {
+            method: 'DELETE'
+        });
+        
+        const result = await response.json();
+        
+        if (result.success) {
+            showToast('Job deleted successfully', 'success');
+            loadSyncJobs(); // Refresh the job list
+        } else {
+            showToast('Error deleting job: ' + result.error, 'error');
+        }
+    } catch (error) {
+        showToast('Error deleting job: ' + error.message, 'error');
+    }
+}
+
+function showLogModal(jobId, logContent) {
+    // Create modal dynamically
+    const modal = document.createElement('dialog');
+    modal.id = 'log-modal';
+    modal.className = 'modal';
+    modal.innerHTML = `
+        <div class="modal-box w-11/12 max-w-4xl">
+            <form method="dialog">
+                <button class="btn btn-sm btn-circle btn-ghost absolute right-2 top-2">✕</button>
+            </form>
+            <h3 class="font-bold text-xl mb-4">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-info inline mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                </svg>
+                Log for Job ${jobId.substring(0, 8)}...
+            </h3>
+            
+            <div class="bg-base-300 rounded-lg p-4 max-h-96 overflow-y-auto">
+                <pre class="text-sm whitespace-pre-wrap">${logContent || 'No log content available.'}</pre>
+            </div>
+            
+            <div class="modal-action">
+                <form method="dialog">
+                    <button class="btn">Close</button>
+                </form>
+            </div>
+        </div>
+    `;
+    
+    // Add modal to page and show it
+    document.body.appendChild(modal);
+    modal.showModal();
+    
+    // Remove modal when closed
+    modal.addEventListener('close', () => {
+        document.body.removeChild(modal);
+    });
 }

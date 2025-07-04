@@ -20,6 +20,7 @@ rclone.conf
 
 # Logs
 *.log
+/data/log/*.log
 
 # Temporary files
 *.tmp

@@ -4,8 +4,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::process::Command;
 use std::process::Stdio;
-use tokio::io::{BufReader, AsyncBufReadExt};
+use tokio::io::{BufReader, AsyncBufReadExt, AsyncWriteExt};
+use tokio::fs;
 use uuid::Uuid;
+use chrono;
 use crate::models::{ApiResponse, SyncRequest, SyncProgress};
 
 type SyncJobs = Arc<Mutex<HashMap<String, SyncProgress>>>;
@@ -51,13 +53,87 @@ pub async fn get_sync_progress(job_id: String) -> ResponseJson<ApiResponse<SyncP
 
 pub async fn list_sync_jobs() -> ResponseJson<ApiResponse<Vec<SyncProgress>>> {
     let jobs = SYNC_JOBS.lock().await;
-    let job_list: Vec<SyncProgress> = jobs.values().cloned().collect();
+    let mut job_list: Vec<SyncProgress> = jobs.values().cloned().collect();
+    
+    // Sort by creation time (newest first) - using job_id as timestamp proxy
+    job_list.sort_by(|a, b| b.id.cmp(&a.id));
+    
     ResponseJson(ApiResponse::success(job_list))
+}
+
+pub async fn get_sync_log(job_id: String) -> ResponseJson<ApiResponse<String>> {
+    let log_file_path = format!("data/log/{}.log", job_id);
+    
+    println!("DEBUG: Trying to read log file: {}", log_file_path);
+    
+    match fs::read_to_string(&log_file_path).await {
+        Ok(content) => {
+            println!("DEBUG: Log file found, content length: {} bytes", content.len());
+            ResponseJson(ApiResponse::success(content))
+        },
+        Err(e) => {
+            println!("DEBUG: Log file read error: {}", e);
+            ResponseJson(ApiResponse::error(&format!("Log file not found: {}", e)))
+        },
+    }
+}
+
+pub async fn delete_sync_job(job_id: String) -> ResponseJson<ApiResponse<String>> {
+    let mut jobs = SYNC_JOBS.lock().await;
+    
+    // Check if job exists and is completed
+    let can_delete = if let Some(job) = jobs.get(&job_id) {
+        job.status == "Completed" || job.status == "Failed" || job.status.contains("Error")
+    } else {
+        false
+    };
+    
+    if !can_delete {
+        return ResponseJson(ApiResponse::error("Can only delete completed or failed jobs"));
+    }
+    
+    // Remove from memory
+    jobs.remove(&job_id);
+    
+    // Remove log file
+    let log_file_path = format!("data/log/{}.log", job_id);
+    if let Err(e) = fs::remove_file(&log_file_path).await {
+        println!("Warning: Could not delete log file {}: {}", log_file_path, e);
+    }
+    
+    ResponseJson(ApiResponse::success("Job deleted successfully".to_string()))
 }
 
 async fn execute_sync(job_id: String, sync_request: SyncRequest, sync_jobs: SyncJobs) {
     let remote_target = format!("{}:{}", sync_request.remote_name, sync_request.remote_path);
     let config_path = "data/cfg/rclone.conf";
+    
+    // Ensure log directory exists
+    if let Err(e) = fs::create_dir_all("data/log").await {
+        eprintln!("Failed to create log directory: {}", e);
+    }
+    
+    let log_file_path = format!("data/log/{}.log", job_id);
+    
+    // Create initial log entry with timestamp
+    let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+    let initial_log = format!(
+        "[{}] Job {} started\n[{}] Source: {}\n[{}] Remote: {}\n[{}] Target: {}\n[{}] Starting rclone operation...\n\n",
+        timestamp,
+        job_id,
+        timestamp,
+        sync_request.source_path,
+        timestamp,
+        sync_request.remote_name,
+        timestamp,
+        remote_target,
+        timestamp
+    );
+    
+    // Write initial log entry
+    if let Err(e) = fs::write(&log_file_path, &initial_log).await {
+        eprintln!("Failed to create initial log file: {}", e);
+    }
     
     {
         let mut jobs = sync_jobs.lock().await;
@@ -111,10 +187,33 @@ async fn execute_sync(job_id: String, sync_request: SyncRequest, sync_jobs: Sync
     println!("DEBUG: Executing rclone command:");
     println!("DEBUG: rclone {}", args.join(" "));
     
+    // Add command to log file
+    let timestamp_cmd = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+    let command_log = format!("[{}] Executing command: rclone {}\n\n", timestamp_cmd, args.join(" "));
+    
+    match tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file_path)
+        .await {
+        Ok(mut file) => {
+            if let Err(write_err) = file.write_all(command_log.as_bytes()).await {
+                println!("ERROR: Failed to write command to log: {}", write_err);
+            } else {
+                let _ = file.flush().await;
+            }
+        },
+        Err(open_err) => {
+            println!("ERROR: Failed to open log file for command: {}", open_err);
+        }
+    }
+    
     // TEST MODE: Uncomment the next 4 lines to test progress parsing with fake output
     // let mut child = match Command::new("bash")
     //     .args(&["-c", "echo 'Transferred: 1.234 MByte / 5.678 MByte, 21%, 345.67 kByte/s, ETA 12s'; sleep 2; echo 'Transferred: 3.456 MByte / 5.678 MByte, 60%, 500 kByte/s, ETA 4s'; sleep 2; echo 'Transferred: 5.678 MByte / 5.678 MByte, 100%, 600 kByte/s, ETA 0s'"])
     
+    // Note: Log file will be created when we write the content
+
     let mut child = match Command::new("rclone")
         .args(&args)
         .stdout(Stdio::piped())
@@ -128,6 +227,28 @@ async fn execute_sync(job_id: String, sync_request: SyncRequest, sync_jobs: Sync
         Err(e) => {
             let error_msg = format!("Failed to spawn rclone process: {}", e);
             println!("ERROR: {}", error_msg);
+            
+            // Append error to log file
+            let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+            let error_log = format!("[{}] ERROR: {}\n", timestamp, error_msg);
+            
+            match tokio::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log_file_path)
+                .await {
+                Ok(mut file) => {
+                    if let Err(write_err) = file.write_all(error_log.as_bytes()).await {
+                        println!("ERROR: Failed to write error to log: {}", write_err);
+                    } else {
+                        let _ = file.flush().await;
+                    }
+                },
+                Err(open_err) => {
+                    println!("ERROR: Failed to open log file: {}", open_err);
+                }
+            }
+            
             let mut jobs = sync_jobs.lock().await;
             if let Some(progress) = jobs.get_mut(&job_id) {
                 progress.status = error_msg;
@@ -154,10 +275,34 @@ async fn execute_sync(job_id: String, sync_request: SyncRequest, sync_jobs: Sync
     // Spawn a task to read rclone output and update progress
     let job_id_for_output = job_id.clone();
     let sync_jobs_for_output = sync_jobs.clone();
+    let log_file_path_for_output = log_file_path.clone();
     let output_task = tokio::spawn(async move {
+        // Open log file for appending
+        let log_file = match tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_file_path_for_output).await {
+            Ok(file) => file,
+            Err(e) => {
+                println!("ERROR: Failed to open log file for appending: {}", e);
+                return;
+            }
+        };
+        let mut log_file = log_file;
+        
         while let Ok(Some(line)) = lines.next_line().await {
             // Print every line from rclone for debugging
             println!("🔧 RCLONE RAW OUTPUT: {}", line);
+            
+            // Write line to log file immediately with timestamp
+            let timestamp = chrono::Utc::now().format("%H:%M:%S");
+            let log_line = format!("[{}] {}\n", timestamp, line);
+            if let Err(e) = log_file.write_all(log_line.as_bytes()).await {
+                println!("ERROR: Failed to write to log file: {}", e);
+            } else {
+                // Flush to ensure immediate writing
+                let _ = log_file.flush().await;
+            }
             
             // Try to parse progress and show detailed parsing info
             if let Some(progress_info) = parse_rclone_progress(&line) {
@@ -198,11 +343,45 @@ async fn execute_sync(job_id: String, sync_request: SyncRequest, sync_jobs: Sync
                 }
             }
         }
+        
+        // Write completion message to log
+        let timestamp = chrono::Utc::now().format("%H:%M:%S");
+        let completion_line = format!("[{}] 🏁 RCLONE OUTPUT STREAM ENDED\n", timestamp);
+        let _ = log_file.write_all(completion_line.as_bytes()).await;
+        let _ = log_file.flush().await;
+        
         println!("🏁 RCLONE OUTPUT STREAM ENDED");
     });
 
     let status = child.wait().await;
     output_task.abort(); // Stop reading output when process ends
+    
+    // Write final status to log file
+    let final_status = match &status {
+        Ok(exit_status) if exit_status.success() => "Completed successfully",
+        Ok(exit_status) => &format!("Failed with exit code: {:?}", exit_status.code()),
+        Err(e) => &format!("Error: {}", e),
+    };
+    
+    let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
+    let final_log = format!("\n[{}] Job {} finished: {}\n", timestamp, job_id, final_status);
+    
+    match tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_file_path)
+        .await {
+        Ok(mut file) => {
+            if let Err(write_err) = file.write_all(final_log.as_bytes()).await {
+                println!("ERROR: Failed to write final status to log: {}", write_err);
+            } else {
+                let _ = file.flush().await;
+            }
+        },
+        Err(open_err) => {
+            println!("ERROR: Failed to open log file for final status: {}", open_err);
+        }
+    }
     
     {
         let mut jobs = sync_jobs.lock().await;
