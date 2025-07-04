@@ -34,9 +34,15 @@ RUN strip target/x86_64-unknown-linux-musl/release/rclone-gui
 # -------- Runtime Stage --------
 FROM alpine:3.19
 
-# Nur Runtime-Tools (ohne libc!)
+# Runtime-Tools installieren (ohne libc!)
 RUN apk update && apk upgrade && \
-    apk add --no-cache ca-certificates rclone wget
+    apk add --no-cache ca-certificates wget unzip && \
+    # Install rclone v1.70.1 directly from GitHub releases
+    wget -O rclone.zip https://github.com/rclone/rclone/releases/download/v1.70.1/rclone-v1.70.1-linux-amd64.zip && \
+    unzip rclone.zip && \
+    mv rclone-v1.70.1-linux-amd64/rclone /usr/local/bin/ && \
+    chmod +x /usr/local/bin/rclone && \
+    rm -rf rclone.zip rclone-v1.70.1-linux-amd64
 
 WORKDIR /app
 
