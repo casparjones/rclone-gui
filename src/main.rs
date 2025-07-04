@@ -1,9 +1,10 @@
 use axum::{
-    extract::Path,
+    extract::{Path, Request},
     routing::{get, post, delete},
     Router,
     Extension,
     response::Html,
+    middleware::{self, Next},
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -11,11 +12,14 @@ use tower::ServiceBuilder;
 use tower_http::{
     cors::CorsLayer,
     services::ServeDir,
+    trace::TraceLayer,
 };
-use tracing_subscriber;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing;
 use clap::Parser;
 use std::env;
 use dotenvy::{dotenv, from_filename_override};
+use chrono;
 
 mod handlers;
 mod models;
@@ -39,18 +43,54 @@ async fn main() {
     // Clean up any leftover log files from previous runs
     cleanup_orphaned_log_files().await;
     
-    tracing_subscriber::fmt::init();
+    // Initialize enhanced tracing
+    setup_tracing();
     let args = Args::parse();
+    
+    println!("⚙️  Command line arguments:");
+    println!("   Memory mode: {}", args.memory_mode);
+    println!("   Bind address: {}", args.bind);
+    println!("");
 
     let config_manager = Arc::new(config_manager::ConfigManager::new(args.memory_mode));
     
     if args.memory_mode {
-        println!("Running in memory mode - configurations will not be saved to file automatically");
+        println!("💾 Running in memory mode:");
+        println!("   ⚠️  Configurations will not be saved to file automatically");
+        println!("   📥 Loading existing configs from file into memory...");
+        
         // Load existing configs from file into memory
         if let Err(e) = config_manager.load_from_file_to_memory().await {
-            eprintln!("Warning: Could not load existing configs from file: {}", e);
+            eprintln!("   ❌ Warning: Could not load existing configs from file: {}", e);
+        } else {
+            println!("   ✅ Existing configs loaded successfully");
         }
+        println!("");
+    } else {
+        println!("💾 Running in persistent mode:");
+        println!("   ✅ Configurations will be saved to file automatically");
+        println!("");
     }
+
+    // Log all registered routes
+    println!("📋 Registering API routes:");
+    println!("   GET    /                              -> serve_index");
+    println!("   GET    /api/configs                   -> get_configs");
+    println!("   POST   /api/configs                   -> save_config");
+    println!("   DELETE /api/configs/:name             -> delete_config");
+    println!("   GET    /api/configs/:name/edit        -> get_config_for_edit");
+    println!("   POST   /api/configs/persist           -> persist_configs");
+    println!("   GET    /api/files/local               -> list_local_files");
+    println!("   GET    /api/files/remote              -> list_remote_files");
+    println!("   POST   /api/sync                      -> start_sync");
+    println!("   GET    /api/sync                      -> list_sync_jobs");
+    println!("   GET    /api/sync-log/:job_id          -> get_sync_log (temp route)");
+    println!("   DELETE /api/sync-delete/:job_id       -> delete_sync_job (temp route)");
+    println!("   GET    /api/sync/:job_id/log          -> get_sync_log");
+    println!("   GET    /api/sync/:job_id              -> get_sync_progress");
+    println!("   DELETE /api/sync/:job_id              -> delete_sync_job");
+    println!("   STATIC /static/*                      -> serve static files");
+    println!("");
 
     let app = Router::new()
         .route("/", get(serve_index))
@@ -69,6 +109,8 @@ async fn main() {
         .route("/api/sync/:job_id", get(get_sync_progress_handler))
         .route("/api/sync/:job_id", delete(delete_sync_job_handler))
         .nest_service("/static", ServeDir::new("static"))
+        .layer(middleware::from_fn(request_logging_middleware))
+        .layer(TraceLayer::new_for_http())
         .layer(Extension(config_manager))
         .layer(
             ServiceBuilder::new()
@@ -76,10 +118,39 @@ async fn main() {
         );
 
     let addr: SocketAddr = args.bind.parse().expect("Invalid bind address");
-    println!("Server running on http://{}", addr);
+    
+    println!("🌐 Starting server...");
+    println!("   📍 Binding to: {}", addr);
+    println!("   🔗 URL: http://{}", addr);
+    println!("   📁 Serving static files from: ./static/");
+    println!("   📊 Request logging: enabled");
+    println!("");
     
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    println!("✅ Server successfully started and listening on http://{}", addr);
+    println!("🎯 Ready to accept connections!");
+    println!("💡 Press Ctrl+C to stop the server");
+    println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    println!("");
+    
+    // Setup graceful shutdown
+    let shutdown_signal = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("Failed to install CTRL+C signal handler");
+        println!("");
+        println!("🛑 Shutdown signal received");
+        println!("🔄 Gracefully shutting down server...");
+    };
+    
+    // Run server with graceful shutdown
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal)
+        .await
+        .unwrap();
+        
+    println!("✅ Server shutdown completed");
+    println!("👋 Goodbye!");
 }
 
 async fn delete_config_handler(
@@ -228,4 +299,71 @@ async fn cleanup_orphaned_log_files() {
             eprintln!("Warning: Could not read log directory: {}", e);
         }
     }
+}
+
+/// Middleware function to log all HTTP requests
+async fn request_logging_middleware(req: Request, next: Next) -> axum::response::Response {
+    let method = req.method().clone();
+    let uri = req.uri().clone();
+    let headers = req.headers().clone();
+    
+    // Extract client IP (simplified)
+    let client_ip = headers
+        .get("x-forwarded-for")
+        .and_then(|hv| hv.to_str().ok())
+        .unwrap_or("unknown");
+    
+    let start_time = std::time::Instant::now();
+    
+    // Log the incoming request
+    println!("📨 {} {} from {} at {}", 
+        method, 
+        uri, 
+        client_ip,
+        chrono::Utc::now().format("%H:%M:%S")
+    );
+    
+    // Process the request
+    let response = next.run(req).await;
+    
+    let duration = start_time.elapsed();
+    let status = response.status();
+    
+    // Log the response
+    let status_emoji = match status.as_u16() {
+        200..=299 => "✅",
+        300..=399 => "🔄", 
+        400..=499 => "❌",
+        500..=599 => "💥",
+        _ => "❓",
+    };
+    
+    println!("📤 {} {} {} - {}ms", 
+        status_emoji,
+        status.as_u16(), 
+        uri,
+        duration.as_millis()
+    );
+    
+    response
+}
+
+/// Setup enhanced tracing with environment-based filtering
+fn setup_tracing() {
+    // Default to INFO level, but allow override via RUST_LOG environment variable
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+    
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_file(false)
+                .with_line_number(false)
+                .compact()
+        )
+        .init();
+        
+    tracing::info!("🔍 Tracing initialized");
 }

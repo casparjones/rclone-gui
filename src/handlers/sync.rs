@@ -8,6 +8,7 @@ use tokio::io::{BufReader, AsyncBufReadExt, AsyncWriteExt};
 use tokio::fs;
 use uuid::Uuid;
 use chrono;
+use tracing::{info, warn, error, debug};
 use crate::models::{ApiResponse, SyncRequest, SyncProgress};
 
 type SyncJobs = Arc<Mutex<HashMap<String, SyncProgress>>>;
@@ -43,6 +44,10 @@ async fn create_initial_log(job_id: &str, sync_request: &SyncRequest) -> tokio::
 pub async fn start_sync(Json(sync_request): Json<SyncRequest>) -> ResponseJson<ApiResponse<String>> {
     let job_id = Uuid::new_v4().to_string();
     
+    info!("🚀 Starting new sync job: {}", job_id);
+    info!("   Source: {}", sync_request.source_path);
+    info!("   Remote: {}:{}", sync_request.remote_name, sync_request.remote_path);
+    
     let progress = SyncProgress {
         id: job_id.clone(),
         progress: 0.0,
@@ -58,7 +63,9 @@ pub async fn start_sync(Json(sync_request): Json<SyncRequest>) -> ResponseJson<A
 
     // Immediately create the log file so it is visible in the UI
     if let Err(e) = create_initial_log(&job_id, &sync_request).await {
-        eprintln!("Failed to create initial log for {}: {}", job_id, e);
+        error!("Failed to create initial log for {}: {}", job_id, e);
+    } else {
+        debug!("📝 Initial log file created for job {}", job_id);
     }
 
     let job_id_clone = job_id.clone();
@@ -93,27 +100,32 @@ pub async fn list_sync_jobs() -> ResponseJson<ApiResponse<Vec<SyncProgress>>> {
 pub async fn get_sync_log(job_id: String) -> ResponseJson<ApiResponse<String>> {
     let log_file_path = format!("data/log/{}.log", job_id);
     
-    println!("DEBUG: Trying to read log file: {}", log_file_path);
+    debug!("📖 Reading log file for job {}: {}", job_id, log_file_path);
     
     match fs::read_to_string(&log_file_path).await {
         Ok(content) => {
-            println!("DEBUG: Log file found, content length: {} bytes", content.len());
+            info!("📖 Log file read successfully for job {}, {} bytes", job_id, content.len());
             ResponseJson(ApiResponse::success(content))
         },
         Err(e) => {
-            println!("DEBUG: Log file read error: {}", e);
+            warn!("📖 Log file read failed for job {}: {}", job_id, e);
             ResponseJson(ApiResponse::error(&format!("Log file not found: {}", e)))
         },
     }
 }
 
 pub async fn delete_sync_job(job_id: String) -> ResponseJson<ApiResponse<String>> {
+    info!("🗑️ Delete request for job {}", job_id);
+    
     let mut jobs = SYNC_JOBS.lock().await;
     
     // Check if job exists and is completed
     let can_delete = if let Some(job) = jobs.get(&job_id) {
-        job.status == "Completed" || job.status == "Failed" || job.status.contains("Error")
+        let deletable = job.status == "Completed" || job.status == "Failed" || job.status.contains("Error");
+        info!("📊 Job {} status: {}, can delete: {}", job_id, job.status, deletable);
+        deletable
     } else {
+        warn!("❌ Job {} not found for deletion", job_id);
         false
     };
     
