@@ -38,11 +38,13 @@ FROM alpine:3.19
 RUN apk update && apk upgrade && \
     apk add --no-cache ca-certificates wget unzip && \
     # Install rclone v1.70.1 directly from GitHub releases
-    wget -O rclone.zip https://github.com/rclone/rclone/releases/download/v1.70.1/rclone-v1.70.1-linux-amd64.zip && \
+    wget --retry-connrefused --tries=3 -O rclone.zip https://github.com/rclone/rclone/releases/download/v1.70.1/rclone-v1.70.1-linux-amd64.zip && \
     unzip rclone.zip && \
     mv rclone-v1.70.1-linux-amd64/rclone /usr/local/bin/ && \
     chmod +x /usr/local/bin/rclone && \
-    rm -rf rclone.zip rclone-v1.70.1-linux-amd64
+    rm -rf rclone.zip rclone-v1.70.1-linux-amd64 && \
+    # Verify rclone version
+    /usr/local/bin/rclone --version
 
 WORKDIR /app
 
