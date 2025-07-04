@@ -8,7 +8,11 @@ let configs = [];
 
 // Initialize app
 document.addEventListener('DOMContentLoaded', function() {
-    loadConfigs();
+    // Load initial data
+    loadConfigs().then(() => {
+        // Check if we have configs and set default tab accordingly
+        setDefaultTab();
+    });
     loadFiles();
     loadSyncJobs();
     
@@ -19,19 +23,39 @@ document.addEventListener('DOMContentLoaded', function() {
     setInterval(loadSyncJobs, 2000);
 });
 
-// Tab switching
+function setDefaultTab() {
+    // If no configs exist, show config tab, otherwise show file browser
+    if (configs.length === 0) {
+        // Hide file browser tab and show config tab
+        document.getElementById('files-tab').classList.remove('block');
+        document.getElementById('config-tab').classList.add('block');
+        
+        // Update tab buttons
+        document.getElementById('files-tab-btn').classList.remove('tab-active');
+        document.getElementById('config-tab-btn').classList.add('tab-active');
+        
+        showToast('No remote configurations found. Please add a remote first.', 'info');
+    }
+    // File browser is already default (has 'block' class in HTML)
+}
+
+// Tab switching for DaisyUI
 function switchTab(tabName) {
-    // Hide all tabs
+    // Hide all tab contents (remove block class)
     document.querySelectorAll('.tab-content').forEach(tab => {
-        tab.classList.remove('active');
-    });
-    document.querySelectorAll('.tab').forEach(tab => {
-        tab.classList.remove('active');
+        tab.classList.remove('block');
     });
     
-    // Show selected tab
-    document.getElementById(tabName + '-tab').classList.add('active');
-    event.target.classList.add('active');
+    // Remove active class from all tabs
+    document.querySelectorAll('.tab').forEach(tab => {
+        tab.classList.remove('tab-active');
+    });
+    
+    // Show selected tab content (add block class to override display: none)
+    document.getElementById(tabName + '-tab').classList.add('block');
+    
+    // Add active class to clicked tab
+    event.target.classList.add('tab-active');
     
     // Refresh content based on tab
     switch(tabName) {
@@ -91,11 +115,14 @@ async function loadConfigs() {
             configs = result.data;
             displayConfigs();
             updateRemoteSelect();
+            return configs; // Return for promise handling
         } else {
             showAlert('config-alert', 'Error loading configurations: ' + result.error, 'error');
+            return [];
         }
     } catch (error) {
         showAlert('config-alert', 'Error loading configurations: ' + error.message, 'error');
+        return [];
     }
 }
 
@@ -103,17 +130,26 @@ function displayConfigs() {
     const configList = document.getElementById('config-list');
     
     if (configs.length === 0) {
-        configList.innerHTML = '<p>No configurations found.</p>';
+        configList.innerHTML = '<div class="text-center text-base-content/60 py-8">No configurations found.</div>';
         return;
     }
     
     configList.innerHTML = configs.map(config => `
-        <div class="config-item">
-            <div>
-                <div class="config-name">${config.name}</div>
-                <div class="config-type">${config.config_type}</div>
+        <div class="card bg-base-200 shadow-sm">
+            <div class="card-body py-3 px-4">
+                <div class="flex items-center justify-between">
+                    <div>
+                        <div class="font-semibold text-lg">${config.name}</div>
+                        <div class="text-sm text-base-content/70">${config.config_type}</div>
+                    </div>
+                    <button class="btn btn-error btn-sm" onclick="deleteConfig('${config.name}')">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                        </svg>
+                        Delete
+                    </button>
+                </div>
             </div>
-            <button class="delete-btn" onclick="deleteConfig('${config.name}')">Delete</button>
         </div>
     `).join('');
 }
@@ -164,31 +200,50 @@ function displayFiles(files) {
     const fileList = document.getElementById('file-list');
     
     if (files.length === 0) {
-        fileList.innerHTML = '<p>No files found.</p>';
+        fileList.innerHTML = '<div class="text-center text-base-content/60 py-8">No files found.</div>';
         return;
     }
     
-    fileList.innerHTML = files.map(file => `
-        <div class="file-item" ${file.is_dir ? `onclick="loadFiles('${file.path}')"` : ''}>
-            <div class="file-icon">${file.is_dir ? '📁' : '📄'}</div>
-            <div class="file-name">${file.name}</div>
-            <div class="file-actions">
-                <button class="sync-btn" onclick="openSyncModal('${file.path}')">Sync</button>
+    fileList.innerHTML = files.map(file => {
+        const sizeInfo = file.size ? formatBytes(file.size) : '';
+        const fileTypeInfo = file.is_dir ? 'Folder' : (sizeInfo ? `File · ${sizeInfo}` : 'File');
+        
+        return `
+        <div class="card bg-base-100 shadow-sm file-item-hover cursor-pointer" ${file.is_dir ? `onclick="loadFiles('${file.path}')"` : ''}>
+            <div class="card-body py-3 px-4">
+                <div class="flex items-center justify-between">
+                    <div class="flex items-center space-x-3">
+                        <div class="text-2xl">${file.is_dir ? '📁' : '📄'}</div>
+                        <div>
+                            <div class="font-medium">${file.name}</div>
+                            <div class="text-sm text-base-content/70">${fileTypeInfo}</div>
+                        </div>
+                    </div>
+                    <div class="flex items-center space-x-2">
+                        <button class="btn btn-primary btn-sm" onclick="event.stopPropagation(); openSyncModal('${file.path}')">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                            </svg>
+                            Sync
+                        </button>
+                    </div>
+                </div>
             </div>
         </div>
-    `).join('');
+        `;
+    }).join('');
 }
 
 function updateBreadcrumb(path) {
     const breadcrumb = document.getElementById('breadcrumb');
     const parts = path.split('/').filter(part => part);
     
-    let breadcrumbHTML = '<a onclick="loadFiles(\'/\')">Root</a>';
+    let breadcrumbHTML = '<li><a onclick="loadFiles(\'/\')" class="cursor-pointer hover:text-primary">🏠 Root</a></li>';
     let currentPath = '';
     
     parts.forEach(part => {
         currentPath += '/' + part;
-        breadcrumbHTML += ` / <a onclick="loadFiles('${currentPath}')">${part}</a>`;
+        breadcrumbHTML += `<li><a onclick="loadFiles('${currentPath}')" class="cursor-pointer hover:text-primary">${part}</a></li>`;
     });
     
     breadcrumb.innerHTML = breadcrumbHTML;
@@ -198,7 +253,7 @@ function updateBreadcrumb(path) {
 function openSyncModal(sourcePath) {
     currentSyncSource = sourcePath;
     document.getElementById('sync-source').value = sourcePath;
-    document.getElementById('sync-modal').style.display = 'block';
+    document.getElementById('sync-modal').showModal();
     updateRemoteSelect();
     
     // Suggest chunk size based on file/folder
@@ -223,15 +278,16 @@ function suggestChunkSize(sourcePath) {
 }
 
 function closeSyncModal() {
-    document.getElementById('sync-modal').style.display = 'none';
+    document.getElementById('sync-modal').close();
     currentSyncSource = '';
     currentRemotePath = '/';
     selectedRemotePath = '/';
     document.getElementById('selected-remote-path').textContent = '/';
     
-    // Alle Auswahlen entfernen
-    document.querySelectorAll('#remote-file-list .file-item').forEach(item => {
-        item.classList.remove('selected');
+    // Alle Auswahlen entfernen - jetzt mit card Selektoren
+    document.querySelectorAll('#remote-file-list .card').forEach(item => {
+        item.classList.remove('bg-primary/20', 'border-primary');
+        item.classList.add('bg-base-200');
     });
 }
 
@@ -286,27 +342,35 @@ function displayRemoteFiles(files) {
     if (currentRemotePath !== '/') {
         const parentPath = getParentPath(currentRemotePath);
         html += `
-            <div class="file-item parent-folder" 
+            <div class="card bg-warning/10 border border-warning/20 cursor-pointer hover:bg-warning/20 transition-colors" 
                  onclick="selectRemoteFolder('${parentPath}')" 
                  ondblclick="loadRemoteFiles('${parentPath}')">
-                <div class="file-icon">⬆️</div>
-                <div class="file-name">.. (zurück zu ${parentPath === '/' ? 'Root' : parentPath.split('/').pop()})</div>
+                <div class="card-body py-2 px-3">
+                    <div class="flex items-center space-x-3">
+                        <div class="text-xl">⬆️</div>
+                        <div class="font-medium">.. (zurück zu ${parentPath === '/' ? 'Root' : parentPath.split('/').pop()})</div>
+                    </div>
+                </div>
             </div>
         `;
     }
     
     // Ordner hinzufügen
     html += folders.map(folder => `
-        <div class="file-item" 
+        <div class="card bg-base-200 cursor-pointer hover:bg-base-300 transition-colors" 
              onclick="selectRemoteFolder('${folder.path}')" 
              ondblclick="loadRemoteFiles('${folder.path}')">
-            <div class="file-icon">📁</div>
-            <div class="file-name">${folder.name}</div>
+            <div class="card-body py-2 px-3">
+                <div class="flex items-center space-x-3">
+                    <div class="text-xl">📁</div>
+                    <div class="font-medium">${folder.name}</div>
+                </div>
+            </div>
         </div>
     `).join('');
     
     if (folders.length === 0 && currentRemotePath === '/') {
-        html = '<p>Keine Ordner gefunden.</p>';
+        html = '<div class="text-center text-base-content/60 py-4">Keine Ordner gefunden.</div>';
     }
     
     remoteFileList.innerHTML = html;
@@ -328,13 +392,18 @@ function updateRemoteBreadcrumb(path) {
 }
 
 function selectRemoteFolder(folderPath) {
-    // Vorherige Auswahl entfernen
-    document.querySelectorAll('#remote-file-list .file-item').forEach(item => {
-        item.classList.remove('selected');
+    // Vorherige Auswahl entfernen - jetzt mit card Selektoren
+    document.querySelectorAll('#remote-file-list .card').forEach(item => {
+        item.classList.remove('bg-primary/20', 'border-primary');
+        item.classList.add('bg-base-200');
     });
     
     // Aktuelle Auswahl markieren
-    event.target.closest('.file-item').classList.add('selected');
+    const clickedCard = event.target.closest('.card');
+    if (clickedCard) {
+        clickedCard.classList.remove('bg-base-200', 'bg-warning/10');
+        clickedCard.classList.add('bg-primary/20', 'border-primary');
+    }
     
     // Ausgewählten Pfad aktualisieren
     selectedRemotePath = folderPath;
@@ -402,11 +471,11 @@ async function startSync() {
 }
 
 function openProgressModal() {
-    document.getElementById('progress-modal').style.display = 'block';
+    document.getElementById('progress-modal').showModal();
 }
 
 function closeProgressModal() {
-    document.getElementById('progress-modal').style.display = 'none';
+    document.getElementById('progress-modal').close();
     currentSyncJobId = '';
 }
 
@@ -457,40 +526,104 @@ function displaySyncJobs(jobs) {
     const syncJobsDiv = document.getElementById('sync-jobs');
     
     if (jobs.length === 0) {
-        syncJobsDiv.innerHTML = '<p>No sync jobs found.</p>';
+        syncJobsDiv.innerHTML = '<div class="text-center text-base-content/60 py-8">No sync jobs found.</div>';
         return;
     }
     
-    syncJobsDiv.innerHTML = jobs.map(job => `
-        <div class="config-item">
-            <div>
-                <div class="config-name">Job ID: ${job.id}</div>
-                <div class="config-type">Status: ${job.status} (${job.progress.toFixed(1)}%)</div>
+    syncJobsDiv.innerHTML = jobs.map(job => {
+        const statusColor = job.status === 'Completed' ? 'badge-success' : 
+                           job.status === 'Failed' ? 'badge-error' : 
+                           job.status === 'Running' ? 'badge-warning' : 'badge-info';
+        
+        return `
+            <div class="card bg-base-100 shadow-sm">
+                <div class="card-body py-4 px-5">
+                    <div class="flex items-center justify-between mb-3">
+                        <div>
+                            <div class="font-semibold text-lg">Job ID: ${job.id.substring(0, 8)}...</div>
+                            <div class="flex items-center space-x-2 mt-1">
+                                <span class="badge ${statusColor}">${job.status}</span>
+                                <span class="text-sm text-base-content/70">${job.progress.toFixed(1)}%</span>
+                            </div>
+                        </div>
+                        <div class="text-right">
+                            <div class="text-sm text-base-content/70">Progress</div>
+                            <div class="text-lg font-bold">${job.progress.toFixed(1)}%</div>
+                        </div>
+                    </div>
+                    
+                    <div class="w-full bg-base-300 rounded-full h-3">
+                        <div class="bg-primary h-3 rounded-full progress-animate" style="width: ${job.progress}%"></div>
+                    </div>
+                    
+                    <div class="flex justify-between text-sm text-base-content/70 mt-2">
+                        <span>Transferred: ${formatBytes(job.transferred)}</span>
+                        <span>Total: ${formatBytes(job.total)}</span>
+                    </div>
+                </div>
             </div>
-            <div class="progress-bar" style="width: 200px;">
-                <div class="progress-fill" style="width: ${job.progress}%"></div>
-            </div>
-        </div>
-    `).join('');
+        `;
+    }).join('');
 }
 
 // Utility functions
 function showAlert(containerId, message, type) {
-    const container = document.getElementById(containerId);
-    container.innerHTML = `<div class="alert alert-${type}">${message}</div>`;
+    // Show as toast notification instead of inline alert
+    showToast(message, type);
+}
+
+function showToast(message, type) {
+    const container = document.getElementById('toast-container');
+    const toastId = 'toast-' + Date.now();
     
-    // Auto-hide after 5 seconds
+    const alertClass = type === 'error' ? 'alert-error' : type === 'success' ? 'alert-success' : 'alert-info';
+    const icon = type === 'error' ? '❌' : type === 'success' ? '✅' : 'ℹ️';
+    
+    const toast = document.createElement('div');
+    toast.id = toastId;
+    toast.className = `alert ${alertClass} shadow-lg mb-2`;
+    toast.innerHTML = `
+        <span>${icon} ${message}</span>
+        <button onclick="removeToast('${toastId}')" class="btn btn-ghost btn-xs">✕</button>
+    `;
+    
+    container.appendChild(toast);
+    
+    // Auto-remove after 5 seconds
     setTimeout(() => {
-        container.innerHTML = '';
+        removeToast(toastId);
     }, 5000);
+}
+
+function removeToast(toastId) {
+    const toast = document.getElementById(toastId);
+    if (toast) {
+        toast.style.opacity = '0';
+        toast.style.transform = 'translateX(-100%)';
+        setTimeout(() => {
+            if (toast.parentNode) {
+                toast.parentNode.removeChild(toast);
+            }
+        }, 300);
+    }
 }
 
 function formatBytes(bytes) {
     if (bytes === 0) return '0 Bytes';
+    if (bytes === null || bytes === undefined) return '';
+    
     const k = 1024;
     const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
     const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+    
+    // Special formatting: 1 decimal for GB and TB, no decimals for smaller units
+    if (i >= 3) { // GB or TB
+        return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
+    } else if (i >= 2) { // MB
+        return Math.round(bytes / Math.pow(k, i)) + ' ' + sizes[i];
+    } else {
+        return parseFloat((bytes / Math.pow(k, i)).toFixed(0)) + ' ' + sizes[i];
+    }
 }
 
 async function persistConfigs() {

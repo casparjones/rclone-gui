@@ -21,13 +21,42 @@ A Rust-based web application that provides a user-friendly GUI for rclone file s
 1. Clone or download the source code
 2. (Optional) Configure the default file browser path:
    ```bash
-   # Edit .env file to set your preferred starting directory
+   # Create local environment file (recommended for development)
+   cp .env.local.example .env.local
+   nano .env.local
+   
+   # OR edit global .env file (will be committed to git)
    nano .env
    ```
 3. Build the application:
    ```bash
    cargo build --release
    ```
+
+### 🔧 Development vs Production Setup
+
+#### **Development (lokale Anpassungen):**
+```bash
+# 1. Lokale Konfiguration erstellen
+cp .env.local.example .env.local
+
+# 2. Persönliche Einstellungen setzen
+echo "RCLONE_GUI_DEFAULT_PATH=/home/$(whoami)/Documents" >> .env.local
+echo "RUST_LOG=debug" >> .env.local
+
+# 3. Entwicklungsserver starten
+./start.sh
+```
+
+#### **Production (Server-Deployment):**
+```bash
+# 1. Standard .env anpassen oder Umgebungsvariablen setzen
+export RCLONE_GUI_DEFAULT_PATH=/srv/storage
+export RUST_LOG=info
+
+# 2. Production-Build starten
+./target/release/rclone-gui --bind 0.0.0.0:8080
+```
 
 ## Usage
 
@@ -55,24 +84,32 @@ cargo run -- --bind 0.0.0.0:3000
 
 ## Web Interface
 
-Open your browser to `http://127.0.0.1:8080` (or your custom bind address) to access the GUI.
+Open your browser to `http://127.0.0.1:8080` (or your custom bind address) to access the modern GUI.
+
+### Modern UI Features
+- **🎨 DaisyUI v5 + Tailwind CSS**: Beautiful, responsive design with consistent components
+- **🌓 Theme Toggle**: Switch between light and dark modes (automatically saved)
+- **📱 Mobile Responsive**: Works perfectly on desktop, tablet, and mobile devices
+- **🎯 Interactive Elements**: Hover effects, smooth animations, and intuitive navigation
+- **🔔 Smart Alerts**: Contextual notifications with auto-dismiss functionality
 
 ### Configuration Tab
-- **Add New Remote**: Create rclone configurations for various services
+- **Add New Remote**: Create rclone configurations with a clean, guided form
 - **Supported Types**: WebDAV, S3, Dropbox, Google Drive, OneDrive, and more
-- **Existing Configurations**: View and manage saved remotes
+- **Existing Configurations**: Beautiful card-based layout for managing remotes
 - **Save to File**: (Memory mode only) Persist configurations to rclone.conf
 
 ### File Browser Tab
-- **Local Navigation**: Browse your local filesystem
-- **Directory Tree**: Click folders to navigate
-- **File Actions**: Each file/folder has a "Sync" button
-- **Default Path**: Starts at `/mnt/home` (siehe Konfiguration unten)
+- **Local Navigation**: Browse your local filesystem with breadcrumb navigation
+- **Card-based Layout**: Clean file/folder cards with hover effects
+- **File Actions**: Prominent sync buttons with visual feedback
+- **Default Path**: Starts at configured path (see configuration below)
 
 ### Sync Jobs Tab
-- **Active Jobs**: Monitor ongoing sync operations
-- **Progress Tracking**: Real-time progress bars and status updates
-- **Job History**: View completed and failed sync operations
+- **Real-time Monitoring**: Live progress tracking with animated progress bars
+- **Status Badges**: Color-coded status indicators (Running, Completed, Failed)
+- **Detailed Progress**: Shows transferred/total bytes with formatted display
+- **Job History**: Complete overview of all sync operations
 
 ## Sync Process
 
@@ -96,40 +133,56 @@ The application creates/manages an `rclone.conf` file in the `data/cfg/` directo
 
 Der File Browser startet standardmäßig im Ordner `/mnt/home`. Dieser kann über Umgebungsvariablen konfiguriert werden:
 
-### Methode 1: .env Datei (empfohlen)
+### Methode 1: .env.local Datei (empfohlen für lokale Entwicklung)
+1. Erstellen Sie eine lokale Konfigurationsdatei:
+   ```bash
+   cp .env.local.example .env.local
+   ```
+2. Bearbeiten Sie `.env.local` (wird nicht in git committed):
+   ```bash
+   # Ihre persönlichen Einstellungen
+   RCLONE_GUI_DEFAULT_PATH=/home/username/Documents
+   RUST_LOG=debug
+   ```
+3. Starten Sie die Anwendung neu
+
+### Methode 2: .env Datei bearbeiten (für dauerhafte Änderungen)
 1. Bearbeiten Sie die Datei `.env` im Projektverzeichnis
 2. Ändern Sie die Zeile: `RCLONE_GUI_DEFAULT_PATH=/mnt/home`
-3. Setzen Sie Ihren gewünschten Start-Ordner, z.B.:
-   ```bash
-   RCLONE_GUI_DEFAULT_PATH=/home/user          # Linux/Mac Home-Ordner
-   RCLONE_GUI_DEFAULT_PATH=/Users/username     # macOS-Benutzer
-   RCLONE_GUI_DEFAULT_PATH=/                   # Root-Verzeichnis
-   RCLONE_GUI_DEFAULT_PATH=/mnt/storage        # Eigener Mount-Point
-   ```
+3. **Achtung**: Diese Änderungen werden in git committed
 4. Starten Sie die Anwendung neu
 
-### Methode 2: Umgebungsvariable beim Start
+### Methode 3: Umgebungsvariable beim Start
 ```bash
 RCLONE_GUI_DEFAULT_PATH=/home/user cargo run
 # oder
 RCLONE_GUI_DEFAULT_PATH=/home/user ./start.sh
 ```
 
-### Methode 3: System-weite Umgebungsvariable
+### Methode 4: System-weite Umgebungsvariable
 ```bash
 export RCLONE_GUI_DEFAULT_PATH=/home/user
 cargo run
 ```
+
+### 🔧 Reihenfolge der Konfiguration (Priorität absteigend):
+1. **Kommandozeile** (`RCLONE_GUI_DEFAULT_PATH=/path cargo run`)
+2. **System-Umgebungsvariablen** (`export RCLONE_GUI_DEFAULT_PATH=...`)
+3. **`.env.local`** (lokale Überschreibungen, nicht in git)
+4. **`.env`** (Standard-Konfiguration, in git committed)
 
 **Hinweis**: Stellen Sie sicher, dass der angegebene Pfad existiert und die Anwendung Leserechte darauf hat.
 
 ## Architecture
 
 - **Backend**: Rust with axum web framework
-- **Frontend**: Vanilla HTML/CSS/JavaScript
+- **Frontend**: Modern HTML with DaisyUI v5 + Tailwind CSS
 - **rclone Integration**: Uses `tokio::process::Command` for rclone operations
 - **Configuration**: INI format parsing for rclone.conf
 - **Progress Tracking**: Real-time job monitoring with polling
+- **UI Framework**: DaisyUI v5 + Tailwind CSS Browser v4 (via CDN)
+- **Theme Support**: Light/Dark mode toggle with persistent storage
+- **Modern CSS**: Latest Tailwind CSS Browser engine with on-demand compilation
 
 ## Development
 

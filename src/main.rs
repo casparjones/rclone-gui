@@ -15,7 +15,7 @@ use tower_http::{
 use tracing_subscriber;
 use clap::Parser;
 use std::env;
-use dotenv::dotenv;
+use dotenvy::{dotenv, from_filename_override};
 
 mod handlers;
 mod models;
@@ -33,8 +33,8 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
-    // Load environment variables from .env file
-    dotenv().ok();
+    // Load environment variables with detailed feedback
+    load_environment_config();
     
     tracing_subscriber::fmt::init();
     let args = Args::parse();
@@ -95,6 +95,7 @@ async fn get_config_for_edit_handler(
 
 async fn serve_index() -> Html<String> {
     let default_path = env::var("RCLONE_GUI_DEFAULT_PATH").unwrap_or_else(|_| "/mnt/home".to_string());
+    println!("🏠 Using default path: {}", default_path);
     
     let html_content = std::fs::read_to_string("static/index.html")
         .unwrap_or_else(|_| include_str!("../static/index.html").to_string());
@@ -111,4 +112,61 @@ async fn serve_index() -> Html<String> {
     );
     
     Html(modified_html)
+}
+
+/// Load environment configuration with detailed feedback
+fn load_environment_config() {
+    println!("🚀 Starting Rclone GUI...");
+    println!("📁 Working directory: {}", env::current_dir().unwrap_or_default().display());
+    println!("📋 Environment configuration:");
+
+    // Load .env file first
+    let env_loaded = match dotenv() {
+        Ok(_) => {
+            println!("   ✅ .env found and loaded");
+            true
+        }
+        Err(_) => {
+            println!("   ❌ .env not found");
+            false
+        }
+    };
+
+    // Load .env.local file (overrides .env)
+    let env_local_loaded = match from_filename_override(".env.local") {
+        Ok(_) => {
+            println!("   ✅ .env.local found and loaded (local overrides)");
+            true
+        }
+        Err(_) => {
+            println!("   ℹ️  .env.local not found (create from .env.local.example for local settings)");
+            false
+        }
+    };
+
+    // Show current effective configuration
+    let current_path = env::var("RCLONE_GUI_DEFAULT_PATH")
+        .unwrap_or_else(|_| "/mnt/home".to_string());
+    
+    // Determine the actual source of the current value
+    let source = if env_local_loaded && current_path != "/mnt/home" {
+        "from .env.local"
+    } else if env_loaded && current_path != "/mnt/home" {
+        "from .env"
+    } else {
+        "fallback default"
+    };
+    
+    println!("   🎯 Active default path: {} ({})", current_path, source);
+
+    // Show other relevant environment variables
+    if let Ok(rust_log) = env::var("RUST_LOG") {
+        println!("   🐛 Log level: {}", rust_log);
+    }
+    
+    if let Ok(bind_addr) = env::var("RCLONE_GUI_BIND") {
+        println!("   🌐 Custom bind address: {}", bind_addr);
+    }
+    
+    println!("");
 }

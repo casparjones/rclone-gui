@@ -1,429 +1,370 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="light">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Rclone GUI</title>
+    <link href="https://cdn.jsdelivr.net/npm/daisyui@5" rel="stylesheet" type="text/css" />
+    <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
+        /* Custom animations for better UX */
+        .file-item-hover {
+            transition: all 0.2s ease-in-out;
         }
-
-        body {
-            font-family: Arial, sans-serif;
-            background-color: #f5f5f5;
-            padding: 20px;
+        .file-item-hover:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
         }
-
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            background: white;
-            border-radius: 8px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-        }
-
-        .header {
-            background: #2c3e50;
-            color: white;
-            padding: 20px;
-            border-radius: 8px 8px 0 0;
-        }
-
-        .tabs {
-            display: flex;
-            border-bottom: 1px solid #ddd;
-        }
-
-        .tab {
-            padding: 15px 25px;
-            border: none;
-            cursor: pointer;
-            border-bottom: 3px solid transparent;
-            transition: all 0.3s;
-        }
-
-        .tab.active {
-            background: white;
-            border-bottom-color: #3498db;
-            color: #3498db;
-        }
-
-        .tab-content {
-            display: none;
-            padding: 20px;
-        }
-
-        .tab-content.active {
-            display: block;
-        }
-
-        .form-group {
-            margin-bottom: 15px;
-        }
-
-        label {
-            display: block;
-            margin-bottom: 5px;
-            font-weight: bold;
-            color: #333;
-        }
-
-        input, select, textarea {
-            width: 100%;
-            padding: 10px;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            font-size: 14px;
-        }
-
-        button {
-            background: #3498db;
-            color: white;
-            padding: 10px 20px;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 14px;
-            transition: background 0.3s;
-        }
-
-        button:hover {
-            background: #2980b9;
-        }
-
-        .file-list {
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            max-height: 400px;
-            overflow-y: auto;
-        }
-
-        .file-item {
-            display: flex;
-            align-items: center;
-            padding: 10px;
-            border-bottom: 1px solid #eee;
-            cursor: pointer;
-            transition: background 0.3s;
-        }
-
-        .file-item:hover {
-            background: #f8f9fa;
-        }
-
-        .file-item.selected {
-            background: #e3f2fd;
-            border-left: 4px solid #2196f3;
-        }
-
-        .file-item.parent-folder {
-            background: #fff3e0;
-            font-weight: bold;
-        }
-
-        .file-item.parent-folder:hover {
-            background: #ffe0b2;
-        }
-
-        .file-icon {
-            margin-right: 10px;
-            font-size: 18px;
-        }
-
-        .file-name {
-            flex: 1;
-            font-weight: 500;
-        }
-
-        .file-actions {
-            display: flex;
-            gap: 10px;
-        }
-
-        .sync-btn {
-            background: #27ae60;
-            color: white;
-            padding: 5px 10px;
-            border: none;
-            border-radius: 3px;
-            cursor: pointer;
-            font-size: 12px;
-        }
-
-        .sync-btn:hover {
-            background: #219a52;
-        }
-
-        .modal {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            width: 100%;
-            height: 100%;
-            background: rgba(0,0,0,0.5);
-            z-index: 1000;
-        }
-
-        .modal-content {
-            position: absolute;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            background: white;
-            padding: 20px;
-            border-radius: 8px;
-            max-width: 500px;
-            width: 90%;
-            max-height: 80vh;
-            overflow-y: auto;
-        }
-
-        .close {
-            position: absolute;
-            top: 10px;
-            right: 15px;
-            font-size: 24px;
-            cursor: pointer;
-            color: #999;
-        }
-
-        .close:hover {
-            color: #333;
-        }
-
-        .progress-bar {
-            width: 100%;
-            height: 20px;
-            background: #f0f0f0;
-            border-radius: 10px;
-            overflow: hidden;
-            margin: 10px 0;
-        }
-
-        .progress-fill {
-            height: 100%;
-            background: #3498db;
-            transition: width 0.3s;
-        }
-
-        .config-item {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 10px;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            margin-bottom: 10px;
-        }
-
-        .config-name {
-            font-weight: bold;
-            color: #2c3e50;
-        }
-
-        .config-type {
-            color: #7f8c8d;
-            font-size: 12px;
-        }
-
-        .delete-btn {
-            background: #e74c3c;
-            color: white;
-            padding: 5px 10px;
-            border: none;
-            border-radius: 3px;
-            cursor: pointer;
-            font-size: 12px;
-        }
-
-        .delete-btn:hover {
-            background: #c0392b;
-        }
-
-        .breadcrumb {
-            padding: 10px;
-            background: #ecf0f1;
-            border-radius: 4px;
-            margin-bottom: 10px;
-            font-size: 14px;
-        }
-
-        .breadcrumb a {
-            color: #3498db;
-            text-decoration: none;
-            cursor: pointer;
-        }
-
-        .breadcrumb a:hover {
-            text-decoration: underline;
-        }
-
-        .alert {
-            padding: 10px;
-            margin-bottom: 15px;
-            border-radius: 4px;
-        }
-
-        .alert-success {
-            background: #d4edda;
-            color: #155724;
-            border: 1px solid #c3e6cb;
-        }
-
-        .alert-error {
-            background: #f8d7da;
-            color: #721c24;
-            border: 1px solid #f5c6cb;
+        .progress-animate {
+            transition: width 0.5s ease-in-out;
         }
     </style>
 </head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>Rclone GUI</h1>
-            <p>Web-based interface for rclone file synchronization</p>
-        </div>
-
-        <div class="tabs">
-            <button class="tab active" onclick="switchTab('config')">Configuration</button>
-            <button class="tab" onclick="switchTab('files')">File Browser</button>
-            <button class="tab" onclick="switchTab('sync')">Sync Jobs</button>
-        </div>
-
-        <div id="config-tab" class="tab-content active">
-            <h2>Rclone Configuration</h2>
-            <div id="config-alert"></div>
-            
-            <div class="form-group">
-                <h3>Add New Remote</h3>
-                <form id="config-form">
-                    <div class="form-group">
-                        <label>Remote Name:</label>
-                        <input type="text" id="config-name" required>
-                    </div>
-                    <div class="form-group">
-                        <label>Type:</label>
-                        <select id="config-type" required>
-                            <option value="">Select type...</option>
-                            <option value="webdav">WebDAV</option>
-                            <option value="s3">Amazon S3</option>
-                            <option value="dropbox">Dropbox</option>
-                            <option value="gdrive">Google Drive</option>
-                            <option value="onedrive">OneDrive</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <label>URL:</label>
-                        <input type="url" id="config-url" placeholder="https://example.com/webdav">
-                    </div>
-                    <div class="form-group">
-                        <label>Username:</label>
-                        <input type="text" id="config-username">
-                    </div>
-                    <div class="form-group">
-                        <label>Password:</label>
-                        <input type="password" id="config-password">
-                    </div>
-                    <button type="submit">Save Configuration</button>
-                </form>
-            </div>
-
-            <div class="form-group">
-                <h3>Existing Configurations</h3>
-                <div style="margin-bottom: 10px;">
-                    <button onclick="persistConfigs()" style="background: #27ae60;">💾 Save to File</button>
-                    <small style="color: #666; margin-left: 10px;">Save in-memory configurations to rclone.conf</small>
+<body class="bg-base-200 min-h-screen">
+    <!-- Navigation -->
+    <div class="navbar bg-primary text-primary-content shadow-lg">
+        <div class="navbar-start">
+            <div class="dropdown">
+                <div tabindex="0" role="button" class="btn btn-ghost lg:hidden">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h8m-8 6h16" />
+                    </svg>
                 </div>
-                <div id="config-list"></div>
+            </div>
+            <a class="btn btn-ghost text-xl font-bold">🚀 Rclone GUI</a>
+        </div>
+        <div class="navbar-center hidden lg:flex">
+            <p class="text-sm opacity-90">Web-based interface for rclone file synchronization</p>
+        </div>
+        <div class="navbar-end">
+            <div class="dropdown dropdown-end">
+                <div tabindex="0" role="button" class="btn btn-ghost btn-circle">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364 6.364l-.707-.707M6.343 6.343l-.707-.707m12.728 0l-.707.707M6.343 17.657l-.707.707M16 12a4 4 0 11-8 0 4 4 0 018 0z" />
+                    </svg>
+                </div>
+                <ul tabindex="0" class="menu dropdown-content mt-3 z-[1] p-2 shadow bg-base-100 rounded-box w-52 text-base-content">
+                    <li><a onclick="toggleTheme()">🌓 Toggle Theme</a></li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <!-- Main Container -->
+    <div class="container mx-auto px-4 py-6 max-w-7xl">
+        <!-- Tab Navigation -->
+        <div class="tabs tabs-bordered mb-6 bg-base-100 p-4 rounded-xl shadow-lg">
+            <a id="config-tab-btn" class="tab tab-lg" onclick="switchTab('config')">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                </svg>
+                Configuration
+            </a>
+            <a id="files-tab-btn" class="tab tab-lg tab-active" onclick="switchTab('files')">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+                </svg>
+                File Browser
+            </a>
+            <a id="sync-tab-btn" class="tab tab-lg" onclick="switchTab('sync')">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+                Sync Jobs
+            </a>
+        </div>
+
+        <!-- Configuration Tab -->
+        <div id="config-tab" class="tab-content">
+            <div class="grid lg:grid-cols-2 gap-6">
+                <!-- Add New Remote -->
+                <div class="card bg-base-100 shadow-xl">
+                    <div class="card-body">
+                        <h2 class="card-title text-2xl mb-4">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-success" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
+                            </svg>
+                            Add New Remote
+                        </h2>
+                        <div id="config-alert"></div>
+                        
+                        <form id="config-form" class="space-y-4">
+                            <div class="form-control">
+                                <label class="label">
+                                    <span class="label-text font-semibold">Remote Name</span>
+                                </label>
+                                <input type="text" id="config-name" class="input input-bordered w-full" placeholder="my-nextcloud" required>
+                            </div>
+                            
+                            <div class="form-control">
+                                <label class="label">
+                                    <span class="label-text font-semibold">Type</span>
+                                </label>
+                                <select id="config-type" class="select select-bordered w-full" required>
+                                    <option value="">Choose remote type...</option>
+                                    <option value="webdav">📂 WebDAV (Nextcloud, ownCloud)</option>
+                                    <option value="s3">☁️ Amazon S3</option>
+                                    <option value="dropbox">📦 Dropbox</option>
+                                    <option value="gdrive">📋 Google Drive</option>
+                                    <option value="onedrive">📘 OneDrive</option>
+                                </select>
+                            </div>
+                            
+                            <div class="form-control">
+                                <label class="label">
+                                    <span class="label-text font-semibold">URL</span>
+                                    <span class="label-text-alt">Server endpoint</span>
+                                </label>
+                                <input type="url" id="config-url" class="input input-bordered w-full" placeholder="https://cloud.example.com/remote.php/webdav">
+                            </div>
+                            
+                            <div class="form-control">
+                                <label class="label">
+                                    <span class="label-text font-semibold">Username</span>
+                                </label>
+                                <input type="text" id="config-username" class="input input-bordered w-full" placeholder="your-username">
+                            </div>
+                            
+                            <div class="form-control">
+                                <label class="label">
+                                    <span class="label-text font-semibold">Password</span>
+                                    <span class="label-text-alt">Will be encrypted</span>
+                                </label>
+                                <input type="password" id="config-password" class="input input-bordered w-full" placeholder="your-password">
+                            </div>
+                            
+                            <div class="card-actions justify-end mt-6">
+                                <button type="submit" class="btn btn-primary">
+                                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+                                    </svg>
+                                    Save Configuration
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+                
+                <!-- Existing Configurations -->
+                <div class="card bg-base-100 shadow-xl">
+                    <div class="card-body">
+                        <div class="flex items-center justify-between mb-4">
+                            <h2 class="card-title text-2xl">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-info" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                                </svg>
+                                Existing Configurations
+                            </h2>
+                            <button onclick="persistConfigs()" class="btn btn-success btn-sm">
+                                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3-3m0 0l-3 3m3-3v12" />
+                                </svg>
+                                Save to File
+                            </button>
+                        </div>
+                        <div class="text-sm text-base-content/70 mb-4">
+                            Save in-memory configurations to rclone.conf
+                        </div>
+                        <div id="config-list" class="space-y-3"></div>
+                    </div>
+                </div>
             </div>
         </div>
 
-        <div id="files-tab" class="tab-content">
-            <h2>File Browser</h2>
-            <div class="breadcrumb" id="breadcrumb"></div>
-            <div class="file-list" id="file-list"></div>
+        <!-- File Browser Tab -->
+        <div id="files-tab" class="tab-content block">
+            <div class="card bg-base-100 shadow-xl">
+                <div class="card-body">
+                    <h2 class="card-title text-2xl mb-4">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-warning" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7v10a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-6l-2-2H5a2 2 0 00-2 2z" />
+                        </svg>
+                        File Browser
+                    </h2>
+                    
+                    <!-- Breadcrumb -->
+                    <div class="breadcrumbs text-sm mb-4">
+                        <ul id="breadcrumb" class="bg-base-200 rounded-lg p-3">
+                            <!-- Breadcrumb items will be added here -->
+                        </ul>
+                    </div>
+                    
+                    <!-- File List -->
+                    <div class="overflow-x-auto">
+                        <div id="file-list" class="space-y-2 max-h-96 overflow-y-auto">
+                            <!-- File items will be added here -->
+                        </div>
+                    </div>
+                </div>
+            </div>
         </div>
 
+        <!-- Sync Jobs Tab -->
         <div id="sync-tab" class="tab-content">
-            <h2>Sync Jobs</h2>
-            <div id="sync-jobs"></div>
+            <div class="card bg-base-100 shadow-xl">
+                <div class="card-body">
+                    <h2 class="card-title text-2xl mb-4">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-secondary" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                        </svg>
+                        Sync Jobs
+                    </h2>
+                    <div id="sync-jobs" class="space-y-4">
+                        <!-- Sync jobs will be added here -->
+                    </div>
+                </div>
+            </div>
         </div>
     </div>
 
     <!-- Sync Modal -->
-    <div id="sync-modal" class="modal">
-        <div class="modal-content">
-            <span class="close" onclick="closeSyncModal()">&times;</span>
-            <h3>Sync to Remote</h3>
-            <div id="sync-alert"></div>
-            <div class="form-group">
-                <label>Source:</label>
-                <input type="text" id="sync-source" readonly>
-            </div>
-            <div class="form-group">
-                <label>Remote:</label>
-                <select id="sync-remote" onchange="loadRemoteFiles()">
-                    <option value="">Select remote...</option>
-                </select>
-            </div>
-            <div class="form-group">
-                <label>Remote Navigation:</label>
-                <div style="margin-bottom: 10px;">
-                    <strong>📂 Aktueller Ordner:</strong> <span class="breadcrumb" id="remote-breadcrumb"></span>
+    <dialog id="sync-modal" class="modal">
+        <div class="modal-box w-11/12 max-w-2xl">
+            <form method="dialog">
+                <button class="btn btn-sm btn-circle btn-ghost absolute right-2 top-2">✕</button>
+            </form>
+            <h3 class="font-bold text-xl mb-4">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-primary inline mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                </svg>
+                Sync to Remote
+            </h3>
+            
+            <div id="sync-alert" class="mb-4"></div>
+            
+            <div class="space-y-4">
+                <div class="form-control">
+                    <label class="label">
+                        <span class="label-text font-semibold">Source</span>
+                    </label>
+                    <input type="text" id="sync-source" class="input input-bordered w-full" readonly>
                 </div>
-                <div style="margin: 10px 0; padding: 10px; background: #e8f5e8; border-radius: 4px; border-left: 4px solid #4caf50;">
-                    <strong>🎯 Upload-Ziel:</strong> <span id="selected-remote-path">/</span>
+                
+                <div class="form-control">
+                    <label class="label">
+                        <span class="label-text font-semibold">Remote</span>
+                    </label>
+                    <select id="sync-remote" class="select select-bordered w-full" onchange="loadRemoteFiles()">
+                        <option value="">Select remote...</option>
+                    </select>
                 </div>
-                <div class="file-list" id="remote-file-list"></div>
-                <small style="color: #666; margin-top: 5px; display: block;">
-                    💡 <strong>Einfach-Klick:</strong> Ordner als Upload-Ziel auswählen &nbsp;•&nbsp; <strong>Doppel-Klick:</strong> In Ordner hinein navigieren
-                </small>
+                
+                <div class="form-control">
+                    <label class="label">
+                        <span class="label-text font-semibold">Remote Navigation</span>
+                    </label>
+                    
+                    <div class="alert alert-info mb-4">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="stroke-current shrink-0 h-6 w-6" fill="none" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v3m0 0v3m0-3h3m-3 0H9m12 0a9 9 0 11-18 0 9 9 0 0118 0z" />
+                        </svg>
+                        <div>
+                            <div class="font-bold">Current Folder: <span id="remote-breadcrumb">/</span></div>
+                        </div>
+                    </div>
+                    
+                    <div class="alert alert-success mb-4">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="stroke-current shrink-0 h-6 w-6" fill="none" viewBox="0 0 24 24">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+                        </svg>
+                        <div>
+                            <div class="font-bold">Upload Target: <span id="selected-remote-path">/</span></div>
+                        </div>
+                    </div>
+                    
+                    <div class="border border-base-300 rounded-lg p-4 max-h-64 overflow-y-auto">
+                        <div id="remote-file-list" class="space-y-2">
+                            <!-- Remote files will be listed here -->
+                        </div>
+                    </div>
+                    
+                    <div class="text-sm text-base-content/70 mt-2">
+                        💡 <strong>Single-click:</strong> Select folder as target &nbsp;•&nbsp; <strong>Double-click:</strong> Navigate into folder
+                    </div>
+                </div>
+                
+                <div class="form-control">
+                    <label class="cursor-pointer label justify-start">
+                        <input type="checkbox" id="use-chunking" class="checkbox checkbox-primary mr-3" checked>
+                        <span class="label-text font-semibold">Enable Multi-Threading for large files</span>
+                    </label>
+                    <div class="text-sm text-base-content/70 mt-1">
+                        Recommended for files > 100MB or upload issues
+                    </div>
+                </div>
+                
+                <div class="form-control">
+                    <label class="label">
+                        <span class="label-text font-semibold">Performance Level</span>
+                        <span class="label-text-alt">Higher = Faster but more server load</span>
+                    </label>
+                    <select id="chunk-size" class="select select-bordered w-full">
+                        <option value="8M">🐢 Conservative (2 Streams)</option>
+                        <option value="16M" selected>⚡ Standard (4 Streams)</option>
+                        <option value="32M">🚀 Aggressive (6 Streams)</option>
+                        <option value="64M">💨 Maximum (8 Streams)</option>
+                        <option value="128M">🔥 Ultra (8 Streams)</option>
+                    </select>
+                </div>
             </div>
-            <div class="form-group">
-                <label>
-                    <input type="checkbox" id="use-chunking" checked> 
-                    Multi-Threading für große Dateien aktivieren
-                </label>
-                <small style="display: block; color: #666; margin-top: 5px;">
-                    Empfohlen für Dateien > 100MB oder bei Upload-Problemen
-                </small>
-            </div>
-            <div class="form-group">
-                <label>Performance-Level:</label>
-                <select id="chunk-size">
-                    <option value="8M">Konservativ (2 Streams)</option>
-                    <option value="16M">Standard (4 Streams)</option>
-                    <option value="32M">Aggressiv (6 Streams)</option>
-                    <option value="64M">Maximum (8 Streams)</option>
-                    <option value="128M">Ultra (8 Streams)</option>
-                </select>
-                <small style="display: block; color: #666; margin-top: 5px;">
-                    Höhere Levels = Schneller aber mehr Serverlast
-                </small>
-            </div>
-            <div class="form-group">
-                <button onclick="startSync()">Start Upload</button>
+            
+            <div class="modal-action">
+                <form method="dialog">
+                    <button class="btn btn-ghost">Cancel</button>
+                </form>
+                <button onclick="startSync()" class="btn btn-primary">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
+                    </svg>
+                    Start Upload
+                </button>
             </div>
         </div>
-    </div>
+    </dialog>
 
     <!-- Progress Modal -->
-    <div id="progress-modal" class="modal">
-        <div class="modal-content">
-            <span class="close" onclick="closeProgressModal()">&times;</span>
-            <h3>Upload Progress</h3>
-            <div id="progress-info"></div>
-            <div class="progress-bar">
-                <div class="progress-fill" id="progress-fill"></div>
+    <dialog id="progress-modal" class="modal">
+        <div class="modal-box">
+            <form method="dialog">
+                <button class="btn btn-sm btn-circle btn-ghost absolute right-2 top-2">✕</button>
+            </form>
+            <h3 class="font-bold text-xl mb-4">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-accent inline mr-2 animate-spin" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+                Upload Progress
+            </h3>
+            
+            <div id="progress-info" class="mb-4"></div>
+            
+            <div class="w-full bg-base-300 rounded-full h-4 mb-4">
+                <div class="bg-primary h-4 rounded-full progress-animate" id="progress-fill" style="width: 0%"></div>
             </div>
-            <div id="progress-details"></div>
+            
+            <div id="progress-details" class="text-sm text-base-content/70"></div>
         </div>
+    </dialog>
+
+    <!-- Toast Container -->
+    <div id="toast-container" class="toast toast-bottom toast-start z-50">
+        <!-- Toast notifications will be added here -->
     </div>
 
     <script src="app.js"></script>
+    <script>
+        // Theme toggle functionality
+        function toggleTheme() {
+            const html = document.documentElement;
+            const currentTheme = html.getAttribute('data-theme');
+            const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
+            html.setAttribute('data-theme', newTheme);
+            localStorage.setItem('theme', newTheme);
+        }
+
+        // Load saved theme
+        const savedTheme = localStorage.getItem('theme') || 'light';
+        document.documentElement.setAttribute('data-theme', savedTheme);
+    </script>
 </body>
 </html>

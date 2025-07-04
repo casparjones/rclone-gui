@@ -1,2 +1,26 @@
-/target
+# Rust
+/target/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local environment overrides (should not be committed)
+.env.local
+
+# Runtime data
 /data/cfg/rclone.conf
+rclone.conf
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
