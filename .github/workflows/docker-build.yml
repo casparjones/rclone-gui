@@ -57,7 +57,13 @@ jobs:
 
     - name: Test Docker image
       run: |
-        docker run --rm -d --name test-container -p 8080:8080 ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-        sleep 10
-        curl -f http://localhost:8080/ || exit 1
+        mkdir -p data userdata
+        docker run --rm -d \
+          --name test-container \
+          -v $(pwd)/data:/app/data \
+          -v $(pwd)/userdata:/data \
+          -p 8080:8080 \
+          ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+        sleep 20
+        curl -f http://localhost:8080/ || (docker logs test-container && exit 1)
         docker stop test-container
