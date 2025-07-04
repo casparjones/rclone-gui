@@ -332,6 +332,21 @@ async fn parse_latest_progress_from_log(job_id: &str) -> Option<(f64, u64, u64)>
                         return Some(progress_info);
                     }
                 }
+                
+                // Check for successful file copy completion
+                if level == "info" {
+                    if let Some(msg) = json.get("msg").and_then(|v| v.as_str()) {
+                        if msg == "Copied (new)" || msg == "Copied (replaced existing)" {
+                            if let Some(object_name) = json.get("object").and_then(|v| v.as_str()) {
+                                debug!("✅ File successfully copied for job {}: {}", job_id, object_name);
+                                // This indicates successful completion, return 100%
+                                // Use reasonable default values for bytes if not available
+                                let total_bytes = json.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+                                return Some((100.0, total_bytes, total_bytes));
+                            }
+                        }
+                    }
+                }
             }
             
             // Alternative: look for explicit stats messages
@@ -353,18 +368,36 @@ async fn parse_latest_progress_from_log(job_id: &str) -> Option<(f64, u64, u64)>
 /// Parse progress information from a rclone JSON log entry
 fn parse_json_stats(json: &serde_json::Value) -> Option<(f64, u64, u64)> {
     // rclone JSON stats structure with --stats-log-level NOTICE
-    // Look for different possible field names that rclone might use
+    // Use the correct fields for accurate progress tracking
     
     // Check for direct stats fields in the JSON object
     if let (Some(transferred), Some(total_size)) = (
         json.get("bytes").and_then(|v| v.as_u64()),
         json.get("totalBytes").and_then(|v| v.as_u64())
     ) {
+        // Check transfer completion status
+        let transfers_completed = json.get("transfers").and_then(|v| v.as_u64()).unwrap_or(0);
+        let transferring_list = json.get("transferring").and_then(|v| v.as_array());
+        let is_transferring = transferring_list.map_or(false, |arr| !arr.is_empty());
+        
+        // Calculate accurate percentage
         let percent = if total_size > 0 {
-            (transferred as f64 / total_size as f64) * 100.0
+            if transferred == total_size && transfers_completed >= 1 && !is_transferring {
+                // Transfer is definitely complete
+                100.0
+            } else {
+                // Calculate based on bytes transferred
+                (transferred as f64 / total_size as f64) * 100.0
+            }
         } else {
             0.0
         };
+        
+        debug!(
+            "📊 JSON stats: bytes={}, totalBytes={}, transfers={}, transferring={}, percent={:.1}%",
+            transferred, total_size, transfers_completed, is_transferring, percent
+        );
+        
         return Some((percent, transferred, total_size));
     }
     
@@ -374,11 +407,25 @@ fn parse_json_stats(json: &serde_json::Value) -> Option<(f64, u64, u64)> {
             stats.get("bytes").and_then(|v| v.as_u64()),
             stats.get("totalBytes").and_then(|v| v.as_u64())
         ) {
+            let transfers_completed = stats.get("transfers").and_then(|v| v.as_u64()).unwrap_or(0);
+            let transferring_list = stats.get("transferring").and_then(|v| v.as_array());
+            let is_transferring = transferring_list.map_or(false, |arr| !arr.is_empty());
+            
             let percent = if total_size > 0 {
-                (transferred as f64 / total_size as f64) * 100.0
+                if transferred == total_size && transfers_completed >= 1 && !is_transferring {
+                    100.0
+                } else {
+                    (transferred as f64 / total_size as f64) * 100.0
+                }
             } else {
                 0.0
             };
+            
+            debug!(
+                "📊 Nested stats: bytes={}, totalBytes={}, transfers={}, transferring={}, percent={:.1}%",
+                transferred, total_size, transfers_completed, is_transferring, percent
+            );
+            
             return Some((percent, transferred, total_size));
         }
     }
