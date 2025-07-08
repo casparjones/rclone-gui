@@ -728,8 +728,9 @@ function displaySyncJobs(jobs) {
                            job.status === 'Failed' ? 'badge-error' : 
                            job.status === 'Running' ? 'badge-warning' : 'badge-info';
         
-        // Calculate elapsed time
-        const elapsedSeconds = Math.floor(Date.now() / 1000) - job.start_time;
+        // Calculate elapsed time - use end_time if available, otherwise current time
+        const currentTime = job.end_time || Math.floor(Date.now() / 1000);
+        const elapsedSeconds = currentTime - job.start_time;
         const elapsedTime = formatDuration(elapsedSeconds);
         
         // Calculate estimated remaining time

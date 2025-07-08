@@ -58,6 +58,7 @@ pub async fn start_sync(Json(sync_request): Json<SyncRequest>) -> ResponseJson<A
         total: 0,
         source_name,
         start_time,
+        end_time: None,
     };
 
     {
@@ -102,7 +103,37 @@ pub async fn get_sync_progress(job_id: String) -> ResponseJson<ApiResponse<SyncP
 }
 
 pub async fn list_sync_jobs() -> ResponseJson<ApiResponse<Vec<SyncProgress>>> {
-    let jobs = SYNC_JOBS.lock().await;
+    let mut jobs = SYNC_JOBS.lock().await;
+    
+    // Clean up jobs older than 24 hours (86400 seconds)
+    let now = Utc::now().timestamp();
+    let cleanup_threshold = now - 86400; // 24 hours ago
+    
+    let mut jobs_to_remove = Vec::new();
+    
+    // Find completed jobs older than 24 hours
+    for (job_id, job) in jobs.iter() {
+        if let Some(end_time) = job.end_time {
+            if end_time < cleanup_threshold && (job.status == "Completed" || job.status == "Failed" || job.status.contains("Error")) {
+                jobs_to_remove.push(job_id.clone());
+            }
+        }
+    }
+    
+    // Remove old jobs and their log files
+    for job_id in jobs_to_remove {
+        if let Some(job) = jobs.remove(&job_id) {
+            info!("🧹 Auto-cleanup: Removing job {} (completed {}h ago)", 
+                job_id, (now - job.end_time.unwrap_or(now)) / 3600);
+            
+            // Remove log file
+            let log_file_path = format!("data/log/{}.log", job_id);
+            if let Err(e) = tokio::fs::remove_file(&log_file_path).await {
+                debug!("⚠️ Could not delete log file {}: {}", log_file_path, e);
+            }
+        }
+    }
+
     let mut job_list: Vec<SyncProgress> = jobs.values().cloned().collect();
 
     // Sort by creation time (newest first) - using job_id as timestamp proxy
@@ -276,6 +307,9 @@ async fn execute_sync(job_id: String, sync_request: SyncRequest, sync_jobs: Sync
     // Update in-memory status based on exit code
     let mut jobs = sync_jobs.lock().await;
     if let Some(progress) = jobs.get_mut(&job_id) {
+        let end_time = Utc::now().timestamp();
+        progress.end_time = Some(end_time);
+        
         match &status {
             Ok(es) if es.success() => {
                 progress.status = "Completed".to_string();
