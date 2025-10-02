@@ -5,6 +5,7 @@ let selectedRemotePath = '/';  // Der aktuell ausgewählte Ordner für den Uploa
 let currentSyncSource = '';
 let currentSyncJobId = '';
 let configs = [];
+let tasks = [];
 
 // Initialize app
 document.addEventListener('DOMContentLoaded', function() {
@@ -15,6 +16,7 @@ document.addEventListener('DOMContentLoaded', function() {
     });
     loadFiles();
     loadSyncJobs();
+    loadTasks();
     
     // Set up form submission
     document.getElementById('config-form').addEventListener('submit', saveConfig);
@@ -67,6 +69,9 @@ function switchTab(tabName) {
             break;
         case 'sync':
             loadSyncJobs();
+            break;
+        case 'tasks':
+            loadTasks();
             break;
     }
 }
@@ -796,6 +801,211 @@ function displaySyncJobs(jobs) {
             </div>
         `;
     }).join('');
+}
+
+// Task management functions
+async function loadTasks() {
+    try {
+        const response = await fetch('/api/tasks');
+        const result = await response.json();
+        
+        if (result.success) {
+            tasks = result.data;
+            displayTasks();
+        } else {
+            showToast('Error loading tasks: ' + result.error, 'error');
+        }
+    } catch (error) {
+        showToast('Error loading tasks: ' + error.message, 'error');
+    }
+}
+
+function displayTasks() {
+    const tasksList = document.getElementById('tasks-list');
+    
+    if (tasks.length === 0) {
+        tasksList.innerHTML = '<div class="text-center text-base-content/60 py-8">No tasks found. Create a task from the sync modal.</div>';
+        return;
+    }
+    
+    tasksList.innerHTML = tasks.map(task => {
+        const createdDate = new Date(task.created_at).toLocaleDateString();
+        return `
+        <div class="card bg-base-100 shadow-sm">
+            <div class="card-body py-4 px-5">
+                <div class="flex items-center justify-between">
+                    <div class="flex-1">
+                        <div class="font-semibold text-lg">${task.name}</div>
+                        <div class="text-sm text-base-content/70 mt-1">
+                            <div>📁 ${task.source_path}</div>
+                            <div>☁️ ${task.remote_name}:${task.remote_path}</div>
+                            <div>📅 Created: ${createdDate}</div>
+                            ${task.use_chunking ? '<div>⚡ Multi-threading enabled' + (task.chunk_size ? ` (${task.chunk_size})` : '') + '</div>' : ''}
+                        </div>
+                    </div>
+                    <div class="flex items-center space-x-2">
+                        <button onclick="startTaskFromList('${task.name}')" class="btn btn-success btn-sm">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.828 14.828a4 4 0 01-5.656 0M9 10h1m4 0h1m-6 4h1m4 0h1m-6 4h6M7 10V7a3 3 0 013-3h4a3 3 0 013 3v3M7 13v8a2 2 0 002 2h6a2 2 0 002-2v-8" />
+                            </svg>
+                            Start
+                        </button>
+                        <button onclick="deleteTask('${task.id}')" class="btn btn-error btn-sm">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
+                            </svg>
+                            Delete
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+        `;
+    }).join('');
+}
+
+function openCreateTaskModal() {
+    const remoteName = document.getElementById('sync-remote').value;
+    
+    if (!remoteName) {
+        showAlert('sync-alert', 'Please select a remote first', 'error');
+        return;
+    }
+    
+    // Clear previous values
+    document.getElementById('task-name').value = '';
+    clearAlert('create-task-alert');
+    
+    // Close sync modal and open task modal
+    document.getElementById('sync-modal').close();
+    document.getElementById('create-task-modal').showModal();
+}
+
+async function createTask() {
+    const taskName = document.getElementById('task-name').value.trim();
+    const remoteName = document.getElementById('sync-remote').value;
+    
+    // Validation
+    if (!taskName) {
+        showAlert('create-task-alert', 'Please enter a task name', 'error');
+        return;
+    }
+    
+    if (!remoteName) {
+        showAlert('create-task-alert', 'No remote selected', 'error');
+        return;
+    }
+    
+    // Validate alphanumeric name
+    if (!/^[a-zA-Z0-9_-]+$/.test(taskName)) {
+        showAlert('create-task-alert', 'Task name can only contain letters, numbers, underscores, and hyphens', 'error');
+        return;
+    }
+    
+    const useChunking = document.getElementById('use-chunking').checked;
+    const chunkSize = useChunking ? document.getElementById('chunk-size').value : null;
+    
+    const taskRequest = {
+        name: taskName,
+        source_path: currentSyncSource,
+        remote_name: remoteName,
+        remote_path: selectedRemotePath,
+        chunk_size: chunkSize,
+        use_chunking: useChunking
+    };
+    
+    try {
+        const response = await fetch('/api/tasks', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(taskRequest)
+        });
+        
+        const result = await response.json();
+        
+        if (result.success) {
+            showToast(`Task '${taskName}' created successfully!`, 'success');
+            document.getElementById('create-task-modal').close();
+            loadTasks(); // Refresh tasks list
+            
+            // Switch to tasks tab to show the new task
+            switchTab('tasks');
+            document.getElementById('tasks-tab-btn').classList.add('tab-active');
+            document.querySelectorAll('.tab:not(#tasks-tab-btn)').forEach(tab => {
+                tab.classList.remove('tab-active');
+            });
+        } else {
+            showAlert('create-task-alert', 'Error creating task: ' + result.error, 'error');
+        }
+    } catch (error) {
+        showAlert('create-task-alert', 'Error creating task: ' + error.message, 'error');
+    }
+}
+
+async function deleteTask(taskId) {
+    if (!confirm('Are you sure you want to delete this task?')) {
+        return;
+    }
+    
+    try {
+        const response = await fetch(`/api/tasks/${taskId}`, {
+            method: 'DELETE'
+        });
+        
+        const result = await response.json();
+        
+        if (result.success) {
+            showToast('Task deleted successfully', 'success');
+            loadTasks(); // Refresh tasks list
+        } else {
+            showToast('Error deleting task: ' + result.error, 'error');
+        }
+    } catch (error) {
+        showToast('Error deleting task: ' + error.message, 'error');
+    }
+}
+
+async function startTaskFromList(taskName) {
+    try {
+        const response = await fetch('/api/tasks/start', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ task_name: taskName })
+        });
+        
+        const result = await response.json();
+        
+        if (result.success) {
+            currentSyncJobId = result.data;
+            showToast(`Task '${taskName}' started successfully!`, 'success');
+            
+            // Switch to sync jobs tab to monitor progress
+            switchTab('sync');
+            document.getElementById('sync-tab-btn').classList.add('tab-active');
+            document.querySelectorAll('.tab:not(#sync-tab-btn)').forEach(tab => {
+                tab.classList.remove('tab-active');
+            });
+            
+            // Open progress modal
+            openProgressModal();
+            monitorProgress();
+        } else {
+            showToast('Error starting task: ' + result.error, 'error');
+        }
+    } catch (error) {
+        showToast('Error starting task: ' + error.message, 'error');
+    }
+}
+
+function clearAlert(containerId) {
+    const container = document.getElementById(containerId);
+    if (container) {
+        container.innerHTML = '';
+    }
 }
 
 // Utility functions

@@ -24,6 +24,7 @@ use chrono;
 mod handlers;
 mod models;
 mod config_manager;
+mod database;
 
 #[derive(Parser)]
 #[command(name = "rclone-gui")]
@@ -33,6 +34,8 @@ struct Args {
     memory_mode: bool,
     #[arg(long, default_value = "127.0.0.1:8080", help = "Address to bind the server to")]
     bind: String,
+    #[arg(long, help = "Start a task by name and exit")]
+    start_task: Option<String>,
 }
 
 #[tokio::main]
@@ -50,8 +53,25 @@ async fn main() {
     println!("⚙️  Command line arguments:");
     println!("   Memory mode: {}", args.memory_mode);
     println!("   Bind address: {}", args.bind);
+    if let Some(ref task_name) = args.start_task {
+        println!("   Start task: {}", task_name);
+    }
     println!("");
 
+    // Initialize database
+    let db_pool = match database::init_database().await {
+        Ok(pool) => pool,
+        Err(e) => {
+            eprintln!("❌ Failed to initialize database: {}", e);
+            std::process::exit(1);
+        }
+    };
+    
+    // Handle CLI task execution
+    if let Some(task_name) = args.start_task {
+        return handle_cli_task_execution(db_pool, task_name).await;
+    }
+    
     let config_manager = Arc::new(config_manager::ConfigManager::new(args.memory_mode));
     
     if args.memory_mode {
@@ -89,6 +109,10 @@ async fn main() {
     println!("   GET    /api/sync/:job_id/log          -> get_sync_log");
     println!("   GET    /api/sync/:job_id              -> get_sync_progress");
     println!("   DELETE /api/sync/:job_id              -> delete_sync_job");
+    println!("   GET    /api/tasks                     -> get_tasks");
+    println!("   POST   /api/tasks                     -> create_task");
+    println!("   DELETE /api/tasks/:task_id            -> delete_task");
+    println!("   POST   /api/tasks/start               -> start_task");
     println!("   STATIC /static/*                      -> serve static files");
     println!("");
 
@@ -108,10 +132,15 @@ async fn main() {
         .route("/api/sync/:job_id/log", get(get_sync_log_handler))
         .route("/api/sync/:job_id", get(get_sync_progress_handler))
         .route("/api/sync/:job_id", delete(delete_sync_job_handler))
+        .route("/api/tasks", get(handlers::tasks::get_tasks))
+        .route("/api/tasks", post(handlers::tasks::create_task))
+        .route("/api/tasks/:task_id", delete(handlers::tasks::delete_task))
+        .route("/api/tasks/start", post(handlers::tasks::start_task))
         .nest_service("/static", ServeDir::new("static"))
         .layer(middleware::from_fn(request_logging_middleware))
         .layer(TraceLayer::new_for_http())
         .layer(Extension(config_manager))
+        .layer(Extension(db_pool))
         .layer(
             ServiceBuilder::new()
                 .layer(CorsLayer::permissive())
@@ -366,4 +395,99 @@ fn setup_tracing() {
         .init();
         
     tracing::info!("🔍 Tracing initialized");
+}
+
+/// Handle CLI task execution
+async fn handle_cli_task_execution(db_pool: sqlx::Pool<sqlx::Sqlite>, task_name: String) {
+    use crate::models::SyncRequest;
+    use axum::extract::Json;
+    
+    println!("🚀 Starting task '{}' from command line...", task_name);
+    
+    // Get task from database
+    let task = match database::get_task_by_name(&db_pool, &task_name).await {
+        Ok(Some(task)) => task,
+        Ok(None) => {
+            eprintln!("❌ Task '{}' not found", task_name);
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("❌ Failed to retrieve task '{}': {}", task_name, e);
+            std::process::exit(1);
+        }
+    };
+    
+    println!("📋 Task details:");
+    println!("   Name: {}", task.name);
+    println!("   Source: {}", task.source_path);
+    println!("   Remote: {}:{}", task.remote_name, task.remote_path);
+    println!("   Chunking: {}", if task.use_chunking { "enabled" } else { "disabled" });
+    if let Some(ref chunk_size) = task.chunk_size {
+        println!("   Chunk size: {}", chunk_size);
+    }
+    println!("");
+    
+    // Convert task to sync request
+    let sync_request = SyncRequest {
+        source_path: task.source_path,
+        remote_name: task.remote_name,
+        remote_path: task.remote_path,
+        chunk_size: task.chunk_size,
+        use_chunking: Some(task.use_chunking),
+    };
+    
+    // Start the sync job
+    let job_response = handlers::sync::start_sync(Json(sync_request)).await;
+    let job_id = match job_response.0.data {
+        Some(id) => id,
+        None => {
+            eprintln!("❌ Failed to start sync job: {:?}", job_response.0.error);
+            std::process::exit(1);
+        }
+    };
+    
+    println!("✅ Sync job started with ID: {}", job_id);
+    println!("📊 Monitoring progress...");
+    println!("");
+    
+    // Monitor progress
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+        
+        let progress_response = handlers::sync::get_sync_progress(job_id.clone()).await;
+        if let Some(progress) = progress_response.0.data {
+            println!("📈 Progress: {:.1}% | Status: {} | Transferred: {} / {}", 
+                progress.progress,
+                progress.status,
+                format_bytes(progress.transferred),
+                format_bytes(progress.total)
+            );
+            
+            if progress.status == "Completed" {
+                println!("");
+                println!("✅ Task '{}' completed successfully!", task_name);
+                break;
+            } else if progress.status == "Failed" || progress.status.contains("Error") {
+                println!("");
+                eprintln!("❌ Task '{}' failed: {}", task_name, progress.status);
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes == 0 { return "0 B".to_string(); }
+    
+    const UNITS: &[&str] = &["B", "KB", "MB", "GB", "TB"];
+    let base = 1024_f64;
+    let log = (bytes as f64).log(base).floor() as usize;
+    let unit_index = log.min(UNITS.len() - 1);
+    let value = bytes as f64 / base.powi(unit_index as i32);
+    
+    if unit_index >= 3 {
+        format!("{:.1} {}", value, UNITS[unit_index])
+    } else {
+        format!("{:.0} {}", value, UNITS[unit_index])
+    }
 }

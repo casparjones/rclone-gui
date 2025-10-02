@@ -8,6 +8,8 @@ A Rust-based web application that provides a user-friendly GUI for rclone file s
 - **File Browser**: Browse local files with an intuitive interface
 - **Remote Browsing**: Navigate remote storage structures
 - **Sync Functionality**: Upload files/folders to remotes with progress tracking
+- **Task Management**: Create, store, and execute reusable sync tasks
+- **CLI Task Execution**: Run tasks from command line for automation
 - **Memory Mode**: Optional in-memory configuration for safe testing
 
 ## Prerequisites
@@ -80,7 +82,18 @@ cargo run -- --bind 0.0.0.0:3000
 ### Command Line Options
 - `--memory-mode`: Enable in-memory configuration mode
 - `--bind <address>`: Set custom bind address (default: 127.0.0.1:8080)
+- `--start-task <task-name>`: Start a task by name and exit (perfect for automation)
 - `--help`: Show all available options
+
+### Task Management (CLI)
+Execute pre-configured sync tasks from the command line:
+```bash
+# Run a specific task
+./target/release/rclone-gui --start-task my-backup-task
+
+# Task will show progress and exit when complete
+# Perfect for cron jobs, scripts, and automation
+```
 
 ## Web Interface
 
@@ -111,14 +124,29 @@ Open your browser to `http://127.0.0.1:8080` (or your custom bind address) to ac
 - **Detailed Progress**: Shows transferred/total bytes with formatted display
 - **Job History**: Complete overview of all sync operations
 
+### Tasks Tab (NEW)
+- **Task Management**: Create, view, and manage reusable sync configurations
+- **One-Click Execution**: Start tasks with a single click
+- **Task Creation**: Create tasks directly from sync modal with custom names
+- **Persistent Storage**: Tasks stored in SQLite database for reliability
+- **Alphanumeric Validation**: Task names must be alphanumeric (plus `-` and `_`)
+
 ## Sync Process
 
+### One-Time Sync
 1. Navigate to the desired local file/folder in the File Browser
 2. Click the "Sync" button next to the item
 3. Select the target remote from the dropdown
 4. Navigate to the desired destination folder on the remote
 5. Click "Start Upload"
 6. Monitor progress in the popup or Sync Jobs tab
+
+### Task-Based Sync (NEW)
+1. Follow steps 1-4 above to configure your sync
+2. Instead of "Start Upload", click "Create Task"
+3. Enter a task name (alphanumeric, `-`, `_` allowed)
+4. Task is saved and can be reused from the Tasks tab
+5. Execute tasks via GUI (Tasks tab → Play button) or CLI (`--start-task task-name`)
 
 ## Configuration File
 
@@ -189,17 +217,23 @@ cargo run
 ### Project Structure
 ```
 src/
-├── main.rs              # Application entry point
-├── models.rs            # Data structures
+├── main.rs              # Application entry point with CLI task support
+├── models.rs            # Data structures including Task models
 ├── config_manager.rs    # Configuration management
+├── database.rs          # SQLite database operations for tasks
 └── handlers/
     ├── mod.rs
     ├── config.rs        # Configuration API endpoints
     ├── files.rs         # File browser endpoints
-    └── sync.rs          # Sync operation endpoints
+    ├── sync.rs          # Sync operation endpoints
+    └── tasks.rs         # Task management endpoints (NEW)
 static/
-├── index.html           # Main web interface
-└── app.js              # Frontend JavaScript
+├── index.html           # Main web interface with Tasks tab
+└── app.js              # Frontend JavaScript with task functionality
+data/
+├── tasks.db             # SQLite database for task storage (auto-created)
+├── cfg/rclone.conf      # Rclone configuration file
+└── log/                 # Sync job logs
 ```
 
 ### Building
@@ -257,6 +291,15 @@ docker-compose up -d
 ### GitHub Container Registry
 Siehe `Docker.info` für detaillierte Anweisungen zum Deployment über GitHub Container Registry.
 
+## Contributors
+
+- **Original Author**: Base rclone GUI application
+- **Claude (Anthropic AI Assistant)**: Task management system implementation (v0.1.0)
+  - Complete task management functionality with SQLite persistence
+  - CLI task execution with `--start-task` option
+  - Web interface enhancements with Tasks tab
+  - Database layer and REST API endpoints
+
 ## Contributing
 
 1. Fork the repository
@@ -264,6 +307,9 @@ Siehe `Docker.info` für detaillierte Anweisungen zum Deployment über GitHub Co
 3. Make your changes
 4. Test thoroughly
 5. Submit a pull request
+
+### Recent Contributions
+- **v0.1.0 (2025-10-02)**: Task management system by Claude - See [CHANGELOG.md](CHANGELOG.md) for details
 
 ## License
 

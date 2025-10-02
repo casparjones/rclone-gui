@@ -73,6 +73,12 @@
                 </svg>
                 Sync Jobs
             </a>
+            <a id="tasks-tab-btn" class="tab tab-lg" onclick="switchTab('tasks')">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" />
+                </svg>
+                Tasks
+            </a>
         </div>
 
         <!-- Configuration Tab -->
@@ -220,6 +226,23 @@
                 </div>
             </div>
         </div>
+
+        <!-- Tasks Tab -->
+        <div id="tasks-tab" class="tab-content">
+            <div class="card bg-base-100 shadow-xl">
+                <div class="card-body">
+                    <h2 class="card-title text-2xl mb-4">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-accent" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-3 7h3m-3 4h3m-6-4h.01M9 16h.01" />
+                        </svg>
+                        Tasks
+                    </h2>
+                    <div id="tasks-list" class="space-y-4">
+                        <!-- Tasks will be added here -->
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
 
     <!-- Sync Modal -->
@@ -320,6 +343,12 @@
                 <form method="dialog">
                     <button class="btn btn-ghost">Cancel</button>
                 </form>
+                <button onclick="openCreateTaskModal()" class="btn btn-secondary">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
+                    </svg>
+                    Create Task
+                </button>
                 <button onclick="startSync()" class="btn btn-primary">
                     <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" />
@@ -352,6 +381,48 @@
             </div>
             
             <div id="progress-details" class="text-sm text-base-content/70"></div>
+        </div>
+    </dialog>
+
+    <!-- Create Task Modal -->
+    <dialog id="create-task-modal" class="modal">
+        <div class="modal-box">
+            <form method="dialog">
+                <button class="btn btn-sm btn-circle btn-ghost absolute right-2 top-2">✕</button>
+            </form>
+            <h3 class="font-bold text-xl mb-4">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-secondary inline mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
+                </svg>
+                Create Task
+            </h3>
+            
+            <div id="create-task-alert" class="mb-4"></div>
+            
+            <div class="space-y-4">
+                <div class="form-control">
+                    <label class="label">
+                        <span class="label-text font-semibold">Task Name</span>
+                        <span class="label-text-alt">Alphanumeric characters only</span>
+                    </label>
+                    <input type="text" id="task-name" class="input input-bordered w-full" placeholder="my-sync-task" maxlength="50" pattern="[a-zA-Z0-9_-]+">
+                    <div class="text-sm text-base-content/70 mt-1">
+                        Only letters, numbers, underscores, and hyphens allowed
+                    </div>
+                </div>
+            </div>
+            
+            <div class="modal-action">
+                <form method="dialog">
+                    <button class="btn btn-ghost">Cancel</button>
+                </form>
+                <button onclick="createTask()" class="btn btn-primary">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7" />
+                    </svg>
+                    Create Task
+                </button>
+            </div>
         </div>
     </dialog>
 

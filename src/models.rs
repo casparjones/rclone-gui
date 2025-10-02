@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use sqlx::FromRow;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RcloneConfig {
@@ -56,6 +57,33 @@ pub struct ApiResponse<T> {
     pub success: bool,
     pub data: Option<T>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct Task {
+    pub id: String,
+    pub name: String,
+    pub source_path: String,
+    pub remote_name: String,
+    pub remote_path: String,
+    pub chunk_size: Option<String>,
+    pub use_chunking: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TaskRequest {
+    pub name: String,
+    pub source_path: String,
+    pub remote_name: String,
+    pub remote_path: String,
+    pub chunk_size: Option<String>,
+    pub use_chunking: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StartTaskRequest {
+    pub task_name: String,
 }
 
 impl<T> ApiResponse<T> {

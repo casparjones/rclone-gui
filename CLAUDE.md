@@ -1,0 +1,4 @@
+ich möchte in dem tool ein kleine anpassung machen. 
+Neu: Tasks
+Beim Sync Button öffnet sich ein Overlay in dem overlay soll man die option haben ein Task zu erstellen mit den einstellungen für diesen Sync job, der Task muss ein name haben, der alphanumerisch ist. Der Task wird dann in der Datenbank gespeichert. Im Frontend gibt es dann ein Tab "Tasks" mit passendem icon, wenn man da drauf klickt sieht man angelegte tasks. Man soll tasks über ein Mülleimer löschen können und mit einem play button ein Syncjob Starten.
+Die CLI App soll eine option haben --start-task=<taskname> um das selbe zu machen wie in der gui, nur über die cli, der output der im log erscheint sollte beim cli auch ausgegeben werden
