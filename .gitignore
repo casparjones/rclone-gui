@@ -18,9 +18,18 @@ Thumbs.db
 /data/cfg/rclone.conf
 rclone.conf
 
+# SQLite-Datenbank (entsteht beim ersten Start, siehe README)
+# Die WAL-Begleitdateien legt SQLite im WAL-Modus zusaetzlich an.
+/data/tasks.db
+/data/*.db-wal
+/data/*.db-shm
+
 # Logs
 *.log
 /data/log/*.log
+
+# Thumbnail-Cache (serverseitig generiert, ausserhalb des browsebaren Baums)
+/data/cache/
 
 # Temporary files
 *.tmp

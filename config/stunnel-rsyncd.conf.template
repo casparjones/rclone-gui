@@ -1,0 +1,78 @@
+# stunnel-Vorlage für die TLS-Terminierung des rsync-Daemons (Ticket 5feb3af2).
+#
+# Diese Datei ist eine VORLAGE. `config/rsync-tls.sh` ersetzt die @PLATZHALTER@
+# und schreibt das Ergebnis nach $RSYNCD_DIR/stunnel.conf. Änderungen gehören
+# hierher, nicht in die gerenderte Datei — die wird bei jedem Start überschrieben.
+#
+# Aufbau (aus `man rsyncd.conf`, Abschnitt "SSL/TLS Daemon Setup"):
+#
+#     Client --TLS--> stunnel 0.0.0.0:874 --Klartext--> rsyncd 127.0.0.1:873
+#
+# Der Daemon selbst bindet ausschliesslich auf 127.0.0.1 (siehe
+# src/handlers/rsyncd.rs, DAEMON_ADDRESS). Port 873 wird nicht nach aussen
+# gemappt. stunnel ist damit der einzige Weg von aussen zum Daemon.
+
+# Kein Fork in den Hintergrund: start.sh verwaltet den Prozess selbst und will
+# die Logzeilen im Container-Log haben (Verbindungen mit echter Client-IP).
+foreground = yes
+pid =
+
+# debug = 4 (warning) wäre zu leise: erst ab notice steht pro Verbindung
+# "Service [rsyncd-tls] accepted connection from <ip>:<port>" im Log. Das ist
+# die einzige Stelle, an der die echte Client-IP auftaucht — siehe den Block
+# "proxy protocol" unten.
+debug = 5
+syslog = no
+
+[rsyncd-tls]
+accept  = @ACCEPT@
+connect = @CONNECT@
+
+cert = @CERT@
+key  = @KEY@
+
+# TLS 1.2 als Untergrenze, 1.3 ist erlaubt. Nicht `sslVersion = TLSv1.2`
+# verwenden — das nagelt exakt auf 1.2 fest und schliesst 1.3 aus.
+sslVersionMin = TLSv1.2
+
+# Der Client authentifiziert den Server (rsync-ssl ruft `openssl s_client
+# -verify_return_error` mit der beim Pairing übergebenen CA auf). In die
+# Gegenrichtung authentifiziert der rsync-Daemon den Client über
+# `auth users` + Challenge-Response, nicht über ein Client-Zertifikat.
+# Deshalb hier bewusst keine `verifyPeer`-Zeile.
+verify = 0
+
+# Verbindungen laufen lange (grosse Transfers) und werden von rsync selbst
+# beendet. 0 = nicht auf close_notify der Gegenseite warten.
+TIMEOUTclose = 0
+
+# ---------------------------------------------------------------------------
+# proxy protocol — bewusst NICHT gesetzt
+#
+# `protocol = proxy` hier und `proxy protocol = true` in der rsyncd.conf sind
+# ein Paar: entweder beide oder keines. Halbe Aktivierung ist der schlimmste
+# Fall — der Daemon (rsync 3.4.3, unser Image) setzt dann jede Verbindung
+# zurück (`safe_read failed to read 1 bytes: Connection reset by peer (104)`,
+# exit 12) und schreibt dazu KEINE Logzeile.
+#
+# Die vollständige Aktivierung wurde gemessen und funktioniert: mit
+# `protocol = proxy` hier UND `proxy protocol = true` im Daemon läuft der
+# Transfer durch, und im Daemon-Log steht die echte Client-IP. Es ist also
+# eine Entscheidung, keine technische Unmöglichkeit.
+#
+# Entscheidung dieses Tickets: beides bleibt aus.
+#   * Für die Zugriffskontrolle bringt es nichts — die läuft über `auth users`,
+#     nicht über `hosts allow`.
+#   * `proxy protocol hosts` kennt rsync 3.4.3 nicht ("Unknown Parameter
+#     encountered", zwei Logzeilen pro Verbindung). Die Liste vertrauens-
+#     würdiger Proxys ist damit wirkungslos: der Daemon glaubt jeden
+#     PROXY-Header, der ihn erreicht.
+#   * Die echte Client-IP steht bereits hier im stunnel-Log (siehe `debug = 5`)
+#     und ist dort nicht fälschbar. Im Daemon-Log steht statt dessen 127.0.0.1.
+#   * Die beiden Hälften liegen in verschiedenen Dateien und verschiedenen
+#     Tickets. Wer nur eine davon ausrollt, bekommt einen Verbindungsabbruch
+#     ohne jede Logzeile auf der Serverseite.
+#
+# Fürs Audit-Log (Ticket 9f3d4888) heisst das: die Peer-IP kommt aus dem
+# stunnel-Log, nicht aus dem rsyncd-Log. Details in README.md.
+# ---------------------------------------------------------------------------

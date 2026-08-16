@@ -1,7 +1,7 @@
+use crate::config_manager::ConfigManager;
+use crate::models::{ApiResponse, ConfigRequest, RcloneConfig};
 use axum::{extract::Json, response::Json as ResponseJson, Extension};
 use std::sync::Arc;
-use crate::models::{ApiResponse, ConfigRequest, RcloneConfig};
-use crate::config_manager::ConfigManager;
 
 pub async fn get_configs(
     Extension(config_manager): Extension<Arc<ConfigManager>>,
@@ -17,7 +17,9 @@ pub async fn save_config(
     Json(config_request): Json<ConfigRequest>,
 ) -> ResponseJson<ApiResponse<String>> {
     match config_manager.save_config(&config_request).await {
-        Ok(_) => ResponseJson(ApiResponse::success("Configuration saved successfully".to_string())),
+        Ok(_) => ResponseJson(ApiResponse::success(
+            "Configuration saved successfully".to_string(),
+        )),
         Err(e) => ResponseJson(ApiResponse::error(&e.to_string())),
     }
 }
@@ -27,7 +29,9 @@ pub async fn delete_config(
     name: String,
 ) -> ResponseJson<ApiResponse<String>> {
     match config_manager.delete_config(&name).await {
-        Ok(_) => ResponseJson(ApiResponse::success("Configuration deleted successfully".to_string())),
+        Ok(_) => ResponseJson(ApiResponse::success(
+            "Configuration deleted successfully".to_string(),
+        )),
         Err(e) => ResponseJson(ApiResponse::error(&e.to_string())),
     }
 }
@@ -36,7 +40,9 @@ pub async fn persist_configs(
     Extension(config_manager): Extension<Arc<ConfigManager>>,
 ) -> ResponseJson<ApiResponse<String>> {
     match config_manager.persist_to_file().await {
-        Ok(_) => ResponseJson(ApiResponse::success("Configurations persisted to file successfully".to_string())),
+        Ok(_) => ResponseJson(ApiResponse::success(
+            "Configurations persisted to file successfully".to_string(),
+        )),
         Err(e) => ResponseJson(ApiResponse::error(&e.to_string())),
     }
 }
@@ -68,4 +74,3 @@ pub async fn get_config_for_edit(
         Err(e) => ResponseJson(ApiResponse::error(&e.to_string())),
     }
 }
-

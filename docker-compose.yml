@@ -1,18 +1,62 @@
-version: '3.8'
-
 services:
   rclone-gui:
     build: .
     container_name: rclone-gui
     ports:
+      # Web-UI
       - "8080:8080"
+      # rsync über TLS (registrierter Port). stunnel terminiert hier und
+      # reicht containerintern nach 127.0.0.1:873 weiter.
+      - "874:874"
+      # Port 873 (rsync-Daemon) wird BEWUSST NICHT gemappt. Der Daemon spricht
+      # unverschlüsselt und ohne TLS-Peer-Prüfung; er bleibt containerintern und
+      # ist nur über die TLS-Terminierung auf 874 erreichbar.
+    # Capabilities: hier steht bewusst KEIN cap_add.
+    #
+    # Der rsync-Daemon braucht CAP_SYS_CHROOT (für `use chroot = yes`) und
+    # CAP_SETGID (für setgroups beim Wechsel auf die Modul-uid/gid). Beide sind
+    # bereits Teil des Default-Sets von Docker; das Image hebt sie mit
+    # `setcap cap_sys_chroot,cap_setgid=ep /usr/bin/rsync` gezielt auf diese eine
+    # Binärdatei (siehe Dockerfile). Damit funktioniert der Daemon auch für
+    # jeden, der ein eigenes Compose-File oder ein blosses `docker run` benutzt —
+    # ein vergessenes cap_add wäre sonst ein stiller Ausfall.
+    #
+    # Wer die Rechte weiter beschneiden will, darf SYS_CHROOT und SETGID nicht
+    # wegnehmen und `no-new-privileges` nicht setzen: beides deaktiviert die
+    # Datei-Capabilities. Der Startup-Check in start.sh bricht dann mit einer
+    # benannten Meldung ab, statt es dem ersten Transfer zu überlassen.
     volumes:
+      # Anwendungsdaten: tasks.db, rclone.conf, Job-Logs
       - ./data:/app/data
       - ./logs:/app/logs
+      # Share-Root: alles, was über rsync/GUI freigegeben wird, liegt hier
+      - ./shares:/data
+      # Daemon-Konfiguration, Secrets und Zertifikate.
+      # Getrennt vom Share-Root, damit nichts davon über einen Share lesbar ist.
+      - ./rsyncd:/etc/rsyncd
     environment:
       - RCLONE_GUI_DEFAULT_PATH=/data
       - RUST_LOG=info
+      # SSL-Backend für rsync-ssl explizit festlegen (openssl statt Heuristik)
+      - RSYNC_SSL_TYPE=openssl
+      # Öffentliche Basis-URL dieser Instanz: Ziel für OAuth-Redirects und
+      # Pairing-Links der Gegenstelle. Ohne korrekten Wert schlägt die Kopplung
+      # fehl. Beispiel: https://rclone.example.org
+      - RCLONE_GUI_PUBLIC_BASE_URL=${RCLONE_GUI_PUBLIC_BASE_URL:-http://localhost:8080}
+      # TLS-Terminierung des rsync-Daemons auf Port 874 (stunnel). 0 schaltet
+      # sie ab — dann ist der Daemon von aussen gar nicht erreichbar, einen
+      # Klartextweg gibt es nicht.
+      - RCLONE_GUI_RSYNC_TLS=${RCLONE_GUI_RSYNC_TLS:-1}
+      # Name, der als SAN ins Serverzertifikat kommt. Er muss exakt der Name
+      # sein, unter dem die Gegenstelle diese Instanz anspricht — eine
+      # Verbindung über die IP scheitert sonst mit "hostname mismatch".
+      # Leer: wird aus RCLONE_GUI_PUBLIC_BASE_URL abgeleitet.
+      - RCLONE_GUI_PEER_HOSTNAME=${RCLONE_GUI_PEER_HOSTNAME:-}
     restart: unless-stopped
+    # PID 1 ist start.sh; es fängt SIGTERM ab, fährt App und stunnel geordnet
+    # herunter und ist weit vor dieser Frist fertig. Sie ist die Obergrenze für
+    # den Fall, dass der Shutdown der App selbst hängt.
+    stop_grace_period: 10s
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/"]
       interval: 30s
@@ -26,10 +70,17 @@ services:
   #   container_name: rclone-gui
   #   ports:
   #     - "8080:8080"
+  #     - "874:874"
   #   volumes:
   #     - ./data:/app/data
   #     - ./logs:/app/logs
+  #     - ./shares:/data
+  #     - ./rsyncd:/etc/rsyncd
   #   environment:
   #     - RCLONE_GUI_DEFAULT_PATH=/data
   #     - RUST_LOG=info
+  #     - RSYNC_SSL_TYPE=openssl
+  #     - RCLONE_GUI_PUBLIC_BASE_URL=${RCLONE_GUI_PUBLIC_BASE_URL:-http://localhost:8080}
+  #     - RCLONE_GUI_RSYNC_TLS=${RCLONE_GUI_RSYNC_TLS:-1}
+  #     - RCLONE_GUI_PEER_HOSTNAME=${RCLONE_GUI_PEER_HOSTNAME:-}
   #   restart: unless-stopped

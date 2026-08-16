@@ -1,6 +1,7 @@
+use crate::handlers::sync::JobStatus;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use sqlx::FromRow;
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RcloneConfig {
@@ -26,7 +27,7 @@ pub struct SyncRequest {
     pub source_path: String,
     pub remote_name: String,
     pub remote_path: String,
-    pub chunk_size: Option<String>,  // z.B. "8M", "16M", "32M"
+    pub chunk_size: Option<String>, // z.B. "8M", "16M", "32M"
     pub use_chunking: Option<bool>,
 }
 
@@ -34,7 +35,10 @@ pub struct SyncRequest {
 pub struct SyncProgress {
     pub id: String,
     pub progress: f64,
-    pub status: String,
+    /// Serialisiert flach als `status` (Anzeigetext), `state` und `terminal` —
+    /// siehe `handlers::sync::JobStatus`.
+    #[serde(flatten)]
+    pub status: JobStatus,
     pub transferred: u64,
     pub total: u64,
     pub source_name: String,

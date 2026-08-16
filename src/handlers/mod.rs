@@ -1,4 +1,10 @@
+pub mod auth;
+pub mod auth_web;
 pub mod config;
+pub mod download;
 pub mod files;
+pub mod preview;
+pub mod rsyncd;
 pub mod sync;
 pub mod tasks;
+pub mod thumbs;
