@@ -40,3 +40,4 @@ rclone.conf
 # Temporary files
 *.tmp
 *.temp
+.env
