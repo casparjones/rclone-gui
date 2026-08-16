@@ -235,10 +235,38 @@
         .fb-head,
         .fb-row {
             display: grid;
-            grid-template-columns: 2rem minmax(0, 1fr) 7rem 11rem 5rem;
+            grid-template-columns: 1.5rem 2rem minmax(0, 1fr) 7rem 11rem 5rem;
             align-items: center;
             gap: 0.75rem;
             padding: 0.5rem 0.75rem;
+        }
+        /* Selection ---------------------------------------------------------
+           A shift click would otherwise drag a text selection across the rows,
+           which looks broken. Scoped to the rows on purpose: the breadcrumb and
+           the rest of the page stay selectable. */
+        .fb-row {
+            user-select: none;
+        }
+        .fb-check {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        .fb-row.is-selected {
+            background-color: rgba(59, 130, 246, 0.16);
+        }
+        .fb-selbar {
+            display: none;
+            align-items: center;
+            gap: 0.75rem;
+            flex-wrap: wrap;
+            margin-bottom: 0.75rem;
+            padding: 0.5rem 0.75rem;
+            border-radius: 0.5rem;
+            background-color: rgba(59, 130, 246, 0.12);
+        }
+        .fb-selbar.is-visible {
+            display: flex;
         }
         .fb-head {
             font-size: 0.75rem;
@@ -296,7 +324,7 @@
         @media (max-width: 640px) {
             .fb-head,
             .fb-row {
-                grid-template-columns: 2rem minmax(0, 1fr) 5rem;
+                grid-template-columns: 1.5rem 2rem minmax(0, 1fr) 5rem;
             }
             .fb-size,
             .fb-modified {
@@ -329,6 +357,20 @@
             padding: 0.5rem;
             border: 1px solid rgba(128, 128, 128, 0.2);
             border-radius: 0.5rem;
+        }
+        /* In a tile the checkbox sits in the corner instead of stacking above
+           the icon — otherwise every tile grows by a row and the ".." tile
+           keeps an empty gap where its (absent) checkbox would be. */
+        .fb-mode-icon .fb-row,
+        .fb-mode-preview .fb-row {
+            position: relative;
+        }
+        .fb-mode-icon .fb-check,
+        .fb-mode-preview .fb-check {
+            position: absolute;
+            top: 0.25rem;
+            left: 0.25rem;
+            z-index: 1;
         }
         .fb-mode-icon .fb-meta,
         .fb-mode-preview .fb-meta {
@@ -375,8 +417,13 @@
         .fb-mode-preview .fb-actions {
             justify-content: center;
         }
-        /* Only list mode has a column header. */
-        .fb-head.fb-hidden {
+        /* Only list mode has column titles. The tile modes keep the header row
+           for the "select all" checkbox alone — without it a folder could not
+           be selected as a whole outside list mode. */
+        .fb-head.fb-compact {
+            grid-template-columns: 1.5rem minmax(0, 1fr);
+        }
+        .fb-head.fb-compact > *:not(.fb-check) {
             display: none;
         }
         .fb-sentinel {
@@ -734,9 +781,24 @@
                         </ul>
                     </div>
 
+                    <!-- Selection bar: only shown while something is selected.
+                         Visibility hangs on the own class `is-visible`, not on a
+                         Tailwind utility — the browser build only generates what
+                         it finds in the static DOM. -->
+                    <div id="fb-selection-bar" class="fb-selbar" role="status" aria-live="polite">
+                        <span id="fb-selection-count" class="font-semibold"></span>
+                        <span id="fb-selection-size" class="text-sm opacity-70"></span>
+                        <div class="fb-spacer"></div>
+                        <button id="fb-selection-clear" type="button" class="btn btn-sm btn-ghost">Clear selection</button>
+                    </div>
+
                     <!-- File List -->
                     <div class="overflow-x-auto">
                         <div id="file-head" class="fb-head">
+                            <div class="fb-check">
+                                <input id="fb-select-all" type="checkbox" class="checkbox checkbox-sm"
+                                       title="Select all entries in this folder" aria-label="Select all entries in this folder">
+                            </div>
                             <div></div>
                             <div>Name</div>
                             <div class="fb-size">Size</div>

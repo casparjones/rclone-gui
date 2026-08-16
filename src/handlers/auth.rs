@@ -73,22 +73,46 @@ const ARGON2_PARALLELISM: u32 = 1;
 // (2 GiB) → `false`, but only after really occupying 2.0 GiB (VmHWM
 // 2 101 800 kB) and 1.6 s of CPU.
 //
-// So the parameters are checked before they are handed to Argon2. The bounds
-// are picked to be generous in the direction we might grow and hard in the
-// direction that hurts:
+// So the parameters are checked before they are handed to Argon2. Preventing
+// the abort is only half the job, though: the first version of these bounds
+// (m<=256 MiB, t<=16, p<=16) let a stored hash cost **27.7 s** per verification
+// — measured — while the comment here claimed "a few seconds". That is not a
+// dead process, but it is still a weapon: anyone who can write one row into
+// `data/tasks.db` can make every login attempt for that account occupy a
+// blocking thread for half a minute.
 //
-//   * memory 256 MiB — 13x today's 19 MiB and ~5.5x the *largest* configuration
-//     OWASP lists (m=47104). That leaves room for several future doublings of
+// Argon2's total work is `m` x `t` (lanes do not add work, they only split it),
+// so the ceiling on *time* is the ceiling on that product. The bounds below are
+// picked to keep that product roughly a quarter of what it was, while staying
+// generous in the direction we might grow:
+//
+//   * memory 128 MiB — 6.7x today's 19 MiB and ~2.8x the *largest* configuration
+//     OWASP lists (m=47104). That leaves room for two more doublings of
 //     `ARGON2_MEMORY_KIB` without locking out a single existing user, while a
-//     peak of 256 MiB is something this server can survive even if it happens
-//     on every login attempt at once.
-//   * iterations 16 — 8x today's t=2; OWASP's variants stop at t=5.
-//   * parallelism 16 — 16x today's p=1. Lanes do not add total work (that is
-//     `m` x `t`), so this one is cheap to be generous with.
+//     peak of 128 MiB is something this server can survive even if it happens
+//     on every login attempt at once. Memory is the knob that actually costs an
+//     attacker, so this is the one to keep headroom on.
+//   * iterations 6 — 3x today's t=2, and above the t=5 where OWASP's variants
+//     stop, so no recommended configuration is out of reach.
+//   * parallelism 8 — 8x today's p=1. Lanes do not add total work, so this one
+//     is cheap to be generous with; it is bounded only so a hash cannot ask for
+//     an absurd lane count.
 //
-// Worst case that still passes the check is therefore ~256 MiB and the work of
-// 16 passes over it, i.e. a few seconds and a bounded peak — a bad login, not a
-// dead process. Everything above is refused outright: no allocation, no
+// Worst case that still passes the check is therefore m=131072, t=6, p=8.
+// Measured on the development machine, one verification of a hash carrying
+// exactly those parameters:
+//
+//   * release build (what actually runs):  **0.28 s**
+//   * debug build (what `cargo test` runs): **5.30 s**
+//
+// Down from the 27.7 s the previous bounds allowed. The measurement lives in
+// `worst_accepted_cost_parameters_stay_under_ten_seconds`, which is `#[ignore]`d
+// because it is a measurement and not a unit test — it fails above 10 s, and the
+// 10 s is chosen so the *debug* figure above still has room; the number that
+// matters operationally is the release one. Run it with
+// `cargo test --release -- --ignored --nocapture` after touching these bounds.
+//
+// Everything above the bounds is refused outright: no allocation, no
 // verification, `false`.
 //
 // These are limits on what is *accepted*, never on what is *produced*: raising
@@ -96,12 +120,12 @@ const ARGON2_PARALLELISM: u32 = 1;
 // `own_parameters_are_within_the_verification_limits` says so.
 // ---------------------------------------------------------------------------
 
-/// Largest memory cost (KiB) accepted from a stored hash: 256 MiB.
-const MAX_VERIFY_MEMORY_KIB: u32 = 256 * 1024;
+/// Largest memory cost (KiB) accepted from a stored hash: 128 MiB.
+const MAX_VERIFY_MEMORY_KIB: u32 = 128 * 1024;
 /// Largest iteration count accepted from a stored hash.
-const MAX_VERIFY_ITERATIONS: u32 = 16;
+const MAX_VERIFY_ITERATIONS: u32 = 6;
 /// Largest degree of parallelism accepted from a stored hash.
-const MAX_VERIFY_PARALLELISM: u32 = 16;
+const MAX_VERIFY_PARALLELISM: u32 = 8;
 
 /// Producing hashes the verifier would then refuse would lock every user out on
 /// their next login, and a limit above ~1 GiB would defeat the purpose. Both
@@ -110,6 +134,10 @@ const _: () = assert!(ARGON2_MEMORY_KIB <= MAX_VERIFY_MEMORY_KIB);
 const _: () = assert!(ARGON2_ITERATIONS <= MAX_VERIFY_ITERATIONS);
 const _: () = assert!(ARGON2_PARALLELISM <= MAX_VERIFY_PARALLELISM);
 const _: () = assert!(MAX_VERIFY_MEMORY_KIB <= 1024 * 1024);
+/// Room left to grow. A cap set to exactly today's memory cost would satisfy the
+/// assertion above while making the next parameter bump impossible without
+/// locking every existing user out, so the cap must allow at least one doubling.
+const _: () = assert!(ARGON2_MEMORY_KIB * 2 <= MAX_VERIFY_MEMORY_KIB);
 
 // ---------------------------------------------------------------------------
 // Password policy
@@ -147,6 +175,20 @@ const WEAK_PASSWORDS: &[&str] = &[
     "123456789",
     "1234567890",
     "12345678910",
+    // The bare row stems. These matter more than the long variants below,
+    // because `qwerty` is what people *prefix* — `qwerty123456` was reported as
+    // slipping through precisely because only `qwertyuiop` was listed.
+    "qwerty",
+    "qwertz",
+    "azerty",
+    "asdfgh",
+    "asdfghjkl",
+    "zxcvbn",
+    "zxcvbnm",
+    "yxcvbn",
+    "qwerty123",
+    "qwerty1234",
+    "qwertyui",
     "qwertyuiop",
     "qwertzuiop",
     "azertyuiop",
@@ -212,9 +254,16 @@ impl std::fmt::Display for PasswordPolicyError {
                 write!(f, "Password must be at most {max} characters long")
             }
             PasswordPolicyError::Blank => write!(f, "Password must not be blank"),
-            PasswordPolicyError::TooCommon => {
-                write!(f, "Password is too common, please choose a different one")
-            }
+            // Read on a terminal as often as in the browser (the CLI password
+            // reset uses the same validation), so it is a complete sentence,
+            // names the reason and says what to do instead — without hinting at
+            // which pattern matched, which would help nobody but a guesser.
+            PasswordPolicyError::TooCommon => write!(
+                f,
+                "Password is too common or follows an obvious pattern \
+                 (a keyboard walk, a counting sequence or a repeated block). \
+                 Choose a longer passphrase of unrelated words instead."
+            ),
         }
     }
 }
@@ -258,17 +307,31 @@ pub fn validate_password(password: &str) -> std::result::Result<(), PasswordPoli
     Ok(())
 }
 
-/// Keyboard walks, written out as the rows are traversed left to right.
+/// Keyboard walks, written out as the keyboard is traversed.
 ///
-/// A password is compared against these (and against their reverse), so
-/// `qwertyuiopas` — row one continued into row two — and `poiuytrewq` are both
-/// caught. Only layouts that actually occur here are listed: QWERTY, the German
-/// QWERTZ and the French AZERTY, plus the number row.
+/// A password (or a segment of one, see [`is_weak_segment`]) is compared against
+/// these and against their reverse, so `qwertyuiopas` — row one continued into
+/// row two — and `poiuytrewq` are both caught. Only layouts that actually occur
+/// here are listed: QWERTY, the German QWERTZ and the French AZERTY.
+///
+/// The last four entries are the *vertical* traversals, which the first version
+/// of this list missed entirely: `qazwsxedcrfv` and `1q2w3e4r5t6y` are the two
+/// shapes people actually type when they walk down the columns instead of along
+/// the rows, and both were reported as accepted.
 const KEYBOARD_ROWS: &[&str] = &[
+    // Horizontal, row after row.
     "qwertyuiopasdfghjklzxcvbnm",
     "qwertzuiopasdfghjklyxcvbnm",
     "azertyuiopqsdfghjklmwxcvbn",
     "1234567890",
+    // Vertical: each column top-to-bottom, columns left to right
+    // (`qaz` `wsx` `edc` ...), for QWERTY and for QWERTZ.
+    "qazwsxedcrfvtgbyhnujmikolp",
+    "qaywsxedcrfvtgbzhnujmikolp",
+    // The same columns, but starting on the number row — the `1qaz2wsx` shape.
+    "1qaz2wsx3edc4rfv5tgb6yhn7ujm8ik9ol0p",
+    // Digit/letter zigzag across the top two rows: `1q2w3e4r`.
+    "1q2w3e4r5t6y7u8i9o0p",
 ];
 
 /// Shortest keyboard walk that counts as weak. Below this, ordinary words start
@@ -277,32 +340,254 @@ const MIN_KEYBOARD_WALK: usize = 6;
 
 /// Whether `password` is obviously weak.
 ///
-/// Four checks, in order of cost:
-///   1. exact match against [`WEAK_PASSWORDS`] (case-insensitive, trimmed);
-///   2. a common password with digits appended, e.g. `password2024` — the usual
-///      way people satisfy a length requirement;
-///   3. a single repeated character (`aaaaaaaaaaaa`) or a near-straight run of
+/// The checks, in order of cost:
+///   1. a known-weak word: exact match against [`WEAK_PASSWORDS`], the same with
+///      digits appended (`password2024`), and either of those after undoing the
+///      usual leetspeak substitutions (`P@ssw0rd` → `password`);
+///   2. a single repeated character (`aaaaaaaaaaaa`) or a near-straight run of
 ///      consecutive characters (`abcdefghijkl`, `123456789012`);
-///   4. a walk along a keyboard row (`qwertyuiopas`, `asdfghjkl`), forwards or
-///      backwards.
+///   3. a walk along the keyboard, horizontal or vertical, forwards or
+///      backwards (`qwertyuiopas`, `qazwsxedcrfv`);
+///   4. a repeated block (`abcabcabcabc`);
+///   5. the same three checks again on the password with runs of identical
+///      characters collapsed, which is what turns `112233445566` into the run
+///      `123456`;
+///   6. finally, whether the whole password is *assembled* from pieces of the
+///      above — `qwerty123456` is a keyboard walk followed by a digit run, and
+///      neither half covers the whole string, so nothing before this catches it.
+///
+/// Deliberately not attempted: completeness. A policy cannot replace a breach
+/// corpus. The goal is the obvious patterns, and the property that matters more
+/// than coverage is the absence of false positives — see the test
+/// `policy_accepts_reasonable_passwords`.
 fn is_weak_password(password: &str) -> bool {
     let normalized = password.trim().to_lowercase();
 
-    if WEAK_PASSWORDS.contains(&normalized.as_str()) {
+    if matches_weak_word(&normalized)
+        || is_character_run(&normalized)
+        || is_keyboard_walk(&normalized)
+        || is_block_repetition(&normalized)
+    {
         return true;
     }
 
-    // A known-weak stem with a trailing number ("rclone2024", "admin1234").
+    // `112233445566` and `aabbccddeeff` are runs wearing a disguise: collapse
+    // the doubled characters and the run underneath shows.
+    let collapsed = collapse_repeats(&normalized);
+    if collapsed != normalized
+        && (matches_weak_word(&collapsed)
+            || is_character_run(&collapsed)
+            || is_keyboard_walk(&collapsed)
+            || is_block_repetition(&collapsed))
+    {
+        return true;
+    }
+
+    is_built_from_weak_segments(&normalized)
+}
+
+/// Leetspeak substitutions, in the direction that undoes them.
+///
+/// Only the unambiguous, widely used ones. `1` maps to `i` rather than `l`
+/// because `passw1rd`-style leet is far rarer than `1` for `i`; the list is
+/// applied to whole-word comparisons only, so a wrong guess here costs a missed
+/// detection, never a false positive on a legitimate password.
+const LEET_SUBSTITUTIONS: &[(char, char)] = &[
+    ('@', 'a'),
+    ('4', 'a'),
+    ('8', 'b'),
+    ('(', 'c'),
+    ('3', 'e'),
+    ('6', 'g'),
+    ('9', 'g'),
+    ('1', 'i'),
+    ('!', 'i'),
+    ('|', 'l'),
+    ('0', 'o'),
+    ('5', 's'),
+    ('$', 's'),
+    ('7', 't'),
+    ('+', 't'),
+    ('2', 'z'),
+];
+
+/// Undo the substitutions above. Characters not in the table are kept as they
+/// are, so an already-plain word comes back unchanged.
+fn unleet(normalized: &str) -> String {
+    normalized
+        .chars()
+        .map(|c| {
+            LEET_SUBSTITUTIONS
+                .iter()
+                .find_map(|(from, to)| (*from == c).then_some(*to))
+                .unwrap_or(c)
+        })
+        .collect()
+}
+
+/// Whether `normalized` is a [`WEAK_PASSWORDS`] entry, possibly with trailing
+/// digits and/or leetspeak on top.
+///
+/// The trailing digits are stripped *before* the leet substitution is applied,
+/// because otherwise the appended year would be de-leeted too and
+/// `p@ssw0rd1234` would turn into `passwordizea` instead of `password`.
+fn matches_weak_word(normalized: &str) -> bool {
     let stem = normalized.trim_end_matches(|c: char| c.is_ascii_digit());
-    if stem.len() >= 4 && stem.len() < normalized.len() && WEAK_PASSWORDS.contains(&stem) {
-        return true;
-    }
 
-    if is_character_run(&normalized) || is_keyboard_walk(&normalized) {
-        return true;
+    for candidate in [normalized, stem] {
+        if candidate.len() < 4 {
+            continue;
+        }
+        if WEAK_PASSWORDS.contains(&candidate) {
+            return true;
+        }
+        let plain = unleet(candidate);
+        if plain != candidate && WEAK_PASSWORDS.contains(&plain.as_str()) {
+            return true;
+        }
     }
 
     false
+}
+
+/// Collapse runs of the same character to a single one: `112233` → `123`.
+fn collapse_repeats(normalized: &str) -> String {
+    let mut out = String::with_capacity(normalized.len());
+    for c in normalized.chars() {
+        if !out.ends_with(c) {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Whether `normalized` is one block repeated at least three times:
+/// `abcabcabcabc`, `123123123`, `xyxyxyxyxy`.
+///
+/// Three repetitions, not two: a password built from two halves is a common
+/// enough shape in legitimate passphrases ("berlinberlin" is weak, but
+/// "sommerregen" style halves are not reliably distinguishable), while three or
+/// more identical blocks is only ever padding.
+fn is_block_repetition(normalized: &str) -> bool {
+    let chars: Vec<char> = normalized.chars().collect();
+    let length = chars.len();
+    if length < 6 {
+        return false;
+    }
+
+    (1..=length / 3).any(|period| {
+        length.is_multiple_of(period) && chars.chunks(period).all(|chunk| chunk == &chars[..period])
+    })
+}
+
+/// Shortest piece that counts as a weak building block in
+/// [`is_built_from_weak_segments`].
+///
+/// Four, not three: three-character alphabetical runs (`stu`, `hij`) occur
+/// inside ordinary words often enough that a threshold of three would start
+/// rejecting real passphrases, and the one pattern that needs three-character
+/// blocks — `abcabcabcabc` — is caught by [`is_block_repetition`] instead.
+const MIN_WEAK_SEGMENT: usize = 4;
+
+/// Longest piece considered. The longest [`KEYBOARD_ROWS`] entry is 36
+/// characters, so nothing above that can be a keyboard walk, and this keeps the
+/// quadratic scan below bounded.
+const MAX_WEAK_SEGMENT: usize = 40;
+
+/// Passwords longer than this are not segmented at all. The scan is quadratic
+/// in the password length, [`MAX_PASSWORD_LENGTH`] is 1024, and a 128-character
+/// password that is *entirely* built from keyboard walks is not the case this
+/// check exists for.
+const MAX_SEGMENTED_LENGTH: usize = 128;
+
+/// Whether `normalized` is essentially nothing but weak building blocks glued
+/// together.
+///
+/// This is the check that catches `qwerty123456`, `1234567890qw` and
+/// `0987654321ab`: each of them is a keyboard walk or a digit run plus a short
+/// remainder, and every check above insists on covering the *whole* password.
+///
+/// The scan is greedy from the left, always taking the longest weak segment that
+/// starts at the current position; anything that does not start a segment counts
+/// as one uncovered character. A password is weak if almost all of it is covered
+/// (at most two uncovered characters, or a fifth of its length for longer ones)
+/// by at most a handful of segments. Requiring a *small* number of segments
+/// matters: a long passphrase will accidentally contain the odd four-character
+/// keyboard substring, but never enough of them, back to back, to tile itself.
+fn is_built_from_weak_segments(normalized: &str) -> bool {
+    let chars: Vec<char> = normalized.chars().collect();
+    let length = chars.len();
+    if !(MIN_WEAK_SEGMENT * 2..=MAX_SEGMENTED_LENGTH).contains(&length) {
+        return false;
+    }
+
+    let mut position = 0;
+    let mut segments = 0usize;
+    let mut uncovered = 0usize;
+
+    while position < length {
+        let longest = (position + MIN_WEAK_SEGMENT..=length.min(position + MAX_WEAK_SEGMENT))
+            .rev()
+            .find(|&end| is_weak_segment(&chars[position..end]));
+
+        match longest {
+            Some(end) => {
+                segments += 1;
+                position = end;
+            }
+            None => {
+                uncovered += 1;
+                position += 1;
+            }
+        }
+    }
+
+    let tolerated = std::cmp::max(2, length / 5);
+    segments > 0 && segments <= 5 && uncovered <= tolerated
+}
+
+/// Whether a single slice is one of the weak building blocks: a known-weak word,
+/// a strictly straight run, or a keyboard walk.
+///
+/// The run test here is strict (every step exactly +1, -1 or 0), unlike
+/// [`is_character_run`], which tolerates a few irregular steps. Tolerance is
+/// right when judging a whole password and wrong here, where a sloppy match
+/// would let arbitrary text count as "covered".
+fn is_weak_segment(segment: &[char]) -> bool {
+    debug_assert!(segment.len() >= MIN_WEAK_SEGMENT);
+
+    let ascending = segment
+        .windows(2)
+        .all(|w| (w[1] as u32).checked_sub(w[0] as u32) == Some(1));
+    let descending = segment
+        .windows(2)
+        .all(|w| (w[0] as u32).checked_sub(w[1] as u32) == Some(1));
+    let identical = segment.windows(2).all(|w| w[0] == w[1]);
+    if ascending || descending || identical {
+        return true;
+    }
+
+    let text: String = segment.iter().collect();
+    if WEAK_PASSWORDS.contains(&text.as_str()) {
+        return true;
+    }
+
+    contains_keyboard_walk(&text)
+}
+
+/// Whether `text` appears, forwards or backwards, inside one of the
+/// [`KEYBOARD_ROWS`].
+fn contains_keyboard_walk(text: &str) -> bool {
+    // Only single-byte input can be a keyboard walk; this also keeps the
+    // substring search on character boundaries.
+    if !text.is_ascii() {
+        return false;
+    }
+
+    let reversed: String = text.chars().rev().collect();
+    KEYBOARD_ROWS
+        .iter()
+        .any(|row| row.contains(text) || row.contains(reversed.as_str()))
 }
 
 /// A single repeated character, or an essentially straight ascending or
@@ -344,20 +629,7 @@ fn is_character_run(normalized: &str) -> bool {
 /// either direction. Anything shorter than that is not judged here — the
 /// wordlist above covers the short, well-known cases.
 fn is_keyboard_walk(normalized: &str) -> bool {
-    if normalized.chars().count() < MIN_KEYBOARD_WALK {
-        return false;
-    }
-
-    // Only single-byte input can be a keyboard walk; this also keeps the
-    // substring search below on character boundaries.
-    if !normalized.is_ascii() {
-        return false;
-    }
-
-    let reversed: String = normalized.chars().rev().collect();
-    KEYBOARD_ROWS
-        .iter()
-        .any(|row| row.contains(normalized) || row.contains(reversed.as_str()))
+    normalized.chars().count() >= MIN_KEYBOARD_WALK && contains_keyboard_walk(normalized)
 }
 
 // ---------------------------------------------------------------------------
@@ -1336,6 +1608,98 @@ mod tests {
         assert!(verify_password(GOOD_PASSWORD, &hash));
     }
 
+    /// A hash this server *produces* must be one it will later accept, and the
+    /// caps must leave room for a future parameter bump. The arithmetic itself
+    /// is enforced at compile time by the `const _: () = assert!(...)` block
+    /// next to the constants — asserting it again here would be a constant
+    /// expression and clippy rightly objects. What is checked here is the round
+    /// trip through the real functions, which the compile-time assertions
+    /// cannot see: parse a freshly produced PHC string and run it through the
+    /// same predicate `verify_password` uses.
+    #[test]
+    fn own_parameters_are_within_the_verification_limits() {
+        let hash = hash_password(GOOD_PASSWORD).expect("hashing must succeed");
+        let parsed = PasswordHash::new(&hash).expect("own hash must parse");
+        assert!(
+            cost_params_are_acceptable(&parsed),
+            "a freshly produced hash must pass the verification limits"
+        );
+
+        let params = Params::try_from(&parsed).expect("own hash must carry parameters");
+        assert!(params.m_cost() <= MAX_VERIFY_MEMORY_KIB);
+        assert!(params.t_cost() <= MAX_VERIFY_ITERATIONS);
+        assert!(params.p_cost() <= MAX_VERIFY_PARALLELISM);
+    }
+
+    /// A PHC string produced with the parameters in use today (m=19456, t=2,
+    /// p=1), frozen here on purpose: the point of this test is that lowering the
+    /// *verification* caps does not invalidate hashes that are already stored in
+    /// somebody's `data/tasks.db`. Re-generating it would defeat that.
+    const STORED_HASH_TODAYS_PARAMS: &str =
+        "$argon2id$v=19$m=19456,t=2,p=1$5Bbg0pBNpV81OD6sqic0hg$smkTjAsFfvWL1rcIaAaGpacuMK9mL1ic+RK+srpL79U";
+
+    #[test]
+    fn a_hash_with_todays_parameters_still_verifies() {
+        let parsed =
+            PasswordHash::new(STORED_HASH_TODAYS_PARAMS).expect("frozen hash must still parse");
+        let params = Params::try_from(&parsed).expect("frozen hash must carry parameters");
+        assert_eq!(params.m_cost(), ARGON2_MEMORY_KIB);
+        assert_eq!(params.t_cost(), ARGON2_ITERATIONS);
+        assert_eq!(params.p_cost(), ARGON2_PARALLELISM);
+
+        assert!(
+            verify_password(GOOD_PASSWORD, STORED_HASH_TODAYS_PARAMS),
+            "a hash stored before the caps were lowered must still verify"
+        );
+        assert!(!verify_password(
+            "something else entirely",
+            STORED_HASH_TODAYS_PARAMS
+        ));
+        assert!(
+            !needs_rehash(STORED_HASH_TODAYS_PARAMS),
+            "today's parameters must not be flagged for re-hashing"
+        );
+    }
+
+    /// Measurement, not a unit test: it deliberately runs the most expensive
+    /// hash the verifier still accepts, which takes seconds. `#[ignore]`d so a
+    /// normal `cargo test` stays fast; run it with
+    /// `cargo test --release -- --ignored --nocapture` when the caps change.
+    ///
+    /// The claim it defends is the one in the parameter comment at the top of
+    /// this file: the worst case an attacker with database write access can
+    /// force onto a login attempt stays in the single-digit seconds.
+    #[test]
+    #[ignore = "measurement: runs the most expensive accepted Argon2 configuration"]
+    fn worst_accepted_cost_parameters_stay_under_ten_seconds() {
+        let params = Params::new(
+            MAX_VERIFY_MEMORY_KIB,
+            MAX_VERIFY_ITERATIONS,
+            MAX_VERIFY_PARALLELISM,
+            None,
+        )
+        .expect("the caps must be a valid Argon2 configuration");
+
+        let salt = SaltString::generate(&mut OsRng);
+        let hash = Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+            .hash_password(GOOD_PASSWORD.as_bytes(), &salt)
+            .expect("hashing at the caps must succeed")
+            .to_string();
+
+        let started = std::time::Instant::now();
+        assert!(verify_password(GOOD_PASSWORD, &hash));
+        let elapsed = started.elapsed();
+
+        println!(
+            "worst accepted configuration m={MAX_VERIFY_MEMORY_KIB}, \
+             t={MAX_VERIFY_ITERATIONS}, p={MAX_VERIFY_PARALLELISM} verified in {elapsed:.2?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the most expensive accepted hash must verify in under 10 s, took {elapsed:.2?}"
+        );
+    }
+
     #[test]
     fn policy_accepts_reasonable_passwords() {
         for password in [
@@ -1343,6 +1707,26 @@ mod tests {
             "Tr0ubadour&3xtra",
             "ganz normale passphrase",
             "größere-passphrase-mit-umlauten",
+            // Umlauts and sharp s, mixed case, a year at the end — the shape a
+            // German-speaking user actually picks.
+            "Schöne Grüße aus Köln 2026",
+            "Wüstenrot-Bausparvertrag-12",
+            "olivenöl-und-rosmarin-brot",
+            // CJK and Hangul: non-ASCII must never be judged as a keyboard
+            // walk, and the character count (not the byte count) decides the
+            // length. Both of these are twelve characters.
+            "日本語のパスワードです安全",
+            "안녕하세요반갑습니다친구여",
+            // Ordinary passphrases. `hijklmnop-...` is the interesting one: it
+            // contains a nine-character alphabetical run and must still pass,
+            // because the run does not carry the whole password.
+            "mein hund heisst waldemar",
+            "the quick brown fox jumps",
+            "purple-tractor-mountain-97",
+            "sommerregen-im-november",
+            "hijklmnop-is-not-my-password",
+            "abstractionlayer42",
+            "defenestration-tuesday",
         ] {
             assert_eq!(
                 validate_password(password),
@@ -1424,6 +1808,91 @@ mod tests {
                 "should have been rejected as weak: {password}"
             );
         }
+    }
+
+    /// The candidates a tester found still slipping through, verbatim from the
+    /// ticket, plus the neighbouring shapes of the same four families. Each
+    /// family is annotated with the check that is supposed to catch it, so a
+    /// later regression points at a mechanism and not just at a string.
+    #[test]
+    fn policy_rejects_the_reported_weak_candidates() {
+        for password in [
+            // Reported verbatim.
+            "qwerty123456",
+            "qwerty1234567",
+            "QWERTY123456",
+            "1234567890qw",
+            "0987654321ab",
+            "qazwsxedcrfv",
+            "1q2w3e4r5t6y",
+            "abcabcabcabc",
+            "112233445566",
+            "P@ssw0rd1234",
+            // A weak stem glued to a digit run — `is_built_from_weak_segments`.
+            // No single check covers the whole string in any of these.
+            "asdfghjkl123",
+            "zxcvbnm12345",
+            "letmein12345",
+            "welcome12345",
+            "adminadmin12",
+            "qwertzuiop12",
+            "poiuytrewq12",
+            "0123456789ab",
+            // Vertical keyboard traversals — the `KEYBOARD_ROWS` entries that
+            // walk down the columns instead of along the rows.
+            "1qaz2wsx3edc4rfv",
+            "zaq1xsw2cde3",
+            "1q2w3e4r5t",
+            // Repeated blocks — `is_block_repetition`.
+            "qwertyqwerty",
+            "123123123123",
+            "xxxxxxxxxxxx",
+            // Doubled characters hiding a run — caught only after
+            // `collapse_repeats`.
+            "aabbccddeeff",
+            // Leetspeak on a known-weak stem — `matches_weak_word` via
+            // `unleet`, with the trailing digits stripped first.
+            "p@ssw0rd",
+            "P4ssword2024",
+            "adm1n1strator",
+        ] {
+            assert_eq!(
+                validate_password(password),
+                Err(PasswordPolicyError::TooCommon),
+                "should have been rejected as weak: {password}"
+            );
+        }
+    }
+
+    /// The mechanisms behind the test above, exercised directly. When a
+    /// candidate above starts passing, these say which of the four checks broke.
+    #[test]
+    fn weak_pattern_detectors_recognise_their_own_shapes() {
+        assert!(is_block_repetition("abcabcabcabc"));
+        assert!(is_block_repetition("123123123"));
+        assert!(is_block_repetition("xyxyxyxyxy"));
+        // Two repetitions are not enough — see the note on the function.
+        assert!(!is_block_repetition("berlinberlin"));
+
+        assert_eq!(collapse_repeats("112233445566"), "123456");
+        assert_eq!(collapse_repeats("aabbcc"), "abc");
+        assert_eq!(collapse_repeats("abc"), "abc");
+
+        assert!(is_keyboard_walk("qazwsxedcrfv"));
+        assert!(is_keyboard_walk("1q2w3e4r5t6y"));
+        assert!(is_keyboard_walk("vfrcdexswzaq"), "and backwards");
+
+        assert!(is_built_from_weak_segments("qwerty123456"));
+        assert!(is_built_from_weak_segments("1234567890qw"));
+        // A passphrase must not tile itself out of accidental fragments.
+        assert!(!is_built_from_weak_segments(
+            "korrekt-pferd-batterie-heftklammer"
+        ));
+        assert!(!is_built_from_weak_segments("the quick brown fox jumps"));
+
+        // Non-ASCII is never a keyboard walk, whatever its shape.
+        assert!(!is_keyboard_walk("日本語のパスワードです安全"));
+        assert!(!contains_keyboard_walk("größere"));
     }
 
     #[test]

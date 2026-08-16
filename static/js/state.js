@@ -25,6 +25,17 @@ export const state = {
     // View mode of the file browser: 'list', 'icon' or 'preview'
     fileView: 'list',
 
+    // Multi-selection in the file browser: path -> { path, name, is_dir, size }.
+    // A Map and not a Set of paths, because the selection bar needs the sizes
+    // and a selected entry may live in a folder that is no longer on screen —
+    // the selection survives navigation on purpose. Session only, never stored.
+    selection: new Map(),
+
+    // Path the last plain selection click happened on. Shift extends from here.
+    // Reset whenever the listing or its order changes, so a range can never be
+    // computed against a row that is gone.
+    selectionAnchor: '',
+
     // Entries are not rendered in one go. Large folders would otherwise build
     // thousands of DOM nodes before the browser paints anything.
     renderCursor: { entries: [], index: 0 },

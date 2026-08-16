@@ -24,6 +24,41 @@ pid =
 debug = 5
 syslog = no
 
+# Logdatei. Ohne diese Zeile schreibt stunnel sein Log nur nach stderr, und die
+# Korrelation der echten Peer-IP im Audit-Log (src/handlers/rsyncd.rs,
+# StunnelIndex) findet nichts: jedes Audit-Ereignis trägt dann dauerhaft
+# client_source=unavailable. Der Mechanismus ist gebaut, ohne `output` läuft er
+# ins Leere (Ticket 88b8c455).
+#
+# Der Pfad wird von config/rsync-tls.sh eingesetzt und liegt im Laufverzeichnis
+# des Daemons ($RSYNCD_DIR/stunnel.log) — genau dort, wo die App ihn erwartet
+# (default_stunnel_log(): neben rsyncd.conf; überschreibbar mit
+# RCLONE_GUI_STUNNEL_LOG). Die Datei entsteht mit Modus 0600, weil sie die
+# Adresse jeder Gegenstelle enthält; die App zieht die Rechte beim Start
+# nachträglich fest, falls sie jemand anders angelegt hat.
+#
+# Gemessen (stunnel 5.75, alpine:3.22): mit `foreground = yes` UND `output`
+# schreibt stunnel die Zeilen in BEIDE Richtungen — Datei und stderr. Das
+# Container-Log verliert also nichts, es kommt nur die Datei dazu.
+#
+# Eine Nebenwirkung, bewusst in Kauf genommen: die Datei wächst unbegrenzt,
+# wie das Audit-Log daneben, und sie liegt im selben Verzeichnis wie PID- und
+# Lock-Datei. Läuft das Laufverzeichnis voll, steht der Transport.
+#
+# Ticket 0cedda6f hat das aufgegriffen und dabei bewusst NICHT zum Kürzen von
+# innen gegriffen — auch nicht bei dieser Datei, obwohl sie kein Audit-Trail
+# ist: die echte Client-IP steht nur hier, StunnelIndex liest sie fortlaufend
+# ab einem Byte-Offset, und der Prozess, dem die Datei gehört, ist stunnel und
+# nicht die Anwendung. Statt dessen misst die Anwendung das Laufverzeichnis
+# einmal pro Minute und warnt im Anwendungslog, sobald eine Datei über 64 MiB
+# oder das Verzeichnis über 256 MiB liegt (RunDirWatch in
+# src/handlers/rsyncd.rs, Schwellen über RCLONE_GUI_LOG_WARN_BYTES und
+# RCLONE_GUI_RUN_DIR_WARN_BYTES). Rotation bleibt Sache des Betriebs; die
+# Vorlage dafür liegt in config/logrotate-rclone-gui.conf und erklärt auch,
+# warum diese Datei nur mit `copytruncate` und möglichst im Leerlauf rotiert
+# werden sollte.
+output = @LOG@
+
 [rsyncd-tls]
 accept  = @ACCEPT@
 connect = @CONNECT@

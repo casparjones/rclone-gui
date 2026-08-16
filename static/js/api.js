@@ -15,15 +15,68 @@
 // **401 JSON**, never with a redirect — `fetch` would follow a 302 silently and
 // hand us the login *page* as if it were an answer.
 //
-// So the status code is the signal, and it is evaluated here, in the single
-// place every request passes through. A session can end at any moment (logout in
-// another tab, the 24 h expiry, an operator deleting the row), which is why this
-// cannot live in the call sites: there are two dozen of them and each would have
-// to get it right.
+// A session can end at any moment (logout in another tab, the 24 h expiry, an
+// operator deleting the row), which is why the reaction cannot live in the call
+// sites: there are two dozen of them and each would have to get it right.
+//
+// But a 401 alone is **not** the signal. Some endpoints speak to a third party
+// and pass its verdict on: `POST /api/files/remote/mkdir` answers 401 when the
+// *remote* rejects its credentials, which says nothing about our session.
+// Treating that as an expiry logged the user out over a wrong remote password,
+// without ever showing what went wrong.
+//
+// So a 401 is only a *question*, and the answer is fetched from the one endpoint
+// that can only ever be turned down by the session guard itself: `/api/auth/me`
+// reads the session and nothing else. If it says 401 too, the session is gone;
+// if it answers, the session is alive and the original 401 belongs to the
+// endpoint and is handed to the caller as an ordinary `{ ok: false }` result.
+//
+// This was chosen over a list of "endpoints whose 401 is not an expiry": such a
+// list ages silently — the next route that talks to a foreign service is
+// forgotten, and the bug resurfaces as a user who finds himself signed out for
+// no reason. The probe needs no upkeep and costs one small request, only on a
+// 401, which is rare in either meaning.
 
 const LOGIN_PATH = '/login';
 
+// Answers only about the session: behind the guard, and its handler does no
+// work of its own beyond reading the session the guard put in place.
+const SESSION_PROBE_PATH = '/api/auth/me';
+
 let redirecting = false;
+
+// The probe in flight, shared by every 401 that arrives while it runs. The app
+// fires several requests at once (the job poller every two seconds among them),
+// and a burst of 401s must not become a burst of probes. Cleared when it
+// settles, so a later 401 asks again instead of trusting a stale verdict.
+let sessionProbe = null;
+
+// Whether the session is really gone, asked at the server rather than guessed
+// from the answer we just got.
+//
+// A probe that cannot reach the server returns `false`: "the network is down"
+// is not a verdict, and leaving for the login page would only trade one failed
+// request for a failed navigation. The next 401 asks again.
+function sessionHasExpired() {
+    if (sessionProbe) {
+        return sessionProbe;
+    }
+
+    const probe = fetch(SESSION_PROBE_PATH, { cache: 'no-store' })
+        .then((response) => response.status === 401)
+        .catch(() => false);
+
+    sessionProbe = probe;
+    // `probe` cannot reject — the `catch` above is part of it — so one handler
+    // is enough to release the slot.
+    probe.then(() => {
+        if (sessionProbe === probe) {
+            sessionProbe = null;
+        }
+    });
+
+    return probe;
+}
 
 export function isRedirectingToLogin() {
     return redirecting;
@@ -64,8 +117,9 @@ function neverSettles() {
 // Network and JSON errors are **not** swallowed here — they reject, because the
 // callers distinguish "could not reach the server" from "server said no".
 //
-// A 401 is the one answer no caller ever sees: it means the session is gone,
-// and the only sensible reaction is the login page. See below.
+// A 401 whose probe confirms an expired session is the one answer no caller
+// ever sees; every other 401 comes back as a normal result with `status: 401`,
+// so the call site can tell the user what the remote said.
 async function request(url, options) {
     if (isRedirectingToLogin()) {
         return neverSettles();
@@ -73,12 +127,12 @@ async function request(url, options) {
 
     const response = await fetch(url, options);
 
-    if (response.status === 401) {
+    if (response.status === 401 && (await sessionHasExpired())) {
         redirectToLogin();
         return neverSettles();
     }
 
-    const result = await response.json();
+    const result = await readJson(response);
 
     return {
         ok: response.ok && !!result && result.success === true,
@@ -88,11 +142,41 @@ async function request(url, options) {
     };
 }
 
-function postJson(url, body) {
+// The body of an answer that is not a session expiry.
+//
+// Parse errors keep rejecting — the callers rely on it — except on a 401 that
+// survived the probe: that one used to be swallowed by the redirect and may
+// come from something that is not one of our handlers at all (a proxy in
+// front of the app). Turning it into an envelope keeps such an answer visible
+// as "HTTP 401" instead of a `SyntaxError` from deep inside the module.
+async function readJson(response) {
+    if (response.status !== 401) {
+        return response.json();
+    }
+
+    try {
+        return await response.json();
+    } catch {
+        return null;
+    }
+}
+
+// `signal` is the only extra option a caller may hand in, and it is optional
+// everywhere. It exists because no endpoint here carries a deadline of its
+// own: a request that runs against an unreachable remote stays open until the
+// server-side process gives up, and the caller has no way to tell that state
+// apart from "still working". An AbortSignal lets the call site stop waiting
+// *and* release the socket instead of only stopping to look.
+//
+// An aborted request rejects with the browser's `AbortError` — it is not
+// turned into an `{ ok: false }` envelope, because "we stopped asking" is not
+// an answer from the server and the two must not be confused.
+function postJson(url, body, options) {
     return request(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body)
+        body: JSON.stringify(body),
+        signal: options ? options.signal : undefined
     });
 }
 
@@ -152,10 +236,37 @@ export function fetchLocalFiles(path) {
 // the query string raw, which let a name containing `&` or `#` add or cut off
 // parameters — the caller is expected to hand over a *configured* remote, but
 // that is no reason to build the URL by hand.
-export function fetchRemoteFiles(remoteName, remotePath) {
+export function fetchRemoteFiles(remoteName, remotePath, options) {
     const remote = encodeURIComponent(remoteName || '');
     const path = encodeURIComponent(remotePath == null ? '/' : remotePath);
-    return request(`/api/files/remote?remote=${remote}&path=${path}`);
+    return request(`/api/files/remote?remote=${remote}&path=${path}`, {
+        signal: options ? options.signal : undefined
+    });
+}
+
+// Creates one folder inside `remotePath` on a **configured** remote.
+//
+//   POST /api/files/remote/mkdir
+//   { "remote": "<name from /api/configs>",
+//     "path":   "/parent",          // folder the user is standing in
+//     "name":   "new folder" }      // single segment, no / \ . ..
+//
+//   200 { success: true,  data: { path: "/parent/new folder" } }
+//   200 { success: false, error: "<reason>" }   // unclassifiable failure
+//
+// The status code is what makes the failure classifiable, and the server sets
+// it (`create_remote_directory` in `src/handlers/files.rs`):
+//   400 the request itself · 403 no write permission · 404 parent path gone ·
+//   401 credentials **of the remote** rejected · 504 no answer in 15 s.
+//
+// That 401 is the reason the session check above asks before it redirects: it
+// belongs to the remote, not to the user's session.
+export function createRemoteFolder(remoteName, remotePath, name, options) {
+    return postJson('/api/files/remote/mkdir', {
+        remote: remoteName || '',
+        path: remotePath == null ? '/' : remotePath,
+        name: name
+    }, options);
 }
 
 export function fetchPreviewInfo(path) {
@@ -214,7 +325,7 @@ export async function fetchSyncLog(jobId) {
 
     const response = await fetch(`/api/sync-log/${jobId}`);
 
-    if (response.status === 401) {
+    if (response.status === 401 && (await sessionHasExpired())) {
         redirectToLogin();
         return neverSettles();
     }

@@ -10,15 +10,17 @@
 //! `..`, absolute Fremdpfade und Symlinks, die aus dem Wurzelverzeichnis
 //! herausführen, werden abgewiesen bzw. beim Auflisten übersprungen.
 
-use axum::{extract::Query, response::Json as ResponseJson};
-use serde::Serialize;
+use axum::{extract::Query, http::StatusCode, response::Json as ResponseJson, Extension, Json};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 use tokio::process::Command;
 
 use crate::config_manager::{ensure_configured_remote, RCLONE_CONFIG_PATH};
+use crate::handlers::auth_web::CurrentUser;
 use crate::handlers::download::{
-    download_root, is_within_root, resolve_within_root, DownloadError,
+    is_within_root, resolve_within_root, scope_from_map, user_root, DownloadError,
 };
 use crate::models::{ApiResponse, FileEntry};
 
@@ -34,7 +36,12 @@ pub struct PathSegment {
 #[derive(Debug, Serialize)]
 pub struct LocalListing {
     /// Kanonisierter Wurzelpfad – oberhalb davon gibt es keine Navigation.
+    /// Das ist das Home des angemeldeten Nutzers, ausser ein Admin hat
+    /// ausdrücklich `scope=system` angefordert.
     pub root: String,
+    /// `home` oder `system`. Das Frontend kennzeichnet damit sichtbar, dass
+    /// gerade ausserhalb des eigenen Bereichs navigiert wird.
+    pub scope: String,
     /// Kanonisierter Pfad des angezeigten Ordners.
     pub path: String,
     /// Elternordner, solange der aktuelle Ordner nicht die Wurzel ist.
@@ -46,9 +53,11 @@ pub struct LocalListing {
 }
 
 pub async fn list_local_files(
+    Extension(current): Extension<CurrentUser>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<ResponseJson<ApiResponse<LocalListing>>, DownloadError> {
-    let root = download_root().await?;
+    let scope = scope_from_map(&params)?;
+    let root = user_root(&current, scope).await?;
 
     // Kein oder ein leerer Pfad bedeutet: Wurzelverzeichnis. Ein einzelner
     // Schrägstrich wird bewusst ebenfalls auf die Wurzel abgebildet – der
@@ -71,6 +80,7 @@ pub async fn list_local_files(
 
     Ok(ResponseJson(ApiResponse::success(LocalListing {
         root: path_to_string(&root),
+        scope: scope.as_str().to_string(),
         path: path_to_string(&dir),
         parent: parent_within_root(&root, &dir).map(|p| path_to_string(&p)),
         segments: breadcrumb_segments(&root, &dir),
@@ -290,6 +300,314 @@ async fn list_remote_directory(
     Ok(files)
 }
 
+// ---------------------------------------------------------------------------
+// Ordner auf einem rclone-Remote anlegen
+// ---------------------------------------------------------------------------
+
+/// Frist für den `rclone mkdir`-Prozess.
+///
+/// Der Client bricht nach 20 s selbst ab (`createRemoteFolder` in
+/// `static/js/api.js`). Der Server muss **vorher** aufgeben, sonst kommt die
+/// Antwort `504` nie an und der Nutzer sieht nur den Abbruch des Browsers, dem
+/// keine Fehlerart zu entnehmen ist.
+const REMOTE_MKDIR_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Obergrenze für einen Ordnernamen. Kein Backend erlaubt mehr, und ein
+/// längerer Name gehört ohnehin nicht in eine Kommandozeile.
+const MAX_REMOTE_DIR_NAME_LEN: usize = 255;
+
+/// Wie viel rclone-stderr in die Antwort darf. Der Wortlaut hilft beim
+/// Nachvollziehen, aber er geht an den Client – also gekappt und einzeilig.
+const MAX_REMOTE_ERROR_LEN: usize = 400;
+
+#[derive(Debug, Deserialize)]
+pub struct RemoteMkdirRequest {
+    /// Name aus `/api/configs`. Wird gegen `rclone.conf` geprüft, bevor
+    /// irgendein Prozess startet.
+    pub remote: String,
+    /// Ordner, in dem angelegt wird. Fehlt er, ist es die Wurzel des Remotes.
+    pub path: Option<String>,
+    /// Ein einzelnes Pfadsegment – kein Pfad.
+    pub name: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RemoteMkdirResult {
+    /// Der angelegte Pfad, so wie der Client ihn zum Navigieren wieder
+    /// einsetzen kann.
+    pub path: String,
+}
+
+type MkdirResponse = (StatusCode, ResponseJson<ApiResponse<RemoteMkdirResult>>);
+
+fn mkdir_error(status: StatusCode, message: &str) -> MkdirResponse {
+    (status, ResponseJson(ApiResponse::error(message)))
+}
+
+/// `POST /api/files/remote/mkdir` – legt **einen** Ordner auf einem
+/// konfigurierten Remote an.
+///
+/// Anders als `/api/files/remote`, das jeden Fehlschlag als HTTP 200 mit
+/// `{success:false, error:"rclone error: …"}` ausliefert, setzt dieser
+/// Endpunkt den Statuscode: `403` fehlende Schreibrechte, `404` Elternpfad
+/// weg, `401` Zugangsdaten des Remotes abgelehnt, `504` keine Antwort in der
+/// Frist. Nur was sich nicht zuordnen lässt, bleibt bei 200 mit
+/// `success:false` – das ist der dokumentierte Sammelfall des Kontrakts, nicht
+/// ein vergessener Statuscode.
+pub async fn create_remote_directory(Json(request): Json<RemoteMkdirRequest>) -> MkdirResponse {
+    // Zuerst der Name, dann erst der Prozess: `:local:` wäre rclones
+    // On-the-fly-Syntax für ein nicht konfiguriertes Backend und führte am
+    // gesamten Pfad-Jail vorbei (siehe `5d31b2f7`). Wird hier abgelehnt,
+    // startet kein rclone.
+    if let Err(e) = ensure_configured_remote(&request.remote).await {
+        return mkdir_error(StatusCode::BAD_REQUEST, &e.to_string());
+    }
+
+    let name = match validate_remote_dir_name(&request.name) {
+        Ok(name) => name,
+        Err(e) => return mkdir_error(StatusCode::BAD_REQUEST, &e),
+    };
+
+    let parent = match normalize_remote_path(request.path.as_deref().unwrap_or("/")) {
+        Ok(path) => path,
+        Err(e) => return mkdir_error(StatusCode::BAD_REQUEST, &e),
+    };
+
+    let created = join_remote_path(&parent, &name);
+    let target = format!("{}:{}", request.remote, created);
+
+    match run_rclone_mkdir(&target).await {
+        Ok(()) => (
+            StatusCode::OK,
+            ResponseJson(ApiResponse::success(RemoteMkdirResult { path: created })),
+        ),
+        Err(MkdirFailure::Timeout) => mkdir_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "The remote did not answer within 15 seconds",
+        ),
+        Err(MkdirFailure::Spawn(message)) => {
+            mkdir_error(StatusCode::INTERNAL_SERVER_ERROR, &message)
+        }
+        Err(MkdirFailure::Rclone(stderr)) => {
+            let (status, reason) = classify_rclone_failure(&stderr);
+            mkdir_error(status, &format!("{}: {}", reason, excerpt(&stderr)))
+        }
+    }
+}
+
+/// Warum `rclone mkdir` nicht durchkam. Getrennt von der Zuordnung zu einem
+/// Statuscode, damit die Zuordnung für sich testbar bleibt.
+enum MkdirFailure {
+    /// Der Prozess lief in die Frist.
+    Timeout,
+    /// Der Prozess liess sich nicht starten oder nicht einsammeln.
+    Spawn(String),
+    /// rclone lief und sagte nein. Trägt stderr.
+    Rclone(String),
+}
+
+async fn run_rclone_mkdir(target: &str) -> Result<(), MkdirFailure> {
+    // `--retries`/`--low-level-retries`: ohne sie wiederholt rclone einen
+    // abgelehnten Aufruf so lange, dass die Frist zuschlägt, bevor der
+    // eigentliche Grund im stderr steht – aus einem sauberen `403` würde ein
+    // nichtssagendes `504`.
+    let child = Command::new("rclone")
+        .args([
+            "mkdir",
+            "--config",
+            RCLONE_CONFIG_PATH,
+            "--retries",
+            "1",
+            "--low-level-retries",
+            "1",
+            target,
+        ])
+        .kill_on_drop(true)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+
+    let child = match child {
+        Ok(child) => child,
+        Err(e) => return Err(MkdirFailure::Spawn(format!("rclone did not start: {}", e))),
+    };
+
+    // `kill_on_drop` oben ist der eigentliche Aufräummechanismus: läuft die
+    // Frist ab, wird das Future fallengelassen und der Prozess mit ihm – sonst
+    // bliebe bei jedem hängenden Remote ein rclone stehen.
+    match tokio::time::timeout(REMOTE_MKDIR_TIMEOUT, child.wait_with_output()).await {
+        Err(_) => Err(MkdirFailure::Timeout),
+        Ok(Err(e)) => Err(MkdirFailure::Spawn(format!(
+            "rclone could not be collected: {}",
+            e
+        ))),
+        Ok(Ok(output)) if output.status.success() => Ok(()),
+        Ok(Ok(output)) => Err(MkdirFailure::Rclone(
+            String::from_utf8_lossy(&output.stderr).to_string(),
+        )),
+    }
+}
+
+/// Ordnet rclones stderr einer Fehlerart zu.
+///
+/// rclone hat keinen brauchbaren Exit-Code für die Unterscheidung – jeder
+/// Fehlschlag ist `1`. Der Wortlaut ist deshalb die einzige Quelle. Die
+/// Reihenfolge ist bedeutsam: „access denied" taucht in Authentifizierungs-
+/// **und** Rechtefehlern auf, die Anmeldung wird zuerst geprüft.
+fn classify_rclone_failure(stderr: &str) -> (StatusCode, &'static str) {
+    let text = stderr.to_lowercase();
+
+    let has = |needles: &[&str]| needles.iter().any(|n| text.contains(n));
+
+    if has(&[
+        "401",
+        "unauthorized",
+        "authentication failed",
+        "authenticationfailed",
+        "invalid credentials",
+        "bad credentials",
+        "signaturedoesnotmatch",
+        "invalidaccesskeyid",
+        "didn't match",
+        "auth error",
+        "token expired",
+        "invalid_grant",
+    ]) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            "The remote rejected the credentials",
+        );
+    }
+
+    if has(&[
+        "403",
+        "permission denied",
+        "access denied",
+        "accessdenied",
+        "forbidden",
+        "read-only",
+        "read only",
+        "not writable",
+        "quota",
+    ]) {
+        return (StatusCode::FORBIDDEN, "No write permission on the remote");
+    }
+
+    if has(&[
+        "404",
+        "directory not found",
+        "no such file or directory",
+        "not found",
+        "nosuchbucket",
+        "nosuchkey",
+        "doesn't exist",
+        "does not exist",
+    ]) {
+        return (StatusCode::NOT_FOUND, "The parent path does not exist");
+    }
+
+    if has(&[
+        "deadline exceeded",
+        "timed out",
+        "i/o timeout",
+        "timeout",
+        "connection refused",
+        "no such host",
+        "network is unreachable",
+    ]) {
+        return (StatusCode::GATEWAY_TIMEOUT, "The remote did not answer");
+    }
+
+    // Der dokumentierte Sammelfall: 200 mit `success:false`. Der Client zeigt
+    // den Grund an, ordnet ihn aber keiner der vier Arten zu – das ist besser,
+    // als eine Art zu raten.
+    (StatusCode::OK, "The folder could not be created")
+}
+
+/// Prüft einen Ordnernamen. Ein Name ist **ein** Segment, kein Pfad.
+///
+/// Abgewiesen werden `/` und `\` (Pfadtrenner in rclone-Zielen), `.` und `..`
+/// (Navigation statt Name), Steuerzeichen und ein führendes `-`, das rclone als
+/// Option läse. Nicht abgewiesen wird `:` – der Remote-Name steht vor dem
+/// ersten Doppelpunkt, alles danach ist für rclone Pfad.
+fn validate_remote_dir_name(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+
+    if trimmed.is_empty() {
+        return Err("The folder name must not be empty".to_string());
+    }
+    if trimmed.chars().count() > MAX_REMOTE_DIR_NAME_LEN {
+        return Err(format!(
+            "The folder name must not be longer than {} characters",
+            MAX_REMOTE_DIR_NAME_LEN
+        ));
+    }
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err("The folder name must not contain control characters".to_string());
+    }
+    if let Some(c) = trimmed.chars().find(|c| matches!(c, '/' | '\\')) {
+        return Err(format!("The folder name must not contain '{}'", c));
+    }
+    if trimmed == "." || trimmed == ".." {
+        return Err("'.' and '..' are not folder names".to_string());
+    }
+    if trimmed.starts_with('-') {
+        // Sonst liest rclone den Namen als Option.
+        return Err("The folder name must not start with '-'".to_string());
+    }
+
+    Ok(trimmed.to_string())
+}
+
+/// Bringt einen vom Client kommenden Remote-Pfad auf die Form
+/// `/a/b` (Wurzel: `/`).
+///
+/// Was für lokale Pfade `resolve_within_root` leistet, ist auf einem Remote
+/// nicht möglich – es gibt kein Dateisystem zum Kanonisieren. Also wird
+/// syntaktisch abgewiesen statt aufgelöst: `..` kommt nicht durch, und nichts
+/// Ungeprüftes gerät in die rclone-Argumentliste.
+fn normalize_remote_path(path: &str) -> Result<String, String> {
+    if path.chars().any(|c| c.is_control()) {
+        return Err("The path must not contain control characters".to_string());
+    }
+
+    let mut segments = Vec::new();
+    for segment in path.split(['/', '\\']) {
+        match segment.trim() {
+            "" | "." => continue,
+            ".." => return Err("The path must not contain '..'".to_string()),
+            other => segments.push(other.to_string()),
+        }
+    }
+
+    if segments.is_empty() {
+        return Ok("/".to_string());
+    }
+
+    Ok(format!("/{}", segments.join("/")))
+}
+
+fn join_remote_path(parent: &str, name: &str) -> String {
+    format!("{}/{}", parent.trim_end_matches('/'), name)
+}
+
+/// Einzeiliger, gekappter Auszug aus rclones stderr für die Antwort.
+fn excerpt(stderr: &str) -> String {
+    let single_line = stderr
+        .lines()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
+
+    if single_line.chars().count() > MAX_REMOTE_ERROR_LEN {
+        let cut: String = single_line.chars().take(MAX_REMOTE_ERROR_LEN).collect();
+        format!("{}…", cut)
+    } else {
+        single_line
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -402,5 +720,104 @@ mod tests {
         assert!(resolve_within_root(&root, "/etc").await.is_err());
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn folder_names_that_are_paths_or_navigation_are_rejected() {
+        assert_eq!(
+            validate_remote_dir_name("Urlaub 2026").unwrap(),
+            "Urlaub 2026"
+        );
+        // Umgebende Leerzeichen sind ein Tippfehler, kein Name.
+        assert_eq!(validate_remote_dir_name("  neu  ").unwrap(), "neu");
+
+        for bad in ["", "   ", "a/b", "a\\b", ".", "..", "-x", "a\u{0}b", "a\nb"] {
+            assert!(
+                validate_remote_dir_name(bad).is_err(),
+                "wurde nicht abgewiesen: {:?}",
+                bad
+            );
+        }
+
+        let too_long = "x".repeat(MAX_REMOTE_DIR_NAME_LEN + 1);
+        assert!(validate_remote_dir_name(&too_long).is_err());
+    }
+
+    #[test]
+    fn remote_paths_are_normalised_and_traversal_is_rejected() {
+        assert_eq!(normalize_remote_path("").unwrap(), "/");
+        assert_eq!(normalize_remote_path("/").unwrap(), "/");
+        assert_eq!(normalize_remote_path("///").unwrap(), "/");
+        assert_eq!(normalize_remote_path("a/b").unwrap(), "/a/b");
+        assert_eq!(normalize_remote_path("/a//b/").unwrap(), "/a/b");
+        assert_eq!(normalize_remote_path("/a/./b").unwrap(), "/a/b");
+
+        assert!(normalize_remote_path("/a/../b").is_err());
+        assert!(normalize_remote_path("..").is_err());
+        // Der Backslash trennt hier ebenfalls, sonst wäre `..\..` ein Name.
+        assert!(normalize_remote_path("a\\..\\b").is_err());
+        assert!(normalize_remote_path("/a\u{0}b").is_err());
+    }
+
+    #[test]
+    fn the_created_path_is_the_one_the_client_gets_back() {
+        assert_eq!(join_remote_path("/", "neu"), "/neu");
+        assert_eq!(
+            join_remote_path("/parent", "neuer ordner"),
+            "/parent/neuer ordner"
+        );
+    }
+
+    #[test]
+    fn rclone_stderr_is_mapped_to_the_four_error_kinds() {
+        let kind = |stderr: &str| classify_rclone_failure(stderr).0;
+
+        assert_eq!(
+            kind("Failed to mkdir: 401 Unauthorized"),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            kind("SignatureDoesNotMatch: the request signature we calculated"),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            kind("Failed to mkdir: permission denied"),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            kind("Failed to mkdir: 403 Forbidden"),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            kind("Failed to mkdir: directory not found"),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            kind("Post \"https://example\": net/http: request canceled (Client.Timeout exceeded)"),
+            StatusCode::GATEWAY_TIMEOUT
+        );
+        assert_eq!(
+            kind("dial tcp: connection refused"),
+            StatusCode::GATEWAY_TIMEOUT
+        );
+
+        // Nicht zuordenbar: der dokumentierte Sammelfall, kein geratener Code.
+        assert_eq!(kind("something went sideways"), StatusCode::OK);
+
+        // Anmeldung schlägt Rechte, wo beides im Wortlaut steht.
+        assert_eq!(
+            kind("access denied: authentication failed"),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[test]
+    fn the_error_excerpt_is_one_line_and_bounded() {
+        assert_eq!(excerpt("  eins  \n\n zwei \n"), "eins | zwei");
+
+        let long = "y".repeat(MAX_REMOTE_ERROR_LEN + 50);
+        let cut = excerpt(&long);
+        assert_eq!(cut.chars().count(), MAX_REMOTE_ERROR_LEN + 1);
+        assert!(cut.ends_with('…'));
     }
 }

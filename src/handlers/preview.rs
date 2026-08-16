@@ -23,9 +23,10 @@
 //!
 //! Neben der Erkennung liefert das Modul die Inhalts-Endpunkte für die
 //! **Textvorschau** (`GET /api/preview/text?path=…`) und die **Bildvorschau**
-//! (`GET /api/preview/image?path=…`). Video bringt seinen eigenen Endpunkt mit
-//! (mit Range-Requests) und setzt ebenfalls auf der hier ermittelten Gattung
-//! auf.
+//! (`GET /api/preview/image?path=…`) sowie die **Videovorschau**
+//! (`GET /api/preview/video?path=…`). Video hat einen eigenen Endpunkt, weil es
+//! als einziges `Range`-Anfragen beantwortet – ohne die bietet der Browser kein
+//! Spulen an. Alle drei setzen auf der hier ermittelten Gattung auf.
 //!
 //! Für den Text gilt zusätzlich:
 //!
@@ -54,14 +55,16 @@ use axum::{
     extract::Query,
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Json as ResponseJson, Response},
+    Extension,
 };
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::Path;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 
-use crate::handlers::download::{download_root, resolve_within_root, DownloadError};
+use crate::handlers::auth_web::CurrentUser;
+use crate::handlers::download::{resolve_within_root, scope_from_map, user_root, DownloadError};
 use crate::models::ApiResponse;
 
 /// So viele Bytes vom Dateianfang fliessen in die Typerkennung ein. Alle
@@ -103,6 +106,7 @@ pub struct PreviewInfo {
 
 /// `GET /api/preview/info?path=…`
 pub async fn preview_info(
+    Extension(current): Extension<CurrentUser>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response, DownloadError> {
     let requested = params
@@ -111,7 +115,7 @@ pub async fn preview_info(
         .filter(|p| !p.is_empty())
         .ok_or_else(|| DownloadError::bad_request("Pfad fehlt"))?;
 
-    let root = download_root().await?;
+    let root = user_root(&current, scope_from_map(&params)?).await?;
     let info = build_preview(&root, requested).await?;
 
     Ok(ResponseJson(ApiResponse::success(info)).into_response())
@@ -269,6 +273,7 @@ pub struct PreviewText {
 /// Bewusst **ohne** Grössen- oder Offset-Parameter: das Limit gehört dem
 /// Server. Wer mehr will, lädt die Datei herunter.
 pub async fn preview_text(
+    Extension(current): Extension<CurrentUser>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response, DownloadError> {
     let requested = params
@@ -277,7 +282,7 @@ pub async fn preview_text(
         .filter(|p| !p.is_empty())
         .ok_or_else(|| DownloadError::bad_request("Pfad fehlt"))?;
 
-    let root = download_root().await?;
+    let root = user_root(&current, scope_from_map(&params)?).await?;
     let text = build_text_preview(&root, requested).await?;
 
     Ok(ResponseJson(ApiResponse::success(text)).into_response())
@@ -515,6 +520,7 @@ const IMAGE_CSP: &str =
 
 /// `GET /api/preview/image?path=…`
 pub async fn preview_image(
+    Extension(current): Extension<CurrentUser>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response, DownloadError> {
@@ -524,7 +530,7 @@ pub async fn preview_image(
         .filter(|p| !p.is_empty())
         .ok_or_else(|| DownloadError::bad_request("Pfad fehlt"))?;
 
-    let root = download_root().await?;
+    let root = user_root(&current, scope_from_map(&params)?).await?;
     build_image_response(&root, requested, &headers).await
 }
 
@@ -726,6 +732,349 @@ fn if_none_match(headers: &HeaderMap, etag: &str) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+// ---------------------------------------------------------------------------
+// Videoinhalt
+// ---------------------------------------------------------------------------
+//
+// `GET /api/preview/video?path=…` liefert die **Originaldatei** aus – kein
+// Transcode, kein Remux. Der `<video>`-Player des Browsers holt sich daraus,
+// was er braucht, und das tut er **bereichsweise**: erst den Kopf mit den
+// Metadaten, dann den Anfang, beim Spulen einen Ausschnitt mitten aus der
+// Datei. Ohne Bereichsunterstützung bietet er keine Zeitleiste zum Springen an
+// und lädt im schlimmsten Fall Gigabytes, um zur letzten Minute zu kommen.
+//
+// Deshalb gilt hier, anders als bei der Bildvorschau:
+//
+//  * **`Accept-Ranges: bytes` auf jeder Antwort.** Auch auf der 304 und der
+//    416 – der Client soll die Fähigkeit unabhängig vom Ausgang sehen.
+//  * **`206` mit `Content-Range: bytes <start>-<ende>/<gesamt>`.** Die Grenzen
+//    sind **inklusiv**: `bytes=0-1` sind zwei Bytes, und die letzte gültige
+//    Position ist `size - 1`.
+//  * **Offene und Suffix-Bereiche.** `bytes=500-` ist „ab 500 bis zum Ende",
+//    `bytes=-500` sind die **letzten** 500 Bytes. Safari fragt regelmässig
+//    zuerst `bytes=0-1` an, nur um zu sehen, ob überhaupt etwas kommt.
+//  * **Unerfüllbar ist ein Fehler, kein stiller Vollversand.** Ein Bereich
+//    jenseits des Dateiendes endet mit `416` und
+//    `Content-Range: bytes */<gesamt>`; mit einer 200 über die ganze Datei
+//    würde ein Player stattdessen Gigabytes ziehen, die er nicht angefragt hat.
+//  * **Nie die ganze Datei in den Speicher.** Es wird gesucht (`seek`) und
+//    gestreamt (`ReaderStream` über `take`), nie gepuffert. Der Speicherbedarf
+//    hängt an [`VIDEO_STREAM_BUFFER`], nicht an der Dateigrösse.
+//
+// Alles andere ist wie bei der Bildvorschau: der Typ kommt aus dem Inhalt
+// (`sniff`), der Pfad durch dieselbe Jail-Prüfung, und die Antwort trägt
+// `nosniff` sowie eine CSP, die sie auch dann inert macht, wenn jemand die URL
+// direkt in einem Tab öffnet.
+
+/// Puffergrösse beim Streamen. Bestimmt zusammen mit dem Kanal von
+/// `Body::from_stream` den Speicherbedarf einer laufenden Videoantwort – die
+/// Dateigrösse tut das nicht.
+const VIDEO_STREAM_BUFFER: usize = 64 * 1024;
+
+/// Kopfzeile für jede Videoantwort. `media-src 'self'` statt `img-src`, sonst
+/// dieselbe Absicht wie bei [`IMAGE_CSP`]: ein direkt geöffnetes Video ist ein
+/// skriptloses Dokument in einem undurchsichtigen Ursprung.
+const VIDEO_CSP: &str = "default-src 'none'; media-src 'self'; sandbox";
+
+/// Ergebnis der Auswertung von `Range`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RangeRequest {
+    /// Kein Bereich, eine fremde Einheit oder eine Angabe, die sich nicht
+    /// auswerten lässt. RFC 9110 §14.2 erlaubt ausdrücklich, den Kopf dann zu
+    /// ignorieren und die ganze Darstellung zu senden.
+    Full,
+    /// Auswertbar und erfüllbar. **Beide Grenzen sind inklusiv.**
+    Partial { start: u64, end: u64 },
+    /// Auswertbar, liegt aber vollständig ausserhalb der Datei → 416.
+    Unsatisfiable,
+}
+
+impl RangeRequest {
+    /// Länge des angeforderten Ausschnitts. Inklusive Grenzen, deshalb `+ 1` –
+    /// genau hier sitzt der Off-by-one, der einem Player die letzte Sekunde
+    /// abschneidet.
+    fn length(&self) -> u64 {
+        match self {
+            RangeRequest::Partial { start, end } => end - start + 1,
+            _ => 0,
+        }
+    }
+}
+
+/// `GET /api/preview/video?path=…`
+pub async fn preview_video(
+    Extension(current): Extension<CurrentUser>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Result<Response, DownloadError> {
+    let requested = params
+        .get("path")
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .ok_or_else(|| DownloadError::bad_request("Pfad fehlt"))?;
+
+    let root = user_root(&current, scope_from_map(&params)?).await?;
+    build_video_response(&root, requested, &headers).await
+}
+
+/// Prüft den Pfad gegen das Jail, bestimmt den Typ aus dem Inhalt und streamt
+/// den angefragten Bereich. Getrennt vom Handler, damit die Tests ohne
+/// Umgebungsvariablen gegen ein explizites Wurzelverzeichnis laufen können.
+///
+/// Reihenfolge ist Absicht: **erst** Jail und Typ, **dann** die Bereichslogik.
+/// Ein Bereichskopf darf nie dazu führen, dass eine Datei ausserhalb der Wurzel
+/// oder eine Nicht-Videodatei auch nur teilweise beantwortet wird.
+async fn build_video_response(
+    root: &Path,
+    requested: &str,
+    request_headers: &HeaderMap,
+) -> Result<Response, DownloadError> {
+    let path = resolve_within_root(root, requested).await?;
+
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .map_err(|e| DownloadError::bad_request(format!("Datei nicht lesbar: {}", e)))?;
+
+    if !metadata.is_file() {
+        return Err(DownloadError::bad_request(
+            "Für Ordner gibt es keine Vorschau",
+        ));
+    }
+    if metadata.len() == 0 {
+        return Err(DownloadError::bad_request("Datei ist leer"));
+    }
+
+    // Derselbe Befund wie in `/api/preview/info`: der Typ kommt aus dem Inhalt.
+    let head = read_head(&path).await?;
+    let (kind, mime) = sniff(&head);
+    if kind != PreviewKind::Video {
+        return Err(DownloadError::bad_request(format!(
+            "Datei ist kein Video (erkannt als {})",
+            mime
+        )));
+    }
+
+    let size = metadata.len();
+    let etag = image_etag(size, modified_nanos(&metadata));
+
+    // Bedingte Anfrage vor der Bereichsauswertung – so verlangt es RFC 9110
+    // §13.2.2, und es ist auch die billigere Reihenfolge.
+    if if_none_match(request_headers, &etag) {
+        let mut response = Response::builder()
+            .status(StatusCode::NOT_MODIFIED)
+            .body(Body::empty())
+            .map_err(|e| DownloadError::internal(format!("Antwort nicht baubar: {}", e)))?;
+        apply_video_headers(response.headers_mut(), mime, &etag, None, None, &path)?;
+        return Ok(response);
+    }
+
+    let range = request_headers
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .map(|raw| parse_range(raw, size))
+        .unwrap_or(RangeRequest::Full);
+
+    // `If-Range` macht den Bereich von einem unveränderten Stand abhängig:
+    // passt der Validator nicht mehr, wäre ein Ausschnitt aus der *neuen* Datei
+    // an den alten Puffer geklebt – deshalb dann die ganze Datei mit 200.
+    let range = if if_range_matches(request_headers, &etag) {
+        range
+    } else {
+        RangeRequest::Full
+    };
+
+    if range == RangeRequest::Unsatisfiable {
+        let mut response = Response::builder()
+            .status(StatusCode::RANGE_NOT_SATISFIABLE)
+            .body(Body::empty())
+            .map_err(|e| DownloadError::internal(format!("Antwort nicht baubar: {}", e)))?;
+        let unsatisfied = format!("bytes */{}", size);
+        apply_video_headers(
+            response.headers_mut(),
+            mime,
+            &etag,
+            Some(0),
+            Some(unsatisfied),
+            &path,
+        )?;
+        return Ok(response);
+    }
+
+    let (status, start, length, content_range) = match range {
+        RangeRequest::Partial { start, end } => (
+            StatusCode::PARTIAL_CONTENT,
+            start,
+            range.length(),
+            Some(format!("bytes {}-{}/{}", start, end, size)),
+        ),
+        // `Unsatisfiable` ist oben schon beantwortet.
+        _ => (StatusCode::OK, 0, size, None),
+    };
+
+    let mut file = tokio::fs::File::open(&path)
+        .await
+        .map_err(|e| DownloadError::bad_request(format!("Datei nicht lesbar: {}", e)))?;
+    if start > 0 {
+        file.seek(std::io::SeekFrom::Start(start))
+            .await
+            .map_err(|e| DownloadError::internal(format!("Datei nicht positionierbar: {}", e)))?;
+    }
+
+    // `take` begrenzt den Strom hart auf die zugesagte Länge: was hinter dem
+    // Bereich in der Datei steht, kann gar nicht erst auf den Body geraten.
+    let stream = ReaderStream::with_capacity(file.take(length), VIDEO_STREAM_BUFFER);
+
+    let mut response = Response::builder()
+        .status(status)
+        .body(Body::from_stream(stream))
+        .map_err(|e| DownloadError::internal(format!("Antwort nicht baubar: {}", e)))?;
+    apply_video_headers(
+        response.headers_mut(),
+        mime,
+        &etag,
+        Some(length),
+        content_range,
+        &path,
+    )?;
+
+    Ok(response)
+}
+
+/// Setzt die Kopfzeilen jeder Videoantwort – auch die der 304 und der 416.
+///
+/// `Accept-Ranges: bytes` steht bewusst auf **allen** Antworten: der Player
+/// entscheidet daran, ob er eine Zeitleiste zum Springen anbietet, und diese
+/// Auskunft hängt nicht am Ausgang der einzelnen Anfrage.
+fn apply_video_headers(
+    headers: &mut HeaderMap,
+    mime: &'static str,
+    etag: &str,
+    length: Option<u64>,
+    content_range: Option<String>,
+    path: &Path,
+) -> Result<(), DownloadError> {
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(mime));
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(VIDEO_CSP),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        inline_disposition(&base_name(path))?,
+    );
+    headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
+    headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-cache"),
+    );
+    if let Ok(value) = HeaderValue::from_str(etag) {
+        headers.insert(header::ETAG, value);
+    }
+    if let Some(range) = content_range {
+        if let Ok(value) = HeaderValue::from_str(&range) {
+            headers.insert(header::CONTENT_RANGE, value);
+        }
+    }
+    if let Some(length) = length {
+        headers.insert(header::CONTENT_LENGTH, HeaderValue::from(length));
+    }
+
+    Ok(())
+}
+
+/// Wertet einen `Range`-Kopf aus. `size` ist die Dateigrösse und immer > 0.
+///
+/// Ausgewertet wird **ein** Bereich. Mehrfachbereiche (`bytes=0-9,20-29`)
+/// werden ignoriert und mit der ganzen Datei beantwortet: sie verlangten eine
+/// `multipart/byteranges`-Antwort, kein Videoplayer fordert sie an, und eine
+/// halb umgesetzte Mehrfachantwort wäre schlechter als gar keine.
+///
+/// Alles, was sich nicht auswerten lässt, ergibt [`RangeRequest::Full`] – nicht
+/// 416. Ein kaputter Kopf ist keine Bereichsanfrage; unerfüllbar ist nur, was
+/// sich lesen lässt und trotzdem ausserhalb der Datei liegt.
+fn parse_range(raw: &str, size: u64) -> RangeRequest {
+    let spec = match raw.trim().split_once('=') {
+        Some((unit, rest)) if unit.trim().eq_ignore_ascii_case("bytes") => rest.trim(),
+        // Fremde oder fehlende Einheit: ignorieren.
+        _ => return RangeRequest::Full,
+    };
+
+    if spec.contains(',') {
+        return RangeRequest::Full;
+    }
+
+    let (first, last) = match spec.split_once('-') {
+        Some(parts) => parts,
+        None => return RangeRequest::Full,
+    };
+    let (first, last) = (first.trim(), last.trim());
+
+    if size == 0 {
+        return RangeRequest::Unsatisfiable;
+    }
+
+    // Suffix-Bereich: `bytes=-500` sind die **letzten** 500 Bytes, nicht die
+    // ersten. Mehr angefragt als da ist, heisst „die ganze Datei", nicht 416.
+    if first.is_empty() {
+        let wanted: u64 = match last.parse() {
+            Ok(value) => value,
+            Err(_) => return RangeRequest::Full,
+        };
+        if wanted == 0 {
+            // `bytes=-0` ist ein leerer Suffix und laut RFC unerfüllbar.
+            return RangeRequest::Unsatisfiable;
+        }
+        return RangeRequest::Partial {
+            start: size.saturating_sub(wanted),
+            end: size - 1,
+        };
+    }
+
+    let start: u64 = match first.parse() {
+        Ok(value) => value,
+        Err(_) => return RangeRequest::Full,
+    };
+    if start >= size {
+        return RangeRequest::Unsatisfiable;
+    }
+
+    // Offener Bereich (`bytes=500-`) läuft bis zum letzten Byte. Ein Ende
+    // jenseits der Datei wird gekappt, nicht abgelehnt.
+    let end = if last.is_empty() {
+        size - 1
+    } else {
+        match last.parse::<u64>() {
+            Ok(value) => value.min(size - 1),
+            Err(_) => return RangeRequest::Full,
+        }
+    };
+
+    if end < start {
+        // Verdrehte Angabe: syntaktisch ungültig, also kein Bereich.
+        return RangeRequest::Full;
+    }
+
+    RangeRequest::Partial { start, end }
+}
+
+/// Wertet `If-Range` aus. Fehlt der Kopf, gilt der Bereich unverändert.
+///
+/// Als Validator wird ausschliesslich der ETag verglichen. Ein Datum (die
+/// zweite laut RFC erlaubte Form) gilt als „passt nicht" und führt damit zur
+/// vollständigen Antwort – das ist die sichere Richtung: schlimmstenfalls
+/// überträgt der Server mehr als nötig, nie aber einen Ausschnitt aus einer
+/// Datei, die der Client so nicht mehr kennt.
+fn if_range_matches(headers: &HeaderMap, etag: &str) -> bool {
+    match headers.get(header::IF_RANGE) {
+        None => true,
+        Some(value) => value.to_str().map(|v| v.trim() == etag).unwrap_or(false),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1920,6 +2269,318 @@ mod tests {
             .await
             .expect("lieferbar");
         assert_eq!(response.status(), StatusCode::OK);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // --- Videovorschau ----------------------------------------------------
+
+    /// Eine Datei mit gültigem MP4-Kopf und `len` Bytes insgesamt. Der Inhalt
+    /// hinter dem Kopf ist eine wiederholbare Folge, damit ein Ausschnitt sich
+    /// eindeutig einer Position zuordnen lässt.
+    fn fake_mp4(len: usize) -> Vec<u8> {
+        let mut bytes = b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00".to_vec();
+        while bytes.len() < len {
+            let index = bytes.len();
+            bytes.push((index % 251) as u8);
+        }
+        bytes.truncate(len);
+        bytes
+    }
+
+    fn video_root(label: &str, name: &str, bytes: &[u8]) -> (PathBuf, PathBuf) {
+        let base = temp_dir(label);
+        let root = std::fs::canonicalize(&base).expect("canonical");
+        std::fs::write(root.join(name), bytes).expect("schreiben");
+        (base, root)
+    }
+
+    fn range_headers(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, HeaderValue::from_str(value).expect("Range"));
+        headers
+    }
+
+    /// Ohne `Range`: ganze Datei, aber mit der Zusage, dass Bereiche gehen.
+    #[tokio::test]
+    async fn video_without_range_answers_200_and_advertises_ranges() {
+        let video = fake_mp4(4096);
+        let (base, root) = video_root("preview-video-full", "film.mp4", &video);
+
+        let response = build_video_response(&root, "film.mp4", &HeaderMap::new())
+            .await
+            .expect("Video lieferbar");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(header_of(&response, header::CONTENT_TYPE), "video/mp4");
+        assert_eq!(header_of(&response, header::ACCEPT_RANGES), "bytes");
+        assert_eq!(
+            header_of(&response, header::X_CONTENT_TYPE_OPTIONS),
+            "nosniff"
+        );
+        assert_eq!(header_of(&response, header::CONTENT_RANGE), "");
+        assert_eq!(
+            header_of(&response, header::CONTENT_LENGTH),
+            video.len().to_string()
+        );
+        assert_eq!(body_bytes(response).await, video, "Bytes unverändert");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Der Kern des Tickets: geschlossener, offener und Suffix-Bereich, jeweils
+    /// mit **inklusiven** Grenzen. `bytes=0-1` sind zwei Bytes – das ist die
+    /// Anfrage, mit der Safari die Fähigkeit prüft.
+    #[tokio::test]
+    async fn video_ranges_are_inclusive_at_both_ends() {
+        let video = fake_mp4(4096);
+        let size = video.len() as u64;
+        let (base, root) = video_root("preview-video-range", "film.mp4", &video);
+
+        // geschlossen
+        let response = build_video_response(&root, "film.mp4", &range_headers("bytes=100-199"))
+            .await
+            .expect("Bereich lieferbar");
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            header_of(&response, header::CONTENT_RANGE),
+            format!("bytes 100-199/{}", size)
+        );
+        assert_eq!(header_of(&response, header::CONTENT_LENGTH), "100");
+        assert_eq!(body_bytes(response).await, video[100..200]);
+
+        // Safaris Fähigkeitsprobe: zwei Bytes, nicht eines.
+        let response = build_video_response(&root, "film.mp4", &range_headers("bytes=0-1"))
+            .await
+            .expect("Bereich lieferbar");
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            header_of(&response, header::CONTENT_RANGE),
+            format!("bytes 0-1/{}", size)
+        );
+        assert_eq!(body_bytes(response).await, video[0..2]);
+
+        // offen: ab 4000 bis zum Ende
+        let response = build_video_response(&root, "film.mp4", &range_headers("bytes=4000-"))
+            .await
+            .expect("Bereich lieferbar");
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            header_of(&response, header::CONTENT_RANGE),
+            format!("bytes 4000-{}/{}", size - 1, size)
+        );
+        assert_eq!(body_bytes(response).await, video[4000..]);
+
+        // Suffix: die **letzten** 500 Bytes
+        let response = build_video_response(&root, "film.mp4", &range_headers("bytes=-500"))
+            .await
+            .expect("Bereich lieferbar");
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            header_of(&response, header::CONTENT_RANGE),
+            format!("bytes {}-{}/{}", size - 500, size - 1, size)
+        );
+        assert_eq!(body_bytes(response).await, video[(video.len() - 500)..]);
+
+        // letztes Byte einzeln – der klassische Off-by-one
+        let response = build_video_response(
+            &root,
+            "film.mp4",
+            &range_headers(&format!("bytes={}-{}", size - 1, size - 1)),
+        )
+        .await
+        .expect("Bereich lieferbar");
+        assert_eq!(header_of(&response, header::CONTENT_LENGTH), "1");
+        assert_eq!(body_bytes(response).await, vec![video[video.len() - 1]]);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Ein Ende jenseits der Datei wird gekappt, ein Anfang jenseits der Datei
+    /// ist unerfüllbar – 416 mit `bytes */<gesamt>`, nicht 200 mit allem.
+    #[tokio::test]
+    async fn video_range_beyond_the_file_is_416_not_the_whole_file() {
+        let video = fake_mp4(1024);
+        let size = video.len() as u64;
+        let (base, root) = video_root("preview-video-416", "film.mp4", &video);
+
+        for spec in ["bytes=2000-3000", "bytes=1024-", "bytes=-0"] {
+            let response = build_video_response(&root, "film.mp4", &range_headers(spec))
+                .await
+                .expect("Antwort baubar");
+            assert_eq!(
+                response.status(),
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "Bereich {}",
+                spec
+            );
+            assert_eq!(
+                header_of(&response, header::CONTENT_RANGE),
+                format!("bytes */{}", size),
+                "Bereich {}",
+                spec
+            );
+            assert_eq!(header_of(&response, header::ACCEPT_RANGES), "bytes");
+            assert!(body_bytes(response).await.is_empty());
+        }
+
+        // Ende jenseits der Datei: gekappt, nicht abgelehnt.
+        let response = build_video_response(&root, "film.mp4", &range_headers("bytes=1000-99999"))
+            .await
+            .expect("Bereich lieferbar");
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            header_of(&response, header::CONTENT_RANGE),
+            format!("bytes 1000-{}/{}", size - 1, size)
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Ein Kopf, der sich nicht auswerten lässt, ist keine Bereichsanfrage –
+    /// er wird ignoriert (200), nicht mit 416 beantwortet.
+    #[test]
+    fn unparsable_range_headers_are_ignored() {
+        assert_eq!(parse_range("items=0-10", 1000), RangeRequest::Full);
+        assert_eq!(parse_range("bytes=abc-def", 1000), RangeRequest::Full);
+        assert_eq!(parse_range("bytes=500-100", 1000), RangeRequest::Full);
+        assert_eq!(parse_range("bytes=0-9,20-29", 1000), RangeRequest::Full);
+        assert_eq!(parse_range("nonsense", 1000), RangeRequest::Full);
+        // Grossschreibung der Einheit ist erlaubt.
+        assert_eq!(
+            parse_range("BYTES=0-9", 1000),
+            RangeRequest::Partial { start: 0, end: 9 }
+        );
+        // Suffix grösser als die Datei: die ganze Datei, kein Fehler.
+        assert_eq!(
+            parse_range("bytes=-5000", 1000),
+            RangeRequest::Partial { start: 0, end: 999 }
+        );
+        assert_eq!(parse_range("bytes=0-0", 1000).length(), 1);
+    }
+
+    /// `If-Range` mit veraltetem Validator: der Ausschnitt würde sonst aus
+    /// einer anderen Datei stammen als der Puffer des Clients.
+    #[tokio::test]
+    async fn stale_if_range_yields_the_whole_file() {
+        let video = fake_mp4(2048);
+        let (base, root) = video_root("preview-video-ifrange", "film.mp4", &video);
+
+        let mut headers = range_headers("bytes=100-199");
+        headers.insert(header::IF_RANGE, HeaderValue::from_static("\"veraltet\""));
+
+        let response = build_video_response(&root, "film.mp4", &headers)
+            .await
+            .expect("Video lieferbar");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(header_of(&response, header::CONTENT_RANGE), "");
+        assert_eq!(
+            header_of(&response, header::CONTENT_LENGTH),
+            video.len().to_string()
+        );
+
+        // Passender Validator: der Bereich bleibt ein Bereich.
+        let metadata = std::fs::metadata(root.join("film.mp4")).expect("metadata");
+        let etag = image_etag(metadata.len(), modified_nanos(&metadata));
+        let mut headers = range_headers("bytes=100-199");
+        headers.insert(
+            header::IF_RANGE,
+            HeaderValue::from_str(&etag).expect("ETag"),
+        );
+        let response = build_video_response(&root, "film.mp4", &headers)
+            .await
+            .expect("Bereich lieferbar");
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Auch die 304 trägt `Accept-Ranges` – der Player entscheidet daran, ob er
+    /// eine Zeitleiste zum Springen anbietet.
+    #[tokio::test]
+    async fn video_304_keeps_accept_ranges() {
+        let video = fake_mp4(2048);
+        let (base, root) = video_root("preview-video-304", "film.mp4", &video);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_NONE_MATCH, HeaderValue::from_static("*"));
+
+        let response = build_video_response(&root, "film.mp4", &headers)
+            .await
+            .expect("Antwort baubar");
+        assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(header_of(&response, header::ACCEPT_RANGES), "bytes");
+        assert_eq!(header_of(&response, header::CONTENT_TYPE), "video/mp4");
+        assert!(body_bytes(response).await.is_empty());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Der Typ kommt aus dem Inhalt: eine `.mp4`, in der Text steht, ist kein
+    /// Video – und ein AVIF (gleicher ISO-BMFF-Kopf) auch nicht.
+    #[tokio::test]
+    async fn video_endpoint_rejects_everything_that_is_not_a_video() {
+        let base = temp_dir("preview-video-typ");
+        let root = std::fs::canonicalize(&base).expect("canonical");
+        std::fs::write(root.join("luege.mp4"), b"nur Text, kein Video\n").expect("schreiben");
+        let mut avif = b"\x00\x00\x00\x20ftypavif".to_vec();
+        avif.extend_from_slice(&[0u8; 64]);
+        std::fs::write(root.join("bild.mp4"), &avif).expect("schreiben");
+        std::fs::write(root.join("leer.mp4"), b"").expect("schreiben");
+
+        for name in ["luege.mp4", "bild.mp4", "leer.mp4"] {
+            let error = build_video_response(&root, name, &HeaderMap::new())
+                .await
+                .expect_err("muss abgelehnt werden");
+            assert_eq!(
+                error.into_response().status(),
+                StatusCode::BAD_REQUEST,
+                "Datei {}",
+                name
+            );
+        }
+
+        // Auch mit Bereichskopf: die Ablehnung kommt vor jeder Bereichslogik.
+        let error = build_video_response(&root, "luege.mp4", &range_headers("bytes=0-1"))
+            .await
+            .expect_err("muss abgelehnt werden");
+        assert_eq!(error.into_response().status(), StatusCode::BAD_REQUEST);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Jail: ein Bereichskopf darf die Prüfung nicht aushebeln.
+    #[tokio::test]
+    async fn video_preview_rejects_paths_outside_the_root() {
+        let base = temp_dir("preview-video-jail");
+        let root = base.join("root");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(outside.join("geheim.mp4"), fake_mp4(512)).expect("schreiben");
+        let canonical_root = std::fs::canonicalize(&root).expect("canonical root");
+
+        // Mit Bereichskopf, damit klar ist: er hebelt die Prüfung nicht aus.
+        let headers = range_headers("bytes=0-1");
+        let absolute = outside.join("geheim.mp4").to_string_lossy().to_string();
+        for candidate in ["../outside/geheim.mp4", absolute.as_str()] {
+            let status = match build_video_response(&canonical_root, candidate, &headers).await {
+                Ok(response) => response.status(),
+                Err(e) => e.into_response().status(),
+            };
+            assert_eq!(status, StatusCode::FORBIDDEN, "Pfad: {}", candidate);
+        }
+
+        // Und über einen aufgelösten Symlink ebenso wenig.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, root.join("escape")).expect("symlink");
+            let status =
+                match build_video_response(&canonical_root, "escape/geheim.mp4", &headers).await {
+                    Ok(response) => response.status(),
+                    Err(e) => e.into_response().status(),
+                };
+            assert_eq!(status, StatusCode::FORBIDDEN);
+        }
 
         let _ = std::fs::remove_dir_all(&base);
     }

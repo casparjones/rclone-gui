@@ -19,6 +19,7 @@ import {
 } from './browser-render.js';
 import { initPreview, openPreview } from './preview.js';
 import { openSyncModal } from './sync.js';
+import { handleSelectionClick, initSelection, resetSelectionAnchor } from './selection.js';
 
 const VIEW_MODES = ['list', 'icon', 'preview'];
 
@@ -41,10 +42,20 @@ export function initFileBrowser() {
     });
 
     initPreview();
+    initSelection();
 
     const fileList = document.getElementById('file-list');
     fileList.addEventListener('click', handleFileListClick);
     fileList.addEventListener('keydown', handleFileListKeydown);
+
+    // Shift-clicking starts a text selection across the rows, which makes a
+    // range look broken. Suppressed here for the list only — a page wide
+    // `user-select: none` would also kill selecting a path in the breadcrumb.
+    fileList.addEventListener('mousedown', event => {
+        if (event.shiftKey && event.target.closest('.fb-row')) {
+            event.preventDefault();
+        }
+    });
 
     // Scrolling pulls in the next chunk of entries. Throttled to one check per
     // frame, otherwise a fast wheel produces hundreds of layout reads.
@@ -102,6 +113,10 @@ export async function loadFiles(path = state.currentPath, options = {}) {
 
     state.currentListing = result.data;
     state.currentPath = state.currentListing.path;
+
+    // The selection itself survives the folder change (that is the point), but
+    // the shift anchor belonged to the old listing and is dropped.
+    resetSelectionAnchor();
 
     renderBreadcrumb();
     renderFiles();
@@ -163,6 +178,8 @@ function setFileSort(key) {
 
     localStorage.setItem(STORAGE_KEYS.fileSort, JSON.stringify(state.fileSort));
     updateSortButtons();
+    // Different order, so the anchor's position is meaningless now.
+    resetSelectionAnchor();
     renderFiles();
 }
 
@@ -221,6 +238,19 @@ function handleFileListClick(event) {
     }
 
     const path = row.dataset.path;
+    const selectable = row.dataset.selectable === '1';
+
+    // The checkbox cell. The native toggle has already happened by now; the
+    // selection is the authority and writes the checked state back, so a shift
+    // range that decides otherwise still ends up consistent.
+    if (event.target.closest('.fb-check')) {
+        event.stopPropagation();
+        if (selectable) {
+            handleSelectionClick(row, event);
+        }
+        return;
+    }
+
     const actionButton = event.target.closest('[data-action]');
 
     if (actionButton) {
@@ -230,6 +260,15 @@ function handleFileListClick(event) {
         } else if (actionButton.dataset.action === 'download') {
             downloadEntry(path, row.dataset.dir === '1');
         }
+        return;
+    }
+
+    // Ctrl/Cmd and shift on the row itself select instead of opening. Expected
+    // from every file manager, and it is the only way to extend a range with
+    // the pointer without hitting the small checkbox.
+    if (selectable && (event.shiftKey || event.ctrlKey || event.metaKey)) {
+        event.preventDefault();
+        handleSelectionClick(row, event);
         return;
     }
 
@@ -252,6 +291,13 @@ function handleFileListKeydown(event) {
 
     const row = event.target.closest && event.target.closest('.fb-row');
     if (!row || event.target.closest('[data-action]')) {
+        return;
+    }
+
+    // The checkbox is the one part of a row that is in the tab order. Enter on
+    // it must not open the file the row happens to point at — space toggles it,
+    // and that arrives here as a native click, not as a keydown.
+    if (event.target.closest('.fb-check')) {
         return;
     }
 

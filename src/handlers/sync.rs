@@ -1,5 +1,7 @@
+use crate::handlers::auth_web::CurrentUser;
+use crate::handlers::download::{resolve_within_root, user_root, RootScope};
 use crate::models::{ApiResponse, SyncProgress, SyncRequest};
-use axum::{extract::Json, response::Json as ResponseJson};
+use axum::{extract::Json, response::Json as ResponseJson, Extension};
 use chrono::{self, Utc};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -420,8 +422,88 @@ async fn create_initial_log(job_id: &str, sync_request: &SyncRequest) -> tokio::
     fs::write(&log_file_path, initial_log).await
 }
 
+// ---------------------------------------------------------------------------
+// Quellpfad-Jail
+//
+// Die Quelle eines Syncs ging früher **direkt** aus dem JSON-Body an rclone.
+// Damit lief der meistgeprüfte Teil des Projekts – `resolve_within_root()` –
+// für diesen Weg schlicht nie: ein `source_path: "/etc"` kopierte das
+// Verzeichnis auf ein Remote. Die Schwesterlücke zum ungeprüften Remote-Namen
+// (`ensure_configured_remote`), nur auf der anderen Seite der Übertragung.
+//
+// Die Jail-Logik selbst bleibt **unangetastet**; geändert hat sich nur, dass
+// dieser Weg sie überhaupt aufruft. Wurzel ist – wie bei Auflistung, Download
+// und Vorschau – das Home des Nutzers, dem der Lauf zugerechnet wird.
+//
+// **Entscheidung: kein `scope=system` für den Sync, auch nicht für Admins.**
+// Begründung:
+//   * Auflisten, Download und Vorschau sind kurze, sichtbare Einzelzugriffe,
+//     bei denen `?scope=system` pro Request ausdrücklich in der URL steht.
+//     Ein Sync ist das Gegenteil: ein Hintergrundlauf, der einen ganzen Baum
+//     auf ein fremdes Remote schiebt. Ein versehentlich gesetzter Schalter
+//     verschöbe dort das gesamte Wirtssystem, und das lässt sich nicht
+//     zurücknehmen.
+//   * `SyncRequest` (`src/models.rs`) hat kein `scope`-Feld, und weder das
+//     Frontend noch ein Task in der Datenbank kann eines setzen. Ein
+//     Admin-Weg wäre also heute ohnehin unerreichbar – ihn trotzdem
+//     einzubauen hiesse, eine ungenutzte Ausnahme offenzuhalten.
+//   * Ein Admin, der wirklich ausserhalb syncen muss, hat den Weg über sein
+//     eigenes `users.home_path`. Das ist eine bewusste, sichtbare Einstellung
+//     statt eines Flags im Request.
+// Kurz: fail closed, wie überall sonst in diesem Modul.
+// ---------------------------------------------------------------------------
+
+/// Löst `source_path` gegen das Home des Aufrufers auf.
+///
+/// Gibt den kanonisierten Pfad zurück – der, und nicht die Eingabe, geht
+/// anschliessend an rclone. Damit ist ausgeschlossen, dass zwischen Prüfung
+/// und Start noch ein `..` oder ein Symlink in der Zeichenkette steckt.
+async fn resolved_source_path(
+    current: &CurrentUser,
+    source_path: &str,
+) -> Result<String, &'static str> {
+    let root = user_root(current, RootScope::Home).await.map_err(|e| {
+        warn!(
+            "Sync abgelehnt: Home von '{}' nicht verfügbar ({:?})",
+            current.user.username, e
+        );
+        "Das Home-Verzeichnis dieses Kontos ist nicht verfügbar"
+    })?;
+
+    let resolved = resolve_within_root(&root, source_path).await.map_err(|e| {
+        warn!(
+            "Sync abgelehnt: Quellpfad '{}' von '{}' ausserhalb des erlaubten Bereichs ({:?})",
+            source_path, current.user.username, e
+        );
+        "Quellpfad liegt ausserhalb des erlaubten Wurzelverzeichnisses"
+    })?;
+
+    // Ein Pfad, der sich nicht als UTF-8 darstellen lässt, ginge unbemerkt
+    // verstümmelt in die Kommandozeile – lieber ablehnen.
+    resolved.to_str().map(str::to_string).ok_or_else(|| {
+        warn!("Sync abgelehnt: Quellpfad ist kein gültiges UTF-8");
+        "Quellpfad enthält ungültige Zeichen"
+    })
+}
+
+/// HTTP-Einstieg. Der angemeldete Nutzer kommt aus den Request-Extensions und
+/// ist der Beweis, dass die Sitzungsprüfung gelaufen ist.
 pub async fn start_sync(
+    Extension(current): Extension<CurrentUser>,
     Json(sync_request): Json<SyncRequest>,
+) -> ResponseJson<ApiResponse<String>> {
+    start_sync_for(&current, sync_request).await
+}
+
+/// Gemeinsamer Kern für HTTP und CLI (`--start-task`).
+///
+/// Der CLI-Weg läuft an der Middleware vorbei und ruft diese Funktion direkt
+/// auf; die Nutzerzuordnung erfolgt dort über `--user`. Beide Wege gehen damit
+/// durch **dieselbe** Prüfung – es gibt keinen zweiten Einstieg, an dem sie
+/// vergessen werden könnte.
+pub async fn start_sync_for(
+    current: &CurrentUser,
+    mut sync_request: SyncRequest,
 ) -> ResponseJson<ApiResponse<String>> {
     // Vor allem anderen: der Remote-Name muss syntaktisch sauber und
     // konfiguriert sein. Ein Name wie `:local` wäre rclones
@@ -433,6 +515,15 @@ pub async fn start_sync(
     {
         warn!("Sync abgelehnt: {}", e);
         return ResponseJson(ApiResponse::error(&e.to_string()));
+    }
+
+    // Dasselbe gilt für die Quelle: abgelehnt wird, bevor ein Job in der
+    // Tabelle steht, bevor eine Logdatei angelegt ist und bevor irgendein
+    // Prozess startet.
+    match resolved_source_path(current, &sync_request.source_path).await {
+        // Was an rclone geht, ist der kanonisierte Pfad – nicht die Eingabe.
+        Ok(path) => sync_request.source_path = path,
+        Err(message) => return ResponseJson(ApiResponse::error(message)),
     }
 
     let job_id = Uuid::new_v4().to_string();
@@ -766,8 +857,12 @@ async fn finish_job(sync_jobs: &SyncJobs, job_id: &str, status: JobStatus) {
 /// ohne laufenden Prozess wäre er nie terminal, nie löschbar und für den
 /// Cleanup unsichtbar. Genau das Muster, das dieses Ticket behebt.
 pub async fn recover_stranded_jobs() {
+    recover_stranded_in(&SYNC_JOBS).await
+}
+
+async fn recover_stranded_in(sync_jobs: &SyncJobs) {
     let stranded: Vec<String> = {
-        let jobs = SYNC_JOBS.lock().await;
+        let jobs = sync_jobs.lock().await;
         jobs.iter()
             .filter(|(_, job)| !job.status.is_terminal())
             .map(|(id, _)| id.clone())
@@ -775,9 +870,12 @@ pub async fn recover_stranded_jobs() {
     };
 
     for job_id in stranded {
-        warn!("🧹 Job {} hat den Neustart nicht überlebt, wird beendet", job_id);
+        warn!(
+            "🧹 Job {} hat den Neustart nicht überlebt, wird beendet",
+            job_id
+        );
         finish_job(
-            &SYNC_JOBS,
+            sync_jobs,
             &job_id,
             JobStatus::failed("Failed: interrupted by server restart"),
         )
@@ -1081,6 +1179,107 @@ mod tests {
         }
     }
 
+    /// Eindeutiges Testverzeichnis, wie in `download.rs`.
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("rclone-gui-sync-{}-{}", label, Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("Testverzeichnis anlegbar");
+        dir
+    }
+
+    /// Angemeldeter Nutzer mit dem angegebenen Home. Die Sitzung ist Beiwerk —
+    /// geprüft wird ausschliesslich über `user.home_path`.
+    fn user_with_home(home: &std::path::Path, role: &str) -> CurrentUser {
+        let now = Utc::now();
+        CurrentUser {
+            user: crate::database::User {
+                id: "u-1".to_string(),
+                username: "tester".to_string(),
+                password_hash: String::new(),
+                role: role.to_string(),
+                home_path: home.to_string_lossy().to_string(),
+                is_active: true,
+                created_at: now,
+                last_login_at: None,
+            },
+            session: crate::database::Session {
+                id: String::new(),
+                user_id: "u-1".to_string(),
+                created_at: now,
+                expires_at: now,
+                user_agent: None,
+                ip: None,
+            },
+        }
+    }
+
+    /// Die Quelle eines Syncs unterliegt derselben Jail-Prüfung wie jeder
+    /// andere vom Client gelieferte Pfad: `..`, absolute Fremdpfade und
+    /// Symlink-Ausbrüche werden abgewiesen, der eigene Baum bleibt erlaubt.
+    #[tokio::test]
+    async fn sync_source_stays_inside_the_home() {
+        let base = temp_dir("quelle");
+        let home = base.join("home");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(home.join("daten")).expect("home");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(outside.join("secret.txt"), b"geheim").expect("secret");
+
+        let current = user_with_home(&home, "user");
+        let canonical_home = std::fs::canonicalize(&home).expect("canonical home");
+
+        // Innerhalb: erlaubt, und was zurückkommt ist der kanonisierte Pfad.
+        let resolved = resolved_source_path(&current, "daten")
+            .await
+            .expect("eigener Baum ist erlaubt");
+        assert_eq!(resolved, canonical_home.join("daten").to_string_lossy());
+
+        // `..`-Ausbruch
+        assert!(resolved_source_path(&current, "../outside").await.is_err());
+
+        // Absoluter Fremdpfad
+        assert!(resolved_source_path(&current, "/etc").await.is_err());
+        assert!(resolved_source_path(&current, &outside.to_string_lossy())
+            .await
+            .is_err());
+
+        // Symlink aus dem Home heraus
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, home.join("escape")).expect("symlink");
+            assert!(resolved_source_path(&current, "escape").await.is_err());
+        }
+
+        // Leerer Pfad und Nullbyte
+        assert!(resolved_source_path(&current, "").await.is_err());
+        assert!(resolved_source_path(&current, "daten\0").await.is_err());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Auch ein Admin synct nur aus seinem eigenen Home: `RootScope::System`
+    /// wird auf diesem Weg bewusst nicht angeboten (Begründung oben am
+    /// Quellpfad-Jail).
+    #[tokio::test]
+    async fn admin_source_is_jailed_too() {
+        let base = temp_dir("admin");
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("home");
+
+        let admin = user_with_home(&home, "admin");
+        assert!(resolved_source_path(&admin, "/etc").await.is_err());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Ein Konto ohne Home kann nicht syncen, statt still auf einen globalen
+    /// Pfad zurückzufallen.
+    #[tokio::test]
+    async fn missing_home_is_refused() {
+        let current = user_with_home(std::path::Path::new(""), "user");
+        assert!(resolved_source_path(&current, "irgendwas").await.is_err());
+    }
+
     fn rclone_args(request: &SyncRequest) -> Vec<String> {
         let spec = JobSpec {
             job_id: "job-1",
@@ -1265,6 +1464,248 @@ mod tests {
         assert_eq!(parse_byte_value("1.5 MB"), 1572864);
         assert_eq!(parse_byte_value("1 GByte"), 1073741824);
         assert_eq!(parse_byte_value(""), 0);
+    }
+
+    // -----------------------------------------------------------------
+    // JobStatus
+    // -----------------------------------------------------------------
+
+    /// Die Meldung, an der die alte Logik gescheitert ist: weder `== "Failed"`
+    /// noch `contains("Error")` (rclone schreibt `os error 2`, klein).
+    const SPAWN_FAILURE: &str =
+        "Failed to spawn rclone process: No such file or directory (os error 2)";
+
+    #[test]
+    fn terminal_state_does_not_depend_on_the_wording() {
+        assert!(!JobStatus::Starting.is_terminal());
+        assert!(!JobStatus::Running.is_terminal());
+        assert!(JobStatus::Completed.is_terminal());
+        assert!(JobStatus::Cancelled.is_terminal());
+
+        // Beliebig formulierte Fehlermeldungen — alle terminal.
+        for reason in [
+            SPAWN_FAILURE,
+            "Failed",
+            "Error: broken pipe",
+            "rsync: partial transfer due to vanished source files",
+            "",
+        ] {
+            let status = JobStatus::failed(reason);
+            assert!(status.is_terminal(), "nicht terminal: {:?}", reason);
+            assert!(!status.is_success());
+            assert_eq!(status.state(), "failed");
+        }
+
+        assert!(JobStatus::Completed.is_success());
+        assert!(!JobStatus::Cancelled.is_success());
+    }
+
+    /// `describe_exit()` liefert freien Text; der landet in `Failed` und darf
+    /// das Terminal-Verhalten nicht mehr beeinflussen. Das ist die Falle, vor
+    /// der das Engine-Ticket gewarnt hat.
+    #[test]
+    fn describe_exit_wording_cannot_break_termination() {
+        struct OddEngine;
+        impl SyncEngine for OddEngine {
+            fn name(&self) -> &'static str {
+                "odd"
+            }
+            fn build_command(&self, _spec: &JobSpec<'_>) -> anyhow::Result<EngineCommand> {
+                unreachable!()
+            }
+            fn progress_source(&self) -> ProgressSource {
+                ProgressSource::JobLog
+            }
+            fn parse_progress(&self, _chunk: &str) -> Option<ProgressSnapshot> {
+                None
+            }
+            fn describe_exit(&self, _code: Option<i32>) -> String {
+                "Übertragung unvollständig abgebrochen".to_string()
+            }
+        }
+
+        let status = JobStatus::failed(OddEngine.describe_exit(Some(23)));
+        assert!(status.is_terminal());
+        assert!(!status.is_success());
+    }
+
+    /// Der Anzeigetext bleibt wortgleich mit der früheren Zeichenkette, damit
+    /// Frontend und CLI-Ausgabe sich nicht ändern.
+    #[test]
+    fn display_text_is_unchanged() {
+        assert_eq!(JobStatus::Starting.to_string(), "Starting");
+        assert_eq!(JobStatus::Running.to_string(), "Running");
+        assert_eq!(JobStatus::Completed.to_string(), "Completed");
+        assert_eq!(JobStatus::failed("Failed").to_string(), "Failed");
+        assert_eq!(JobStatus::failed(SPAWN_FAILURE).to_string(), SPAWN_FAILURE);
+    }
+
+    fn job(id: &str, status: JobStatus) -> SyncProgress {
+        SyncProgress {
+            id: id.to_string(),
+            progress: 0.0,
+            status,
+            transferred: 0,
+            total: 0,
+            source_name: "src".to_string(),
+            start_time: 1_000,
+            end_time: None,
+        }
+    }
+
+    /// Die API liefert `status` unverändert weiter und ergänzt `state` und
+    /// `terminal` auf derselben Ebene.
+    #[test]
+    fn json_keeps_the_old_status_field_and_adds_the_typed_ones() {
+        let value =
+            serde_json::to_value(job("j1", JobStatus::failed(SPAWN_FAILURE))).expect("json");
+
+        assert_eq!(value["status"], SPAWN_FAILURE);
+        assert_eq!(value["state"], "failed");
+        assert_eq!(value["terminal"], true);
+        // Die übrigen Felder liegen weiterhin flach daneben.
+        assert_eq!(value["id"], "j1");
+        assert_eq!(value["start_time"], 1_000);
+
+        let running = serde_json::to_value(job("j2", JobStatus::Running)).expect("json");
+        assert_eq!(running["status"], "Running");
+        assert_eq!(running["state"], "running");
+        assert_eq!(running["terminal"], false);
+    }
+
+    #[test]
+    fn json_round_trips() {
+        for status in [
+            JobStatus::Starting,
+            JobStatus::Running,
+            JobStatus::Completed,
+            JobStatus::Cancelled,
+            JobStatus::failed(SPAWN_FAILURE),
+        ] {
+            let json = serde_json::to_string(&job("j", status.clone())).expect("json");
+            let back: SyncProgress = serde_json::from_str(&json).expect("parse");
+            assert_eq!(back.status, status);
+        }
+    }
+
+    /// Ein Client, der nur den alten Anzeigetext kennt, wird weiterhin richtig
+    /// eingeordnet.
+    #[test]
+    fn legacy_status_text_without_state_is_understood() {
+        assert_eq!(
+            JobStatus::from_parts(None, "Running".into()),
+            JobStatus::Running
+        );
+        assert_eq!(
+            JobStatus::from_parts(None, "Completed".into()),
+            JobStatus::Completed
+        );
+        let legacy = JobStatus::from_parts(None, SPAWN_FAILURE.into());
+        assert!(legacy.is_terminal());
+    }
+
+    // -----------------------------------------------------------------
+    // Terminalpfade in der Jobtabelle
+    // -----------------------------------------------------------------
+
+    async fn insert_job(id: &str, status: JobStatus) {
+        SYNC_JOBS
+            .lock()
+            .await
+            .insert(id.to_string(), job(id, status));
+    }
+
+    /// Der Kern des Tickets: ein Job, dessen Prozessstart fehlschlägt, ist
+    /// löschbar und hat `end_time` gesetzt.
+    #[tokio::test]
+    async fn a_job_that_failed_to_spawn_is_deletable_and_has_an_end_time() {
+        let id = "test-spawn-failure-1e67022b";
+        insert_job(id, JobStatus::Running).await;
+
+        finish_job(&SYNC_JOBS, id, JobStatus::failed(SPAWN_FAILURE)).await;
+
+        {
+            let jobs = SYNC_JOBS.lock().await;
+            let stored = jobs.get(id).expect("job");
+            assert!(stored.end_time.is_some(), "end_time fehlt");
+            assert!(stored.status.is_terminal());
+        }
+
+        let response = delete_sync_job(id.to_string()).await;
+        assert!(
+            response.0.success,
+            "Job war nicht löschbar: {:?}",
+            response.0.error
+        );
+        assert!(SYNC_JOBS.lock().await.get(id).is_none());
+    }
+
+    /// Ein laufender Job bleibt geschützt.
+    #[tokio::test]
+    async fn a_running_job_cannot_be_deleted() {
+        let id = "test-running-1e67022b";
+        insert_job(id, JobStatus::Running).await;
+
+        let response = delete_sync_job(id.to_string()).await;
+        assert!(!response.0.success);
+
+        SYNC_JOBS.lock().await.remove(id);
+    }
+
+    /// Der 24-Stunden-Cleanup erfasst auch fehlgeschlagene Jobs — vorher fiel
+    /// alles durch, dessen Meldung nicht exakt passte.
+    #[tokio::test]
+    async fn the_cleanup_catches_failed_jobs_regardless_of_wording() {
+        let old = Utc::now().timestamp() - 90_000; // > 24 h
+        let ids = [
+            (
+                "test-cleanup-failed-1e67022b",
+                JobStatus::failed(SPAWN_FAILURE),
+            ),
+            ("test-cleanup-done-1e67022b", JobStatus::Completed),
+        ];
+
+        for (id, status) in &ids {
+            let mut entry = job(id, status.clone());
+            entry.end_time = Some(old);
+            SYNC_JOBS.lock().await.insert(id.to_string(), entry);
+        }
+
+        let _ = list_sync_jobs().await;
+
+        let jobs = SYNC_JOBS.lock().await;
+        for (id, _) in &ids {
+            assert!(jobs.get(*id).is_none(), "Job {} wurde nicht aufgeräumt", id);
+        }
+    }
+
+    /// Gestrandete Jobs bekommen beim Start einen Endzustand. Läuft auf einer
+    /// eigenen Tabelle, damit der Durchlauf nicht die Jobs der Nachbartests
+    /// beendet.
+    #[tokio::test]
+    async fn stranded_jobs_are_finished_on_startup() {
+        let table: SyncJobs = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut jobs = table.lock().await;
+            jobs.insert("running".to_string(), job("running", JobStatus::Running));
+            jobs.insert("starting".to_string(), job("starting", JobStatus::Starting));
+
+            let mut done = job("done", JobStatus::Completed);
+            done.end_time = Some(42);
+            jobs.insert("done".to_string(), done);
+        }
+
+        recover_stranded_in(&table).await;
+
+        let jobs = table.lock().await;
+        for id in ["running", "starting"] {
+            let stored = jobs.get(id).expect("job");
+            assert!(stored.status.is_terminal(), "{} nicht beendet", id);
+            assert!(stored.end_time.is_some(), "{} ohne end_time", id);
+        }
+        // Fertige Jobs bleiben unangetastet.
+        assert_eq!(jobs["done"].end_time, Some(42));
+        assert_eq!(jobs["done"].status, JobStatus::Completed);
     }
 
     #[test]

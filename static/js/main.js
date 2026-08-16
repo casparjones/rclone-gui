@@ -32,6 +32,8 @@ import { previewRenderers } from './ui/preview.js';
 import './ui/preview-text.js';
 // Imported for its side effect: registers previewRenderers.image.
 import './ui/preview-image.js';
+// Imported for its side effect: registers previewRenderers.video.
+import './ui/preview-video.js';
 import { loadRemoteFiles, onRemoteSelectChange, selectRemoteFolder } from './ui/remote.js';
 import { closeProgressModal, closeSyncModal, startSync } from './ui/sync.js';
 import { createTask, deleteTask, loadTasks, openCreateTaskModal, startTaskFromList } from './ui/tasks.js';

@@ -320,31 +320,27 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# App starten
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
 # App starten und beenden
 # ---------------------------------------------------------------------------
 #
-# Bewusst KEIN `exec`. Das war der Grund, warum `docker stop` die vollen zehn
-# Sekunden brauchte und mit Exit 137 (SIGKILL) endete:
+# Bewusst KEIN `exec`, und das Signal wird unverändert durchgereicht.
 #
-#   * `exec` machte rclone-gui zu PID 1.
-#   * Für PID 1 wendet der Kernel die Default-Disposition eines Signals NICHT
-#     an. Ein Signal ohne installierten Handler wird schlicht ignoriert.
-#   * rclone-gui installiert nur einen Handler für SIGINT
-#     (`tokio::signal::ctrl_c`, src/main.rs), nicht für SIGTERM. `docker stop`
-#     schickt SIGTERM -> ignoriert -> Gnadenfrist -> SIGKILL -> 137, ohne dass
-#     die SQLite-Verbindung, der rsync-Daemon oder stunnel geordnet endeten.
+# Warum kein `exec`: stunnel wird hier gestartet (rsync_tls_start) und hat
+# selbst keinen Trap. Nur diese Shell weiss von STUNNEL_PID — mit `exec` wäre
+# rclone-gui PID 1 und stunnel liefe nach dessen Ende als Waise weiter, bis der
+# Container-Abbau es hart abräumt. Der Trap unten ist also der einzige Ort, an
+# dem stunnel geordnet endet; er wirkt auch für PID 1, denn die Sonderregel des
+# Kernels (Default-Disposition greift für PID 1 nicht) betrifft nur Signale
+# **ohne** installierten Handler.
 #
-# Diese Shell bleibt deshalb PID 1 und fängt das Signal selbst ab. Ein Trap
-# wirkt auch für PID 1 — die Sonderregel betrifft nur Signale ohne Handler.
-# SIGTERM wird dabei in SIGINT übersetzt, weil das der Weg in den vorhandenen
-# Graceful-Shutdown der App ist (Server austrudeln lassen, dann
-# `daemon.shutdown()`, das dem rsync-Daemon selbst SIGTERM schickt und auf ihn
-# wartet). Ein blosses Durchreichen von SIGTERM würde die App zwar beenden —
-# als Nicht-PID-1 greift dann die Default-Disposition — aber eben hart.
+# Warum unverändert durchgereicht: rclone-gui behandelt seit Ticket c417c1c6
+# SIGINT **und** SIGTERM gleichwertig (`wait_for_shutdown_signal`, src/main.rs)
+# und läuft in beiden Fällen in denselben Graceful-Shutdown — Server austrudeln
+# lassen (SERVER_DRAIN_DEADLINE), dann `daemon.shutdown()` für den rsync-Daemon
+# (DAEMON_SHUTDOWN_DEADLINE). Früher übersetzte dieses Skript SIGTERM nach
+# SIGINT, weil nur `ctrl_c` behandelt wurde. Diese Krücke ist entfallen: sie
+# verschleierte, welches Signal der Prozess tatsächlich bekam, und zwang jeden,
+# der das Shutdown-Verhalten nachweisen wollte, an start.sh vorbeizuzielen.
 
 APP_PID=""
 SHUTTING_DOWN=0
@@ -360,13 +356,17 @@ stop_stunnel() {
 
 # Reihenfolge: erst die App (sie fährt ihren rsync-Daemon selbst herunter),
 # dann stunnel. Umgekehrt liefe ein laufender Transfer ins Leere.
+#
+# $1 ist das empfangene Signal und geht unverändert an die App weiter, damit im
+# Log der App dasselbe Signal steht, das der Container bekommen hat.
 on_term() {
+    local sig="${1:-TERM}"
     [ "$SHUTTING_DOWN" -eq 1 ] && return 0
     SHUTTING_DOWN=1
-    echo "🛑 Signal empfangen — fahre herunter"
+    echo "🛑 SIG${sig} empfangen — fahre herunter"
 
     if [ -n "$APP_PID" ] && kill -0 "$APP_PID" 2>/dev/null; then
-        kill -INT "$APP_PID" 2>/dev/null
+        kill -"$sig" "$APP_PID" 2>/dev/null
         # Gnadenfrist deutlich unter den 10 s von `docker stop`, damit ein
         # hängender Shutdown immer noch vor dem SIGKILL des Daemons endet.
         local i
@@ -375,13 +375,18 @@ on_term() {
             sleep 0.2
         done
         if kill -0 "$APP_PID" 2>/dev/null; then
-            echo "⚠️  rclone-gui reagiert nicht auf SIGINT — SIGTERM folgt." >&2
-            kill -TERM "$APP_PID" 2>/dev/null
+            # Ein zweites SIG${sig} brächte nichts — die App hat es bereits
+            # bekommen und behandelt. Bleibt nur SIGKILL, und der kommt hier
+            # noch vor dem SIGKILL von `docker stop`, damit stunnel unten
+            # überhaupt noch abgeräumt wird.
+            echo "⚠️  rclone-gui reagiert nicht auf SIG${sig} — SIGKILL folgt." >&2
+            kill -KILL "$APP_PID" 2>/dev/null
         fi
     fi
 }
 
-trap on_term TERM INT
+trap 'on_term TERM' TERM
+trap 'on_term INT' INT
 
 # Auf die App warten und ihren Exit-Code weiterreichen. `wait` kehrt bei einem
 # abgefangenen Signal mit >128 zurück, ohne dass das Kind schon beendet wäre —

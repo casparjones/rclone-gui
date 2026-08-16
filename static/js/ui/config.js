@@ -6,6 +6,164 @@ import { showAlert } from '../util/dom.js';
 import { updateConfigHintBadge } from './menu.js';
 import { clearRemoteCache, clearLastSelectedRemote, getLastSelectedRemote, updateRemoteSelect } from './remote.js';
 
+// The password of a stored remote never comes back from the server — not the
+// plaintext and not the obscured value, because `rclone reveal` turns one into
+// the other without a key. The form therefore has nothing to prefill it with,
+// and what it sends says which of three things it means:
+//
+//   field omitted   leave the stored password alone
+//   ""              remove the stored password
+//   anything else   set it
+//
+// The middle case is the one that is easy to forget: without it "left empty"
+// would always mean "keep", and a connection that once had a password could
+// never be saved without one again. It is a deliberate act in the form — a
+// checkbox — and not something an empty input triggers by accident.
+const KEEP_PLACEHOLDER = 'Leave empty to keep the stored password';
+
+// The remote currently being edited, or null while a new one is being created.
+// Only in edit mode does an empty password field mean "keep": for a new remote
+// there is nothing to keep.
+let editingName = null;
+
+function passwordInput() {
+    return document.getElementById('config-password');
+}
+
+// Visibility as an inline style, not a class: Tailwind runs as the browser
+// build and only generates utilities it finds in the static DOM, so a class
+// added from here would have no rules behind it.
+function setHidden(element, hidden) {
+    element.style.display = hidden ? 'none' : '';
+}
+
+// The "remove the stored password" control. It lives next to the password
+// field and is built here because `static/index.html` knows nothing about it.
+// Created once, then only shown and hidden.
+function ensureRemovePasswordControl() {
+    const existing = document.getElementById('config-password-remove-row');
+    if (existing) {
+        return existing;
+    }
+
+    const input = passwordInput();
+    if (!input) {
+        return null;
+    }
+
+    const row = document.createElement('div');
+    row.id = 'config-password-remove-row';
+    setHidden(row, true);
+
+    // daisyUI ships as a complete stylesheet, so its component classes exist
+    // whether or not they appear in the static markup.
+    const label = document.createElement('label');
+    label.className = 'label';
+
+    const checkbox = document.createElement('input');
+    checkbox.type = 'checkbox';
+    checkbox.id = 'config-password-remove';
+    checkbox.className = 'checkbox checkbox-sm';
+
+    const text = document.createElement('span');
+    text.className = 'label-text';
+    text.textContent = 'Remove the stored password';
+
+    // Ticking the box makes the input pointless; untick restores it.
+    checkbox.addEventListener('change', () => {
+        const field = passwordInput();
+        if (!field) {
+            return;
+        }
+        field.disabled = checkbox.checked;
+        if (checkbox.checked) {
+            field.value = '';
+        }
+    });
+
+    label.appendChild(checkbox);
+    label.appendChild(text);
+    row.appendChild(label);
+
+    input.insertAdjacentElement('afterend', row);
+    return row;
+}
+
+function setRemovePasswordVisible(visible) {
+    const row = ensureRemovePasswordControl();
+    if (!row) {
+        return;
+    }
+
+    setHidden(row, !visible);
+
+    const checkbox = document.getElementById('config-password-remove');
+    if (checkbox && !visible) {
+        checkbox.checked = false;
+    }
+
+    const field = passwordInput();
+    if (field) {
+        field.disabled = false;
+    }
+}
+
+// Back to "create a new remote".
+function resetConfigForm() {
+    const form = document.getElementById('config-form');
+    if (form) {
+        form.reset();
+    }
+
+    editingName = null;
+    setRemovePasswordVisible(false);
+
+    const field = passwordInput();
+    if (field) {
+        field.placeholder = 'your-password';
+    }
+
+    const name = document.getElementById('config-name');
+    if (name) {
+        name.readOnly = false;
+    }
+}
+
+// Load a stored remote into the form. Everything but the password comes from
+// the list the server already sent; the password field stays empty on purpose.
+function startEdit(config) {
+    const setValue = (id, value) => {
+        const element = document.getElementById(id);
+        if (element) {
+            element.value = value ?? '';
+        }
+    };
+
+    setValue('config-name', config.name);
+    setValue('config-type', config.config_type);
+    setValue('config-url', config.url);
+    setValue('config-username', config.username);
+    setValue('config-password', '');
+
+    editingName = config.name;
+    setRemovePasswordVisible(true);
+
+    const field = passwordInput();
+    if (field) {
+        field.placeholder = KEEP_PLACEHOLDER;
+    }
+
+    // The name is the key of the record being edited. Changing it here would
+    // silently create a second remote instead of renaming the first.
+    const name = document.getElementById('config-name');
+    if (name) {
+        name.readOnly = true;
+    }
+
+    showAlert('config-alert', `Editing "${config.name}". The password stays as it is unless you enter a new one.`, 'info');
+    document.getElementById('config-form')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
 export async function saveConfig(event) {
     event.preventDefault();
 
@@ -13,16 +171,29 @@ export async function saveConfig(event) {
         name: document.getElementById('config-name').value,
         config_type: document.getElementById('config-type').value,
         url: document.getElementById('config-url').value || null,
-        username: document.getElementById('config-username').value || null,
-        password: document.getElementById('config-password').value || null
+        username: document.getElementById('config-username').value || null
     };
+
+    const entered = passwordInput()?.value ?? '';
+    const removeRequested = document.getElementById('config-password-remove')?.checked === true;
+
+    if (removeRequested) {
+        config.password = '';
+    } else if (entered) {
+        config.password = entered;
+    } else if (!editingName) {
+        // A new remote without a password: nothing to keep, so say so plainly
+        // instead of relying on the "unchanged" case.
+        config.password = '';
+    }
+    // Editing with an empty field: the key is left out entirely — "unchanged".
 
     try {
         const result = await api.createConfig(config);
 
         if (result.ok) {
             showAlert('config-alert', 'Configuration saved successfully!', 'success');
-            document.getElementById('config-form').reset();
+            resetConfigForm();
             loadConfigs();
         } else {
             showAlert('config-alert', 'Error: ' + result.error, 'error');
@@ -57,6 +228,30 @@ export async function loadConfigs() {
     }
 }
 
+// Constant icon markup — the only thing in this list that reaches innerHTML.
+// It is written here in the source and contains no server data.
+const TRASH_ICON = '<svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">'
+    + '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />'
+    + '</svg>';
+
+function el(tag, className, text) {
+    const node = document.createElement(tag);
+    if (className) {
+        node.className = className;
+    }
+    if (text !== undefined) {
+        node.textContent = text;
+    }
+    return node;
+}
+
+// Remote names are not trustworthy. The API rejects markup when a remote is
+// created, but a `rclone.conf` written before that check existed — or edited by
+// hand — can still hold a name like `<img src=x onerror=…>`. Such names stay
+// deliberately listable and deletable so they can be cleaned up, and this is
+// the place that lists them: every name goes in as text, and the delete button
+// carries its handler as a listener instead of an inline `onclick` whose quoting
+// the name could break out of.
 function displayConfigs() {
     const configList = document.getElementById('config-list');
 
@@ -65,24 +260,38 @@ function displayConfigs() {
         return;
     }
 
-    configList.innerHTML = state.configs.map(config => `
-        <div class="card bg-base-200 shadow-sm">
-            <div class="card-body py-3 px-4">
-                <div class="flex items-center justify-between">
-                    <div>
-                        <div class="font-semibold text-lg">${config.name}</div>
-                        <div class="text-sm text-base-content/70">${config.config_type}</div>
-                    </div>
-                    <button class="btn btn-error btn-sm" onclick="deleteConfig('${config.name}')">
-                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4 mr-1" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                        </svg>
-                        Delete
-                    </button>
-                </div>
-            </div>
-        </div>
-    `).join('');
+    configList.replaceChildren(...state.configs.map(config => {
+        const card = el('div', 'card bg-base-200 shadow-sm');
+        const body = el('div', 'card-body py-3 px-4');
+        const row = el('div', 'flex items-center justify-between');
+
+        const info = el('div');
+        info.appendChild(el('div', 'font-semibold text-lg', config.name));
+        info.appendChild(el('div', 'text-sm text-base-content/70', config.config_type));
+
+        // Editing loads this record into the form above. Nothing secret travels
+        // with it: the server does not send the password, so there is none to
+        // put into a DOM node.
+        const edit = el('button', 'btn btn-sm', 'Edit');
+        edit.type = 'button';
+        edit.addEventListener('click', () => startEdit(config));
+
+        const button = el('button', 'btn btn-error btn-sm');
+        button.type = 'button';
+        button.innerHTML = TRASH_ICON;
+        button.appendChild(document.createTextNode('Delete'));
+        button.addEventListener('click', () => deleteConfig(config.name));
+
+        const actions = el('div', 'card-actions');
+        actions.appendChild(edit);
+        actions.appendChild(button);
+
+        row.appendChild(info);
+        row.appendChild(actions);
+        body.appendChild(row);
+        card.appendChild(body);
+        return card;
+    }));
 }
 
 export async function deleteConfig(name) {
@@ -94,6 +303,11 @@ export async function deleteConfig(name) {
         const result = await api.deleteConfig(name);
 
         if (result.ok) {
+            // The form must not keep editing a record that no longer exists.
+            if (editingName === name) {
+                resetConfigForm();
+            }
+
             // Clear cache for deleted remote
             clearRemoteCache(name);
 
@@ -153,9 +367,10 @@ let rsyncdPollTimer = null;
 // The fields of the detail grid, created once and then only written to.
 const rsyncdFields = {};
 
-function setHidden(element, hidden) {
-    element.style.display = hidden ? 'none' : '';
-}
+// `setHidden` is declared once near the top of this module and is shared by the
+// remote form and the rsyncd card. A second copy here was a duplicate `function`
+// declaration, which is a SyntaxError in an ES module and killed the whole
+// import chain from `main.js`.
 
 function rsyncdDetailRow(parent, label) {
     const row = document.createElement('div');
@@ -280,19 +495,16 @@ function ensureRsyncdCard() {
 }
 
 // Keeps the panel current without a reload. Deliberately cheap: the request
-// only goes out while the card is actually on screen — the configuration
+// only goes out while the card actually has layout boxes — the configuration
 // section is hidden most of the time, and a poller running behind a closed
-// panel would produce nothing but log noise.
+// panel would produce nothing but log noise. A tab in the background is left
+// to the browser, which throttles the timer on its own.
 function startRsyncdPolling() {
     if (rsyncdPollTimer !== null) {
         return;
     }
 
     rsyncdPollTimer = window.setInterval(() => {
-        if (document.hidden) {
-            return;
-        }
-
         const card = document.getElementById('rsyncd-card');
         // No layout boxes means an ancestor is display:none — the panel is
         // closed or another section is showing.
@@ -302,6 +514,19 @@ function startRsyncdPolling() {
 
         refreshRsyncdStatus();
     }, RSYNCD_POLL_MS);
+
+    // Coming back to the tab should not mean waiting out a tick that the
+    // browser throttled while the page was in the background.
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+            return;
+        }
+
+        const card = document.getElementById('rsyncd-card');
+        if (card && card.getClientRects().length > 0) {
+            refreshRsyncdStatus();
+        }
+    });
 }
 
 async function refreshRsyncdStatus() {

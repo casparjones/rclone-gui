@@ -174,6 +174,7 @@ pub async fn delete_task(
 
 pub async fn start_task(
     Extension(pool): Extension<Pool<Sqlite>>,
+    Extension(current): Extension<crate::handlers::auth_web::CurrentUser>,
     Json(start_request): Json<StartTaskRequest>,
 ) -> ResponseJson<ApiResponse<String>> {
     info!("🚀 Starting task: {}", start_request.task_name);
@@ -203,9 +204,11 @@ pub async fn start_task(
         use_chunking: Some(task.use_chunking),
     };
 
-    // Start the sync job using existing sync handler
+    // Start the sync job using existing sync handler. Der Quellpfad des Tasks
+    // wird dort gegen das Home des angemeldeten Nutzers geprüft — ein
+    // gespeicherter Task ist kein Freifahrtschein an der Pfadprüfung vorbei.
     info!("🔄 Converting task '{}' to sync job", task.name);
-    sync::start_sync(Json(sync_request)).await
+    sync::start_sync_for(&current, sync_request).await
 }
 #[cfg(test)]
 mod tests {

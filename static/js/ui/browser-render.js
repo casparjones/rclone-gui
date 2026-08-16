@@ -4,6 +4,7 @@
 import { state } from '../state.js';
 import { escapeHtml } from '../util/dom.js';
 import { fileIcon, formatBytes, formatTimestamp } from '../util/format.js';
+import { isSelected, updateSelectionUi } from './selection.js';
 
 // How many entries are added to the DOM per step. A folder with 5000 files
 // stays responsive because only the visible part exists as elements.
@@ -24,16 +25,20 @@ export function renderFiles() {
     const entries = sortEntries(state.currentListing.entries || []);
     state.renderCursor = { entries: entries, index: 0 };
 
-    // The column header only makes sense in list mode
+    // The column titles only make sense in list mode. The header is not hidden
+    // outright in the tile modes though: it carries the "select all" checkbox,
+    // and dropping it would leave those modes without a way to select a whole
+    // folder. `fb-compact` keeps that one cell and hides the rest.
     const head = document.getElementById('file-head');
     if (head) {
-        head.classList.toggle('fb-hidden', state.fileView !== 'list');
+        head.classList.toggle('fb-compact', state.fileView !== 'list');
     }
 
     // ".." row, the usual way up in a file manager. It is rendered right away
     // and is not part of the chunked entries.
     const parentRow = state.currentListing.parent ? `
         <div class="fb-row fb-clickable" data-path="${escapeHtml(state.currentListing.parent)}" data-nav="1">
+            <div class="fb-check"></div>
             <div class="fb-thumb-box"><div class="fb-icon">⬆️</div></div>
             <div class="fb-name">..</div>
             <div class="fb-meta fb-size"></div>
@@ -49,6 +54,10 @@ export function renderFiles() {
         + empty
         + '<div id="fb-sentinel" class="fb-sentinel"></div>';
     fileList.scrollTop = 0;
+
+    // The header checkbox and the bar refer to the folder that is on screen
+    // now, so they are refreshed for the new listing before anything is filled.
+    updateSelectionUi();
 
     if (entries.length === 0) {
         return;
@@ -188,12 +197,24 @@ function entryMarkup(entry) {
     const modified = formatTimestamp(entry.modified);
     const nav = entry.is_dir ? '1' : '0';
 
+    // The checked state is part of the markup and not applied afterwards: rows
+    // arrive chunk by chunk, and a folder that is scrolled into view later must
+    // show the selection it already has without a second pass over the list.
+    const selected = isSelected(entry.path);
+    const rawSize = entry.size == null ? '' : String(Number(entry.size));
+
     // Files are clickable too now: a click opens the preview instead of a
     // download. `tabindex="-1"` keeps the rows out of the tab order (a folder
     // with 5000 entries would otherwise be untabbable) but makes them
     // focusable from script — the preview gives the focus back to its row.
+    //
+    // The checkbox itself stays in the tab order and reacts to space, so the
+    // selection is usable without a mouse.
     return `
-        <div class="fb-row fb-clickable" tabindex="-1" data-path="${path}" data-nav="${nav}" data-dir="${entry.is_dir ? '1' : '0'}" title="${name}">
+        <div class="fb-row fb-clickable${selected ? ' is-selected' : ''}" tabindex="-1" data-path="${path}" data-nav="${nav}" data-dir="${entry.is_dir ? '1' : '0'}" data-name="${name}" data-size="${rawSize}" data-selectable="1" title="${name}">
+            <div class="fb-check">
+                <input type="checkbox" class="checkbox checkbox-sm fb-check-input" aria-label="Select ${name}"${selected ? ' checked' : ''}>
+            </div>
             ${thumbCell(entry, path)}
             <div class="fb-name">${name}</div>
             <div class="fb-meta fb-size">${size}</div>

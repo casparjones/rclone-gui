@@ -1,137 +1,172 @@
 # continue.md — Wiederaufnahme
 
-Stand: 15.08.2026, nach Abbruch aller Agenten am Sitzungslimit.
+Stand: 16.08.2026, Lauf am Token-Limit beendet. Alle Agenten **geordnet gestoppt**,
+nicht abgestürzt.
 Arbeitsanweisung: `AGENTS.md`. Board: https://plankton.tiny-dev.de/p/rclone-gui
 
 ---
 
 ## 1. Zustand des Arbeitsbaums
 
-**Grün.** Die abgestürzten Agenten haben nichts Kaputtes hinterlassen.
+**Grün, und zwar geprüft, nicht angenommen:**
 
 ```
-cargo check      sauber
-cargo test       141 passed, 0 failed, 3 ignored
-node --check     alle 17 JS-Module sauber
-clippy           21 Findings, alle vorbestehend
-                 (main.rs 14, sync.rs 5, config_manager.rs 2)
+cargo check      0 Fehler
+cargo test       343 bestanden, 0 Fehlschläge, 8 ignoriert
+JS-Module        alle 21 als ESM syntaktisch sauber
+Marker           <!-- RCLONE_GUI_SCRIPTS --> vorhanden
+clippy           18 Findings, alle vorbestehend
+                 (main.rs 13, sync.rs 5) — Ticket e81f29bb
 ```
 
-**Nichts ist committet.** Rund 4200 geänderte Zeilen, 6 neue Rust-Module, das gesamte
-`static/js/`-Verzeichnis und `docs/` existieren nur im Arbeitsbaum. Sicherungskopie:
-`<scratchpad>/worktree-backup.tar.gz` (Stand vor dieser Runde).
+**Nichts ist committet.** Die gesamte Arbeit liegt im Arbeitsbaum. Neue, noch untrackte
+Dateien: `src/handlers/shares.rs`, `src/handlers/urlguard.rs`,
+`static/js/ui/selection.js`, `static/js/ui/preview-video.js`,
+`config/logrotate-rclone-gui.conf`.
 
-Verwaiste Testcontainer wurden entfernt.
-
----
-
-## 2. Was die abgestürzten Agenten hinterlassen haben
-
-Vier Agenten starben gleichzeitig am Sitzungslimit. Ihre Abbruchmeldungen sind
-irreführend — der tatsächliche Stand wurde nachgeprüft:
-
-| Agent | Ticket | Tatsächlicher Stand |
-|---|---|---|
-| Dev X | `3ed12cdd` Daemon-Lifecycle | **Praktisch nichts.** Nur ein Kommentar in `rsyncd.rs:48`. `REFUSED_OPTIONS` (Zeile 69) ist **unverändert** — der `--delete`-Fix ist **nicht** umgesetzt. Kein Lifecycle-Code. |
-| Dev Z | `1ab74e9c` Argon2 | **Vollständig fertig** — Kostengrenze (`auth.rs:421`), `LoginOutcome`-Debug (`auth.rs:895`), Cookie-Parsing, Passwortrichtlinie. Ticket ist inzwischen in `Testing`. *(Diese Zeile lautete zuerst „Offen: LoginOutcome-Debug" — das war ein Fehler meiner Bestandsaufnahme: gesucht wurde nach `impl fmt::Debug`, im Code steht `impl std::fmt::Debug`.)* |
-| Dev AA | `d6f2d111` Sync-Modus | **Weitgehend fertig.** `static/js/ui/syncmode.js` (280 Zeilen), in `main.js:36/56` importiert und aufgerufen, Umschalter im HTML. Verifikation offen. |
-| Tester 9 | `dc91da86`, `77e24d88` | Nichts. War beim Serverstart. Komplett neu aufsetzen. |
+`.gitignore` wurde um `/data/rsyncd/` ergänzt — dort liegt `secrets/rsyncd.secrets` im
+Klartext, das wäre sonst mitcommittet worden.
 
 ---
 
-## 3. Dringend offen — vor dem Middleware-Ticket zu erledigen
-
-### `--delete` wird nicht verweigert (Datenverlust)
-`rsyncd.rs:69` — `REFUSED_OPTIONS = "copy-links copy-dirlinks copy-unsafe-links"`.
-Ein Tester hat am echten Daemon nachgestellt: Push mit `--delete` löscht Dateien und
-Symlinks im Share, exit 0. **Ein Peer mit reinen Schreibrechten kann fremde Inhalte
-vernichten.**
-
-Fehlt: `delete*` und `remove-source-files` (löscht auf der *Quellseite*).
-Wildcard-Abdeckung am echten Daemon nachweisen, nicht annehmen. Scope `rsync:delete`
-existiert im Modell noch nicht → vorerst **immer** verweigern, mit Code-Kommentar für
-das spätere Scope-Ticket.
-
-### `LoginOutcome` leakt das Session-Token
-`auth.rs:884` — abgeleitetes `Debug`. Das `SessionToken`-Feld ist redigiert, aber
-`set_cookie: String` enthält dasselbe Token im Klartext und `user` den vollen
-Argon2-Hash. Gemessen: `format!("{outcome:?}")` druckt den Cookie vollständig.
-
-Ein `tracing::debug!(?outcome)` im kommenden Login-Handler (`3cc9c90b`) schriebe ein
-**gültiges Token** ins Log.
-
-### Kleiner: Cookie-Parsing
-`auth.rs:663-676` bricht mit `?` ab, sobald ein Cookie-Paar kein `=` enthält.
-`Cookie: flag; rclone_gui_session=<token>` liefert dadurch `None`. Fail-closed, aber
-Flag-Cookies sind zulässig.
-
----
-
-## 4. Board
+## 2. Board
 
 | Spalte | Anzahl |
 |---|---|
-| Todo | 83 |
-| In Progress | 3 (die abgestürzten Tickets) |
-| Testing | 22 |
-| Done | **0** |
+| Done | **61** |
+| Testing | 5 (ungeprüft, siehe unten) |
+| In Progress | 0 |
+| Todo | 75 |
 
-**Geprüft und bestanden** (warten auf Epic-Abschluss): Menü, Ordner-Navigation,
-View-Modi, Download+ZIP, Docker-rsync, alpine-Bump, Engine-Trait, `app.js`-Split,
-Thumbnail-Cache, tasks.db aus VCS, Session-Verwaltung, Daemon-Konfiguration,
-Daemon-Module.
+### In `Testing`, noch von niemandem geprüft
+| Ticket | Was |
+|---|---|
+| `07267d40` | SSRF-Schutz, **Nachbesserung** nach Rückweisung |
+| `e3e971ee` | `wait_until_listening` per TCP-Connect statt Logzeile |
+| `f581f435` | Gesperrte PID-Datei — nur die `rsyncd.rs`-Hälfte |
+| `88b8c455` | stunnel schreibt jetzt ein Log |
+| `e2d122fb` | 401-Behandlung in `api.js` |
 
-**Ungetestet in `Testing`**: Vorschau-Grundgerüst, Textvorschau, Bildvorschau,
-Auth-Digest-Doku, Stored-XSS-Fix, Pfad-Validierung, 403-statt-404.
+### Zurück in `Todo`, weil der Agent mittendrin gestoppt wurde
+**Teilarbeit kann im Arbeitsbaum liegen — erst `git status --short` und `git diff`
+ansehen, nicht neu anfangen.**
 
----
-
-## 5. Zwei offene Entscheidungen des Nutzers
-
-Beide blockieren den in `AGENTS.md` festgelegten Ablauf und wurden mehrfach gestellt:
-
-**a) Zwischencommit?** Der Auftrag lautet „pro Epic einchecken". Es ist aber noch kein
-Epic abschliessbar, und es liegen über 4200 ungesicherte Zeilen im Baum, an denen bis
-zu vier Agenten gleichzeitig arbeiten.
-
-**b) Downloader verschieben?** Epic 1 kann **nicht** abgeschlossen werden, weil das
-Ticket „Downloader: Von URL holen" (`27e3e014`) auf die Datentrennung aus Epic 4
-wartet. Verschiebt man es nach Epic 4, wäre Epic 1 abschliessbar, sobald Videovorschau
-und die zwei kleinen Fehlerbehebungen durch sind.
-
-Ohne eine der beiden Entscheidungen erreicht kein Epic den Zustand, in dem laut Auftrag
-committet würde.
+| Ticket | Stand beim Abbruch |
+|---|---|
+| `40103f77` | Passwort-Reset per Token. **Praktisch nichts** — Agent war beim Lesen. |
+| `0cedda6f` | Audit-Log-Grössengrenze. Weit fortgeschritten; `config/logrotate-rclone-gui.conf` existiert bereits. |
+| `8cc0df6b` | `start.sh`-Krücke entfernen. Unklar wie weit. |
+| `c9a674ee` | Atomarer Config-Schreibweg. War bei `remove_key_from_contents` / `write_config_atomically` in `config_manager.rs`. |
 
 ---
 
-## 6. Wiederaufnahme
+## 3. Epic-Stand
 
-Reihenfolge nach Dringlichkeit:
+**Epic 1 (UI-Rework) ist bis auf ein Ticket fertig.** 12 von 13 in `Done`; offen nur
+`27e3e014` (Downloader „Von URL holen"), dessen Vorbedingung — die Datentrennung —
+inzwischen erfüllt ist. **Das ist der kürzeste Weg zu einem abschliessbaren Epic und
+damit zum ersten Commit.**
 
-1. **`3ed12cdd` Daemon-Lifecycle** — neu aufsetzen, `--delete`-Fix **zuerst**
-   (`rsyncd.rs` + `main.rs`)
-2. **`1ab74e9c` abschliessen** — nur noch `LoginOutcome`-Debug und Cookie-Parsing
-   (`auth.rs`)
-3. **`d6f2d111` verifizieren und abschliessen** (`static/js/**`, `index.html`)
-4. **Tester** für Text- und Bildvorschau (`dc91da86`, `77e24d88`)
-
-Dateibesitz-Regeln und Konfliktpunkte: `AGENTS.md` Abschnitt 4.
-`src/main.rs`, `static/js/app-weite Dateien` und `Cargo.toml` vertragen jeweils nur
-**einen** Agenten gleichzeitig.
+Der SSRF-Baustein (`07267d40`) ist die Grundlage dafür und liegt bereits in `Testing`.
 
 ---
 
-## 7. Erfahrungen, die Zeit sparen
+## 4. Was der Nutzer zuletzt wollte
 
-- In einem **nicht sichtbaren** Browser-Tab feuern `requestAnimationFrame` und
-  `IntersectionObserver` **nicht**. Lazy-Loading und Chunk-Rendering sind dort
-  stillschweigend ungeprüft. Hat drei Agenten beschäftigt.
-- Das Screenshot-Werkzeug der Chrome-Erweiterung löst am `<dialog>` ein **spontanes
-  `close`-Event** aus — das Overlay wirkt leer, obwohl das DOM gefüllt ist.
-- `alert()` als XSS-Nutzlast blockiert den eigenen Testlauf. `window.__FLAG__=1` nutzen.
-- Neue Crates immer gegen den Docker-Builder (`rust:1.88`) prüfen. Höchste MSRV im Baum
-  ist bereits 1.88 (`image`, `zip`) — **kein Puffer**.
-- Testverzeichnisse im Scratchpad mit **Ticket-ID** im Namen, sonst überschreiben sich
-  Agenten gegenseitig.
-- `data/tasks.db` ist inzwischen gitignored und **nicht** per `git checkout`
-  wiederherstellbar.
+1. **`40103f77` Passwort-Reset per Terminal-Token** — ausdrücklicher Wunsch, noch nicht
+   gebaut. Begründung im Wortlaut: *„damit ich rein komme wenn ich es mal vergessen
+   sollte."* `ADMIN_PASSWORD_DEFAULT` wurde auf seinen Wunsch **verworfen**,
+   `RCLONE_GUI_ADMIN_PASSWORD` genügt.
+2. **Er testet die Anwendung selbst auf dem Host.** Zwei seiner Fehlermeldungen führten
+   zu Tickets: `bb6e1f0b` (erledigt) und `50c8ec48` (rootloser rsync-Daemon, offen).
+
+### Beim Testen auf dem Host: der Admin-Zugang
+In `data/tasks.db` liegt ein Konto `admin` mit Home-Pfad `/`, **dessen Passwort niemand
+kennt**. Um hineinzukommen:
+
+```bash
+cp data/tasks.db data/tasks.db.bak
+sqlite3 data/tasks.db "delete from sessions; delete from users;"
+RCLONE_GUI_ADMIN_PASSWORD='<passwort>' cargo run -- --bind 127.0.0.1:8080
+```
+
+Der Home-Pfad `/` ist ein zweiter Grund für das Neuanlegen: seit der Datentrennung ist
+der Home-Pfad die Wurzel des erlaubten Bereichs.
+
+### rsync-Daemon auf dem Host
+`RCLONE_GUI_RSYNCD_DIR=$PWD/data/rsyncd` behebt `os error 13`. Danach folgt aber der
+nächste Anschlag (Port 873 ist privilegiert), dann chroot, dann uid/gid — deshalb
+Ticket `50c8ec48`.
+
+---
+
+## 5. Korrekturen an früheren Annahmen
+
+Diese Datei hat schon einmal Falsches behauptet. Was inzwischen widerlegt ist:
+
+- **`rclone` liegt auf dem Host** (`/usr/bin/rclone`, v1.75.0), nicht nur im Container.
+  `AGENTS.md` behauptete lange das Gegenteil, und der Orchestrator hat dem Nutzer auf
+  dieser Grundlage eine falsche Fehlerdiagnose gegeben. Im Image ist es **1.70.1** —
+  Versionsabhängiges gegen beide prüfen. `rsync` ist weiterhin nur im Container.
+- **Eine *verwaiste* `flock` gibt es nicht.** Der Kernel gibt die Sperre mit dem Prozess
+  frei, egal wie er stirbt. Wer die PID-Datei hält, **lebt**. Die ursprüngliche Annahme
+  von `f581f435` war falsch; die Lösung fragt jetzt `/proc/locks`.
+- **`node --check datei.js` ist für `static/js/**` wertlos** — siehe nächster Abschnitt.
+
+---
+
+## 6. Der teuerste Fehler dieses Laufs
+
+`static/js/ui/config.js` deklarierte `setHidden` zweimal. Als ES-Modul ist das ein
+`SyntaxError`, der die Importkette von `main.js` nie anlaufen lässt: **die gesamte
+Oberfläche war tot**, ohne sichtbare Fehlermeldung.
+
+**Drei Agenten haben brav `node --check` ausgeführt und grün gemeldet** — Node parst
+`.js` als CommonJS-Script, und dort sind doppelte Funktionsdeklarationen erlaubt. Der in
+`AGENTS.md` vorgeschriebene Prüfschritt konnte diese Fehlerklasse nicht finden.
+
+Gefunden hat es erst ein Tester, der die Seite **tatsächlich öffnete**. Der Prüfschritt
+in `AGENTS.md` ist korrigiert (`.mjs`), aber die Lehre ist die grössere:
+**ein Werkzeuglauf ersetzt nicht, das Ding einmal anzufassen.**
+
+---
+
+## 7. Was sich in diesem Lauf bewährt hat
+
+Diese Muster haben echte Fehler gefunden, die reines Lesen übersehen hätte — sie gehören
+in jeden künftigen Prompt:
+
+- **Gegenprobe bei jedem Null-Ergebnis.** „Kein XSS gefunden" ist wertlos, solange nicht
+  gezeigt ist, dass derselbe Aufbau ein echtes XSS **melden würde**. Ein Tester hat so
+  bewiesen, dass sein argv-Log-Beweis trägt (365/365 Treffer im Kontrollfall,
+  0/2589 im Echtfall).
+- **Mutationstest bei Nebenläufigkeit.** Zweimal wurde die Implementierung durch eine
+  naive ersetzt, um zu zeigen, dass der Test **durchfällt**. Beim zweiten Mal deckte das
+  auf, dass ein atomares `UPDATE` mit nachfolgendem `SELECT` immer noch falsch zählt.
+- **Tests wieder verwerfen, die nicht fehlschlagen können.** Ein Entwickler hat einen
+  eigenen neuen Test gestrichen, weil er in der Gegenprobe grün blieb: „hätte nur
+  Vertrauen erzeugt."
+- **Eigene Kopie des Baums**, wenn parallel gearbeitet wird — plus `sha256sum` der
+  geprüften Dateien im Ticketkommentar. Sonst gilt ein Urteil für eine Fassung, die es
+  nicht mehr gibt.
+- **Eigene Chrome-Instanz** statt des geteilten Browsers. Im geteilten Chrome bleiben
+  Tabs auf `hidden`, und dort verzögert Chrome das Media-Preload so weit, dass gar keine
+  Anfrage kommt — ein Tester hätte fast „funktioniert nicht" gemeldet.
+- **Melden statt bauen**, wenn eine fremde Datei im Weg ist. Ein Agent hat ein bereits
+  hinzugefügtes Feld **zurückgenommen**, statt `main.rs` anzupassen. Genau richtig.
+
+### Ein wiederkehrendes Muster, fünfmal gefunden
+`derive(Debug)` mit einem Geheimnis im Struct: `LoginOutcome`, `ModuleConfig`,
+`RcloneConfig`, `ConfigRequest`, `NewShare`. Ein Tester hat `src/**` abschliessend
+durchsucht — **die Serie ist bei fünf geschlossen**. Bei jedem neuen Struct mit
+Geheimnis: handgeschriebenes `Debug` **und ein Test**, sonst entsteht es wieder.
+
+---
+
+## 8. Fallstricke im Werkzeug
+
+- **Plankton akzeptiert nur volle UUIDs.** `move_task` mit einer Kurz-ID läuft **ohne
+  Fehler ins Leere** (`null`), das Ticket bleibt liegen. Ein Agent hat so einen
+  Statuswechsel verloren, ohne es zu merken.
+- `add_log` ist deprecated und wird auf `add_comment` umgeleitet. Argumente:
+  `project_id`, `task_id`, **`text`**.

@@ -5,6 +5,8 @@ pub mod download;
 pub mod files;
 pub mod preview;
 pub mod rsyncd;
+pub mod shares;
 pub mod sync;
 pub mod tasks;
 pub mod thumbs;
+pub mod urlguard;

@@ -129,7 +129,11 @@ export async function monitorProgress() {
             const progress = result.data;
             updateProgressDisplay(progress);
 
-            if (progress.status === 'Running' || progress.status === 'Starting') {
+            // `terminal` ist die maschinenlesbare Aussage des Servers, ob der
+            // Job fertig ist. Früher stand hier ein Textvergleich auf
+            // "Running"/"Starting" — eine Fehlermeldung wie "Failed to spawn
+            // rclone process: …" traf keinen der Zweige.
+            if (progress.terminal !== true) {
                 setTimeout(monitorProgress, 1000);
             }
         }
@@ -147,10 +151,13 @@ function updateProgressDisplay(progress) {
         <p>Total: ${formatBytes(progress.total)}</p>
     `;
 
-    // Update icon based on status
-    if (progress.status === 'Completed') {
+    // Das Icon hängt am maschinenlesbaren `state`
+    // (starting|running|completed|failed|cancelled), nicht am Anzeigetext.
+    if (progress.state === 'completed') {
         setProgressModalIcon('completed');
-    } else if (progress.status === 'Failed' || progress.status.includes('Error')) {
+    } else if (progress.terminal === true) {
+        // Alles andere Beendete ist ein Fehlschlag oder Abbruch — unabhängig
+        // davon, wie die Meldung formuliert ist.
         setProgressModalIcon('error');
     } else {
         setProgressModalIcon('loading');

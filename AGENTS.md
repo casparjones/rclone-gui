@@ -61,6 +61,27 @@ static/
   ESC-Behandlung und Fokus-Traps müssen aussteigen, solange ein `<dialog open>`
   vorhanden ist, sonst kollidieren sie mit dem Browserverhalten.
 
+- **`node --check datei.js` ist als Prüfung NICHT ausreichend.** Node behandelt `.js`
+  als *Script*; die Dateien unter `static/js/` werden im Browser aber als **ES-Modul**
+  geladen, und die Regeln unterscheiden sich. Eine doppelte Funktionsdeklaration ist im
+  Script erlaubt und im Modul ein `SyntaxError`.
+
+  Real passiert: zwei `function setHidden` in `config.js`. `node --check` war grün, der
+  Entwickler hat abgeliefert, und im Browser riss der `SyntaxError` den **gesamten
+  Modulgraph** von `main.js` mit — die komplette Oberfläche war tot, ohne sichtbare
+  Fehlermeldung. Gefunden hat es erst ein Tester, der die Seite tatsächlich öffnete.
+
+  Deshalb **immer als Modul prüfen**:
+  ```bash
+  for f in $(find static/js -name '*.js'); do
+      cp "$f" "$SCRATCH/_m.mjs"
+      out=$(node --check "$SCRATCH/_m.mjs" 2>&1)
+      [ -n "$out" ] && echo "FEHLER in $f: $out"
+  done
+  ```
+  Die Endung `.mjs` ist der ganze Unterschied. Und selbst das ersetzt nicht, die Seite
+  einmal wirklich zu öffnen und die Browser-Konsole anzusehen.
+
 ### Wie der Sync heute funktioniert
 
 `src/handlers/sync.rs` startet `rclone copy` als Subprozess mit
@@ -80,8 +101,21 @@ cargo test                   # Tests
 docker compose up --build    # Vollständiger Lauf inkl. rclone-Binary
 ```
 
-`rclone` ist **nur im Container** vorhanden, nicht auf dem Host. Alles, was ein echtes
-rclone-Binary braucht, wird über Docker getestet.
+**`rclone` liegt inzwischen auch auf dem Host** — `/usr/bin/rclone`, v1.75.0. Diese Datei
+behauptete lange das Gegenteil, und der Orchestrator hat einem Nutzer auf dieser Grundlage
+eine falsche Fehlerdiagnose gegeben. Wer eine Aussage über die Umgebung braucht, prüft sie
+(`command -v rclone`), statt sie hier abzulesen.
+
+Zwei Einschränkungen bleiben:
+
+- **Die Version auf dem Host ist nicht die des Images** (Container: 1.70.1). Was
+  versionsabhängig ist — Ausgabeformate, verfügbare Unterbefehle, Verhalten von
+  `obscure`/`reveal` — gehört gegen **beide** geprüft.
+- `rsync` gibt es weiterhin **nur im Container**. Alles, was ein echtes rsync-Binary
+  braucht, läuft über Docker.
+
+Für Nachweise über `argv` ist ein **Stub** ohnehin besser als das echte Binary: er
+kontrolliert das Zeitfenster, in dem man `/proc/<pid>/cmdline` lesen kann.
 
 ---
 
@@ -196,6 +230,18 @@ Sobald **alle** Subtickets eines Epics in `Done` sind:
    fachliche Zweck des Epics erfüllt?
 2. **Fehlerfrei** → Epic nach `Done`, Commit
    (`feat(epic-<n>): <Titel>` mit Auflistung der Tickets).
+
+   **Zum Zeitpunkt:** Bei mehreren parallelen Developern gehört der Arbeitsbaum
+   zeitweise niemandem — ein Commit sammelt dann Arbeit aus fremden, noch offenen
+   Tickets mit ein. Das ist passiert und wurde von zwei Agenten gemeldet.
+
+   Regeln daraus:
+   - **Nie in einen roten Baum committen.** Vor jedem Commit `cargo check` und
+     `cargo test`; ist etwas rot, warten statt committen.
+   - Der saubere Zeitpunkt ist eine Lücke, in der **kein** Developer läuft. Lässt sich
+     das nicht abwarten, im Commit-Text benennen, dass er über das Epic hinaus Arbeit
+     enthält — ein falsch zugeschnittener Commit ist besser als tagelang ungesicherte
+     Arbeit, aber er soll nicht so tun, als wäre er sauber.
 3. **Fehler** → neue Tickets in `Todo`, Epic bleibt offen.
 
 Der Lauf ist fertig, wenn `Todo`, `In Progress` und `Testing` leer sind.
@@ -344,6 +390,50 @@ Kollisionen — immer Ticket-ID anhängen (`cdp-d6f2d111.mjs`).
 
 Ebenso: laufende Testserver auf einem eigenen, unwahrscheinlichen Port binden
 (`--bind 127.0.0.1:<port>`), Port 8080 ist oft belegt.
+
+### Niemals `pkill -f` zum Aufräumen
+`pkill -f rclone-gui` trifft die Testserver **aller** parallel laufenden Agenten. Ein
+Tester hat es getan und dabei fremde Prozesse erwischt — nur eine
+Berechtigungsverweigerung hat Schlimmeres verhindert.
+
+Eigene Prozesse gezielt über die gemerkte PID beenden, oder über den eigenen Port
+(`ss -ltnp 'sport = :<port>'`). Dasselbe gilt für `docker rm -f` mit Mustern:
+nur eigene Container mit dem eigenen Namenspräfix.
+
+### Session-Cookies kollidieren zwischen parallelen Agenten
+**Cookies sind nicht nach Port getrennt.** Jeder Login auf `127.0.0.1:<irgendein Port>`
+überschreibt das `rclone_gui_session` **aller anderen** Agenten auf demselben Host.
+
+Real passiert: Der Browserlauf eines Testers endete in einer Login-Weiterleitung, und
+gleichzeitig flog ein fremder Agent aus seiner Sitzung — beide suchten den Fehler in
+ihrer eigenen Arbeit.
+
+Deshalb **immer einen eigenen Cookie-Namen setzen**:
+```
+RCLONE_GUI_SESSION_COOKIE_NAME=rclone_gui_session_<agent-kürzel>
+```
+Das ist die eigentliche Trennung. Zusätzlich hilft `localhost:<port>` statt
+`127.0.0.1:<port>`, aber das trennt nur zwei Gruppen, nicht N Agenten.
+
+**Noch robuster, und der empfohlene Weg:** eine **eigene Loopback-Adresse** je Agent —
+`--bind 127.0.1.<n>:<port>`. Der gesamte 127.0.0.0/8-Bereich zeigt auf das lokale
+System, und Cookies sind nach **Host** getrennt. Damit können sich zwei Agenten selbst
+dann nicht in die Quere kommen, wenn beide den Standard-Cookienamen benutzen. Ein Tester
+hatte sich zweimal mitten im Lauf die Sitzung überschreiben lassen und den Fehler in der
+Anwendung gesucht — mit eigener Adresse war es weg. Beides zusammen (eigene Adresse
+**und** eigener Cookiename) kostet nichts und macht den Lauf reproduzierbar.
+
+Ebenso: **Screenshots sind bei parallelen Agenten unbrauchbar** — mehrere teilen sich
+Chrome, und das Bild zeigt womöglich ein fremdes Fenster. Aussagen über die Oberfläche
+gehören aus DOM-Messungen im **eigenen** Tab, nicht aus Bildern.
+
+### Browser-Tests brauchen `RCLONE_GUI_SESSION_COOKIE_SECURE=false`
+Das Session-Cookie trägt `Secure`. Chrome nimmt es über `http://127.0.0.1` **nicht an** —
+die Anmeldung scheint zu gelingen, aber jeder Folgeaufruf ist 401, und die Ursache sieht
+nach einem Fehler der Anwendung aus.
+
+Für Browser-Tests deshalb `RCLONE_GUI_SESSION_COOKIE_SECURE=false` setzen. Der Standard
+bleibt `true` und wird beim Abschalten gewarnt — das ist Absicht.
 
 ### `dispatchEvent` schliesst kein natives `<dialog>`
 Ein per `dispatchEvent(new KeyboardEvent('keydown', {key:'Escape'}))` erzeugtes Ereignis

@@ -18,8 +18,18 @@
 // no innerHTML in this file at all, and no path is ever interpolated into
 // markup. A folder called `<img src=x onerror=…>` is a label, nothing else.
 
+//
+// Creating a folder is the one thing the pane may *write*. It lives in the
+// toolbar, never in a row: a row stays what it was — a label plus, for folders,
+// a navigation target. Nothing was added to entryRow() for this feature.
+//
+// Failures are classified instead of being printed. "Connection failed" is the
+// same sentence for a remote whose token expired, a folder that was deleted
+// underneath the user, a read-only share and a remote that simply never
+// answers — four problems with four different remedies. See classifyFailure().
+
 import { registerRemotePane, getSyncBackend, onSyncBackendChange } from './syncmode.js';
-import { fetchRemoteFiles } from '../api.js';
+import { fetchRemoteFiles, createRemoteFolder } from '../api.js';
 
 // ---------------------------------------------------------------------------
 // Data source
@@ -36,10 +46,14 @@ import { fetchRemoteFiles } from '../api.js';
 //       requiresTarget: true,
 //
 //       // Required. Lists one folder.
-//       //   request: { target: string, backend: string, path: string }
+//       //   request: { target, backend, path, signal }
 //       //     target  – the chosen remote/peer ('' when none is selected)
 //       //     backend – 'rclone' | 'rsync'
 //       //     path    – folder to list, '/' for the root
+//       //     signal  – AbortSignal, aborted when the pane stops waiting.
+//       //               Honouring it is optional: the pane gives up either
+//       //               way, the signal only lets the source release the
+//       //               request instead of leaving it open.
 //       //
 //       //   resolves to RemoteListing:
 //       //     {
@@ -52,7 +66,21 @@ import { fetchRemoteFiles } from '../api.js';
 //       //   Failures: either reject with an Error, or resolve with the
 //       //   ApiResponse-shaped `{ ok: false, error: '…' }` that api.js
 //       //   produces. Both are rendered as an error state.
-//       async list(request) { … }
+//       async list(request) { … },
+//
+//       // Optional. Creates one folder. Absent (or not a function) means the
+//       // source cannot create folders — the pane then shows the button
+//       // disabled together with `mkdirUnavailable` as the reason, instead of
+//       // offering an action that cannot work.
+//       //   request: { target, backend, path, name, signal }
+//       //     path – folder the new one goes into
+//       //     name – a single segment, already validated by the pane
+//       //   resolves to anything on success (the pane reloads the folder),
+//       //   fails like list(): reject, or resolve `{ ok: false, error, status }`.
+//       async mkdir(request) { … },
+//
+//       // Optional. Shown next to the disabled button when mkdir is missing.
+//       mkdirUnavailable: 'why not'
 //   })
 //
 // Entries with `is_dir === false` are shown but never become navigable, so a
@@ -91,8 +119,43 @@ export function getRemoteTargetPath() {
 // is not in that list never reaches the server. That is the client-side half
 // of "the remote comes from the configuration"; the server-side half is not in
 // this ticket's files.
+//
+// --- Creating folders -------------------------------------------------------
+//
+// `POST /api/files/remote/mkdir` does **not exist**. There is no route today
+// that creates anything on a remote, and `src/**` belongs to another ticket, so
+// it could not be added here. `POST /api/peer/mkdir` from the peer-API ticket
+// (`9e83c167`) is a different endpoint for a different backend and does not
+// cover rclone either.
+//
+// Rather than fire requests at a 404 and dress the resulting error up as a
+// feature, the call is switched off at a single named place. The client side is
+// complete: api.js carries `createRemoteFolder()` with the full contract, and
+// everything in this file — button, form, validation, the four error kinds —
+// runs today against any source that provides `mkdir()`.
+//
+// When the endpoint lands, flip `available` to true. Nothing else changes.
+const REMOTE_MKDIR = {
+    available: true,
+    reason: 'Creating folders needs POST /api/files/remote/mkdir on the server; that endpoint does not exist yet.'
+};
+
+async function rcloneMkdir(request) {
+    const remote = configuredRemoteName(request.backend, request.target);
+    if (!remote) {
+        throw new Error('No configured rclone remote selected.');
+    }
+
+    return createRemoteFolder(remote, normalisePath(request.path), request.name, {
+        signal: request.signal
+    });
+}
+
 const rcloneSource = {
     requiresTarget: true,
+
+    mkdir: REMOTE_MKDIR.available ? rcloneMkdir : null,
+    mkdirUnavailable: REMOTE_MKDIR.available ? null : REMOTE_MKDIR.reason,
 
     async list(request) {
         const remote = configuredRemoteName(request.backend, request.target);
@@ -101,7 +164,7 @@ const rcloneSource = {
         }
 
         const path = normalisePath(request.path);
-        const result = await fetchRemoteFiles(remote, path);
+        const result = await fetchRemoteFiles(remote, path, { signal: request.signal });
 
         // Envelope straight through on failure — loadRemotePath() renders
         // `{ ok: false, error }` as the error state.
@@ -176,10 +239,23 @@ function remoteEntry(basePath, entry) {
 // of nodes before the first paint.
 const RENDER_CHUNK = 200;
 
+// How long the pane waits for a listing or for a folder to be created before it
+// stops waiting. Neither endpoint has a deadline of its own — rclone keeps
+// retrying an unreachable remote — and an infinite "Loading …" is exactly the
+// failure the user cannot name. See withDeadline().
+const REMOTE_TIMEOUT_MS = 20000;
+
 const elements = {
     root: null,
     up: null,
     reload: null,
+    newFolder: null,
+    mkdirNote: null,
+    mkdirForm: null,
+    mkdirInput: null,
+    mkdirConfirm: null,
+    mkdirCancel: null,
+    mkdirMessage: null,
     breadcrumb: null,
     target: null,
     list: null
@@ -193,7 +269,11 @@ const view = {
     fillScheduled: false,
     // Request-ID guard: only the newest listing may render. Two clicks in
     // quick succession used to let the slower answer overwrite the faster one.
-    token: 0
+    token: 0,
+    // A folder creation is in flight. Used to keep the form from being fired
+    // twice, never to lock the rest of the pane: navigating away while a
+    // creation runs is allowed, the answer then only updates the form.
+    creating: false
 };
 
 // ---------------------------------------------------------------------------
@@ -252,10 +332,31 @@ function buildSkeleton(container) {
     elements.reload.title = 'Reload folder';
     elements.reload.addEventListener('click', () => loadRemotePath(view.path));
 
+    // The only write action of this pane. It sits in the toolbar and acts on
+    // the folder the breadcrumb shows — there is deliberately no per-row
+    // "create inside this one", which would need clickable rows.
+    elements.newFolder = createElement('button', 'btn btn-sm', '➕ New folder');
+    elements.newFolder.type = 'button';
+    elements.newFolder.id = 'rp-new-folder';
+    elements.newFolder.addEventListener('click', openMkdirForm);
+
+    // Why the button is dead, in the open, instead of a title attribute nobody
+    // hovers over. Empty and hidden as long as creating folders works.
+    elements.mkdirNote = createElement('span', 'text-xs opacity-70');
+    elements.mkdirNote.id = 'rp-mkdir-note';
+    elements.mkdirNote.hidden = true;
+
     const spacer = createElement('div', 'fb-spacer');
     const note = createElement('span', 'text-sm opacity-70', 'Folders only — files are read-only here');
 
-    toolbar.append(elements.up, elements.reload, spacer, note);
+    toolbar.append(elements.up, elements.reload, elements.newFolder, elements.mkdirNote, spacer, note);
+
+    // Creation form --------------------------------------------------------
+    //
+    // Not a <dialog>: a modal in the top layer would take the folder out of
+    // sight, and the pane must not fight the browser's own dialog handling.
+    // Not a <form> either — a submit that escapes would reload the page.
+    const mkdirBox = buildMkdirForm();
 
     // Target bar -----------------------------------------------------------
     //
@@ -297,10 +398,251 @@ function buildSkeleton(container) {
 
     listBox.append(head, elements.list);
 
-    root.append(toolbar, targetBar, breadcrumbBox, listBox);
+    root.append(toolbar, mkdirBox, targetBar, breadcrumbBox, listBox);
 
     container.replaceChildren(root);
     elements.root = root;
+
+    updateMkdirAvailability();
+}
+
+// ---------------------------------------------------------------------------
+// Create folder
+// ---------------------------------------------------------------------------
+
+function buildMkdirForm() {
+    const box = createElement('div', 'bg-base-200 rounded-lg p-3 mb-4');
+    box.id = 'rp-mkdir-form';
+    box.hidden = true;
+
+    const row = createElement('div', 'flex items-center gap-2');
+
+    elements.mkdirInput = createElement('input', 'input input-bordered w-full');
+    elements.mkdirInput.type = 'text';
+    elements.mkdirInput.id = 'rp-mkdir-name';
+    elements.mkdirInput.placeholder = 'Folder name';
+    elements.mkdirInput.setAttribute('aria-label', 'Name of the new folder');
+    elements.mkdirInput.maxLength = 255;
+    elements.mkdirInput.autocomplete = 'off';
+    elements.mkdirInput.addEventListener('keydown', handleMkdirKeydown);
+
+    elements.mkdirConfirm = createElement('button', 'btn btn-sm btn-primary', 'Create');
+    elements.mkdirConfirm.type = 'button';
+    elements.mkdirConfirm.id = 'rp-mkdir-confirm';
+    elements.mkdirConfirm.addEventListener('click', submitMkdir);
+
+    elements.mkdirCancel = createElement('button', 'btn btn-sm btn-ghost', 'Cancel');
+    elements.mkdirCancel.type = 'button';
+    elements.mkdirCancel.id = 'rp-mkdir-cancel';
+    elements.mkdirCancel.addEventListener('click', () => closeMkdirForm());
+
+    row.append(elements.mkdirInput, elements.mkdirConfirm, elements.mkdirCancel);
+
+    // Everything the form has to say — validation, progress, the classified
+    // failure — goes here. It never replaces the listing: a failed creation
+    // must not take the folder the user was looking at off the screen.
+    elements.mkdirMessage = createElement('div', 'text-sm mt-2');
+    elements.mkdirMessage.id = 'rp-mkdir-message';
+    elements.mkdirMessage.setAttribute('role', 'status');
+    elements.mkdirMessage.hidden = true;
+
+    box.append(row, elements.mkdirMessage);
+    elements.mkdirForm = box;
+
+    return box;
+}
+
+// The button is only live where creating a folder can mean anything: a source
+// that can do it, a target that is selected, and a folder that was actually
+// listed. In every other case it is disabled — an enabled button that answers
+// with an error is worse than one that says beforehand it cannot help.
+function updateMkdirAvailability() {
+    if (!elements.newFolder || !elements.list) {
+        return;
+    }
+
+    const source = getRemoteSource();
+    const supported = typeof source.mkdir === 'function';
+    const state = elements.list.dataset.state;
+    const listed = state === 'ok' || state === 'empty';
+
+    elements.newFolder.disabled = !supported || !listed || view.creating;
+
+    if (!supported) {
+        const reason = source.mkdirUnavailable || 'This source cannot create folders.';
+        elements.mkdirNote.textContent = reason;
+        elements.mkdirNote.hidden = false;
+        elements.newFolder.title = reason;
+        closeMkdirForm();
+        return;
+    }
+
+    elements.mkdirNote.textContent = '';
+    elements.mkdirNote.hidden = true;
+    elements.newFolder.title = listed
+        ? 'Create a folder in the folder shown below'
+        : 'Available once a folder is listed';
+}
+
+function openMkdirForm() {
+    if (!elements.mkdirForm || elements.newFolder.disabled) {
+        return;
+    }
+
+    elements.mkdirForm.hidden = false;
+    elements.mkdirInput.value = '';
+    elements.mkdirInput.disabled = false;
+    elements.mkdirConfirm.disabled = false;
+    setMkdirMessage(null);
+    elements.mkdirInput.focus();
+}
+
+function closeMkdirForm() {
+    if (!elements.mkdirForm) {
+        return;
+    }
+    elements.mkdirForm.hidden = true;
+    setMkdirMessage(null);
+}
+
+function handleMkdirKeydown(event) {
+    if (event.key === 'Enter') {
+        event.preventDefault();
+        submitMkdir();
+        return;
+    }
+    // Escape closes the form, nothing else: there is no dialog in the top
+    // layer here, so this cannot collide with the browser's own handling.
+    if (event.key === 'Escape') {
+        event.preventDefault();
+        closeMkdirForm();
+        elements.newFolder.focus();
+    }
+}
+
+// A name is checked here before anything leaves the browser. Not as a security
+// measure — the server has to check as well, it is the only side that can — but
+// because a rejected name should say what is wrong with it instead of coming
+// back as a backend error five seconds later.
+function validateFolderName(raw) {
+    const name = String(raw == null ? '' : raw).trim();
+
+    if (name === '') {
+        return { error: 'Enter a name for the new folder.' };
+    }
+    if (name === '.' || name === '..') {
+        return { error: '"." and ".." are not folder names.' };
+    }
+    if (name.includes('/') || name.includes('\\')) {
+        return { error: 'A folder name cannot contain "/" or "\\". Create the folders one level at a time.' };
+    }
+    if (/[\u0000-\u001f\u007f]/.test(name)) {
+        return { error: 'A folder name cannot contain control characters.' };
+    }
+    if (name.length > 255) {
+        return { error: 'A folder name may be at most 255 characters long.' };
+    }
+
+    return { name: name };
+}
+
+async function submitMkdir() {
+    if (!elements.mkdirForm || view.creating) {
+        return;
+    }
+
+    const checked = validateFolderName(elements.mkdirInput.value);
+    if (checked.error) {
+        setMkdirMessage({ tone: 'error', title: 'That name does not work', detail: checked.error });
+        elements.mkdirInput.focus();
+        return;
+    }
+
+    const source = getRemoteSource();
+    if (typeof source.mkdir !== 'function') {
+        updateMkdirAvailability();
+        return;
+    }
+
+    const selection = currentSelection();
+    const parent = view.path;
+
+    view.creating = true;
+    elements.mkdirInput.disabled = true;
+    elements.mkdirConfirm.disabled = true;
+    elements.newFolder.disabled = true;
+    setMkdirMessage({ tone: 'busy', title: 'Creating …', detail: joinPath(parent, checked.name) });
+
+    let failure = null;
+    try {
+        const result = await withDeadline(signal => source.mkdir({
+            target: selection.target,
+            backend: selection.backend,
+            path: parent,
+            name: checked.name,
+            signal: signal
+        }));
+
+        // A source may pass the api.js envelope through instead of unwrapping.
+        if (result && result.ok === false) {
+            failure = failureFromEnvelope(result);
+        }
+    } catch (error) {
+        failure = failureFromError(error);
+    }
+
+    view.creating = false;
+    elements.mkdirInput.disabled = false;
+    elements.mkdirConfirm.disabled = false;
+
+    if (failure) {
+        // The form stays open with the name still in it: the user can correct
+        // it, try again, or cancel. Nothing else in the pane is touched — the
+        // listing, the breadcrumb and the toolbar keep working.
+        const kind = classifyFailure(failure);
+        const described = describeFailure(kind, 'mkdir');
+        setMkdirMessage({
+            tone: 'error',
+            kind: kind,
+            title: described.title,
+            hint: described.hint,
+            detail: failure.message
+        });
+        updateMkdirAvailability();
+        elements.mkdirInput.focus();
+        return;
+    }
+
+    closeMkdirForm();
+
+    // Show the result rather than claim it: the folder only counts as created
+    // once it comes back in a listing.
+    await loadRemotePath(parent);
+}
+
+function setMkdirMessage(message) {
+    if (!elements.mkdirMessage) {
+        return;
+    }
+
+    if (!message) {
+        elements.mkdirMessage.replaceChildren();
+        elements.mkdirMessage.hidden = true;
+        delete elements.mkdirMessage.dataset.tone;
+        delete elements.mkdirMessage.dataset.errorKind;
+        return;
+    }
+
+    elements.mkdirMessage.dataset.tone = message.tone;
+    if (message.kind) {
+        elements.mkdirMessage.dataset.errorKind = message.kind;
+    } else {
+        delete elements.mkdirMessage.dataset.errorKind;
+    }
+
+    const parts = [failureBlock(message)];
+    elements.mkdirMessage.replaceChildren(...parts);
+    elements.mkdirMessage.hidden = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -386,22 +728,25 @@ export async function loadRemotePath(path) {
         renderBreadcrumb([]);
         setListMessage(notReady.message, notReady.state);
         updateUpButton();
+        updateMkdirAvailability();
         return;
     }
 
     const token = ++view.token;
     setListMessage('Loading …', 'loading');
+    updateMkdirAvailability();
 
     let listing = null;
     try {
-        listing = await source.list({
+        listing = await withDeadline(signal => source.list({
             target: target,
             backend: selection.backend,
-            path: normalisePath(path)
-        });
+            path: normalisePath(path),
+            signal: signal
+        }));
     } catch (error) {
         if (token === view.token) {
-            setListMessage('Folder could not be loaded: ' + (error && error.message ? error.message : error), 'error');
+            setListFailure(failureFromError(error));
         }
         return;
     }
@@ -414,14 +759,14 @@ export async function loadRemotePath(path) {
     // api.js hands back `{ ok, data, error }`; a source may pass that through
     // unchanged instead of unwrapping it.
     if (listing && listing.ok === false) {
-        setListMessage('Folder could not be loaded: ' + (listing.error || 'unknown error'), 'error');
+        setListFailure(failureFromEnvelope(listing));
         return;
     }
     if (listing && listing.ok === true && listing.data) {
         listing = listing.data;
     }
     if (!listing || !Array.isArray(listing.entries)) {
-        setListMessage('The remote returned an unusable listing.', 'error');
+        setListFailure({ status: 0, message: 'The remote returned an unusable listing.', kind: 'unusable' });
         return;
     }
 
@@ -432,12 +777,282 @@ export async function loadRemotePath(path) {
     renderBreadcrumb(Array.isArray(listing.segments) ? listing.segments : segmentsFor(view.path));
     renderEntries(listing.entries);
     updateUpButton();
+    updateMkdirAvailability();
 }
 
 function updateUpButton() {
     if (elements.up) {
         elements.up.disabled = view.parent == null;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Failures
+// ---------------------------------------------------------------------------
+//
+// Four kinds of failure need four different reactions from the user, and the
+// server tells them apart badly: `GET /api/files/remote` answers HTTP 200 with
+// `{ success: false, error: "rclone error: <stderr>" }` for everything. So the
+// classification works on whatever is available — the HTTP status when there is
+// a meaningful one, otherwise the wording rclone produced — and it is kept in
+// one function so a new pattern is added in one place.
+//
+//   timeout   – nothing came back in time. Retry, or check the remote.
+//   auth      – the remote refused the credentials (expired OAuth token,
+//               rotated key). Reconnecting the remote is the only fix; retrying
+//               will fail the same way.
+//   not-found – the path is gone. Going up or reloading helps.
+//   denied    – the credentials are fine, the operation is not allowed
+//               (read-only share, no write permission on the folder).
+//   offline   – the browser never reached our own server.
+//   unknown   – anything else; shown as-is rather than mislabelled.
+//
+// The wording is deliberately different per kind: a user who reads "Retry" for
+// an expired token retries forever.
+
+const FAILURE_TEXT = {
+    timeout: {
+        list: {
+            title: 'The remote did not answer in time',
+            hint: 'It may be unreachable or very slow. Reload to try again — nothing was changed.'
+        },
+        mkdir: {
+            title: 'The remote did not answer in time',
+            hint: 'The folder may still have been created. Reload the listing before trying again.'
+        }
+    },
+    auth: {
+        list: {
+            title: 'The remote rejected the credentials',
+            hint: 'The sign-in for this remote has expired. Reconnect it in the configuration — retrying will fail the same way.'
+        },
+        mkdir: {
+            title: 'The remote rejected the credentials',
+            hint: 'The sign-in for this remote has expired. Reconnect it in the configuration, then create the folder again.'
+        }
+    },
+    'not-found': {
+        list: {
+            title: 'This path does not exist on the remote',
+            hint: 'It may have been renamed or deleted. Go up one folder or reload.'
+        },
+        mkdir: {
+            title: 'The folder you are in no longer exists',
+            hint: 'The parent path is gone on the remote. Reload the listing and pick an existing folder.'
+        }
+    },
+    denied: {
+        list: {
+            title: 'No permission to read this folder',
+            hint: 'The remote allows the connection but not this folder.'
+        },
+        mkdir: {
+            title: 'No permission to write here',
+            hint: 'The remote is read-only for these credentials, or this folder does not allow new entries. Pick a different folder.'
+        }
+    },
+    offline: {
+        list: {
+            title: 'The server could not be reached',
+            hint: 'Check the connection to this application, then reload.'
+        },
+        mkdir: {
+            title: 'The server could not be reached',
+            hint: 'Nothing was created. Check the connection and try again.'
+        }
+    },
+    unusable: {
+        list: {
+            title: 'The remote sent an answer that could not be read',
+            hint: 'Reload the folder. If it keeps happening the remote is answering something other than a listing.'
+        },
+        mkdir: {
+            title: 'The remote sent an answer that could not be read',
+            hint: 'Reload the listing to see whether the folder was created.'
+        }
+    },
+    unknown: {
+        list: {
+            title: 'The folder could not be loaded',
+            hint: 'The exact message from the remote is below.'
+        },
+        mkdir: {
+            title: 'The folder could not be created',
+            hint: 'The exact message from the remote is below.'
+        }
+    }
+};
+
+// Rejections: an Error, an AbortError from the deadline below, or whatever a
+// foreign source threw.
+function failureFromError(error) {
+    if (!error) {
+        return { status: 0, message: 'unknown error' };
+    }
+
+    const message = error.message ? String(error.message) : String(error);
+
+    // Set by withDeadline(); a source that aborts on its own reports the
+    // browser's AbortError, which means the same thing here.
+    if (error.remoteKind) {
+        return { status: 0, message: message, kind: error.remoteKind };
+    }
+    if (error.name === 'AbortError') {
+        return { status: 0, message: message, kind: 'timeout' };
+    }
+    // fetch() rejects with a TypeError when it never reached the server. That
+    // is our own server, not the remote — a different problem entirely.
+    if (error.name === 'TypeError') {
+        return { status: 0, message: message, kind: 'offline' };
+    }
+
+    return { status: 0, message: message };
+}
+
+// `{ ok: false, error, status }` from api.js.
+function failureFromEnvelope(result) {
+    return {
+        status: Number(result && result.status) || 0,
+        message: (result && result.error) ? String(result.error) : 'unknown error'
+    };
+}
+
+function classifyFailure(failure) {
+    // A kind that was decided at the source (timeout, offline) is not
+    // second-guessed by pattern matching.
+    if (failure.kind) {
+        return failure.kind;
+    }
+
+    const status = Number(failure.status) || 0;
+
+    // An HTTP status is unambiguous where it exists, so it wins over the text.
+    // 401 is included for completeness only: api.js turns a lost session into a
+    // redirect to the login page, so it never arrives here.
+    if (status === 408 || status === 504 || status === 524) {
+        return 'timeout';
+    }
+    if (status === 401) {
+        return 'auth';
+    }
+    if (status === 403) {
+        return 'denied';
+    }
+    if (status === 404 || status === 410) {
+        return 'not-found';
+    }
+
+    const text = String(failure.message || '').toLowerCase();
+
+    if (/timed out|timeout|deadline exceeded|i\/o timeout/.test(text)) {
+        return 'timeout';
+    }
+    // Before the auth patterns: "403 Forbidden" and "permission denied" are
+    // about what these credentials may do, not about who they belong to.
+    if (/permission denied|access denied|forbidden|\b403\b|read[- ]only|readonly|not writable|write access|insufficient permission|quota/.test(text)) {
+        return 'denied';
+    }
+    if (/unauthori[sz]ed|\b401\b|invalid_grant|invalid_client|invalid_token|token expired|expired token|refresh token|couldn't fetch token|oauth|authentication|bad credentials|login required/.test(text)) {
+        return 'auth';
+    }
+    if (/directory not found|not found|no such file|does not exist|doesn't exist|\b404\b|couldn't find/.test(text)) {
+        return 'not-found';
+    }
+    if (/failed to fetch|networkerror|load failed|connection refused|could not connect|no route to host|name resolution|dns/.test(text)) {
+        return 'offline';
+    }
+
+    return 'unknown';
+}
+
+function describeFailure(kind, context) {
+    const entry = FAILURE_TEXT[kind] || FAILURE_TEXT.unknown;
+    return entry[context] || entry.list;
+}
+
+// Title, hint and the raw message underneath. The raw message is the one part
+// that comes from outside and it goes in through textContent like every other
+// remote string.
+function failureBlock(message) {
+    const box = createElement('div');
+
+    box.append(createElement('div', 'font-semibold', message.title));
+
+    if (message.hint) {
+        box.append(createElement('div', 'text-sm mt-1', message.hint));
+    }
+    if (message.detail) {
+        const detail = createElement('div', 'text-xs opacity-70 mt-1');
+        detail.textContent = message.detail;
+        box.append(detail);
+    }
+
+    return box;
+}
+
+// The error state of the listing. Keeps `data-state="error"` — the state
+// vocabulary of the pane does not change — and adds `data-error-kind`, so the
+// four kinds are distinguishable in the DOM and not only to a reader.
+//
+// The toolbar, the breadcrumb and the target bar are left exactly as they were:
+// after a failed listing the user is still standing in the last folder that
+// worked and can navigate away from the error.
+function setListFailure(failure) {
+    if (!elements.list) {
+        return;
+    }
+
+    const kind = classifyFailure(failure);
+    const described = describeFailure(kind, 'list');
+
+    view.cursor = { entries: [], index: 0 };
+    elements.list.dataset.state = 'error';
+    elements.list.dataset.errorKind = kind;
+
+    const box = createElement('div', 'fb-message fb-error');
+    box.append(failureBlock({
+        title: described.title,
+        hint: described.hint,
+        detail: failure.message
+    }));
+
+    // Retrying is the same button as in the toolbar, put where the error is.
+    // It is offered for every kind: even where retrying cannot help, the user
+    // is the one who decides to stop.
+    const retry = createElement('button', 'btn btn-sm mt-2', '⟳ Try again');
+    retry.type = 'button';
+    retry.addEventListener('click', () => loadRemotePath(view.path));
+    box.append(retry);
+
+    elements.list.replaceChildren(box);
+    updateMkdirAvailability();
+}
+
+// Runs `run(signal)` and stops waiting after REMOTE_TIMEOUT_MS.
+//
+// Two mechanisms, because they cover different things: the signal lets a source
+// abort the actual request, and the race makes the pane give up even when the
+// source ignores the signal. Without the race a source that never settles would
+// leave "Loading …" on screen forever.
+function withDeadline(run) {
+    const controller = new AbortController();
+    let timer = 0;
+
+    const expired = new Promise((resolve, reject) => {
+        timer = window.setTimeout(() => {
+            controller.abort();
+
+            const error = new Error(`No answer within ${Math.round(REMOTE_TIMEOUT_MS / 1000)} seconds.`);
+            error.remoteKind = 'timeout';
+            reject(error);
+        }, REMOTE_TIMEOUT_MS);
+    });
+
+    // Promise.race attaches a handler to the work as well, so a rejection that
+    // arrives after the deadline is consumed and not reported as unhandled.
+    const work = Promise.resolve().then(() => run(controller.signal));
+
+    return Promise.race([work, expired]).finally(() => window.clearTimeout(timer));
 }
 
 // ---------------------------------------------------------------------------
@@ -483,6 +1098,8 @@ function renderEntries(entries) {
     const sorted = sortEntries(entries);
 
     elements.list.dataset.state = 'ok';
+    // A successful listing leaves no trace of the previous failure.
+    delete elements.list.dataset.errorKind;
     elements.list.replaceChildren();
     elements.list.scrollTop = 0;
     view.cursor = { entries: sorted, index: 0 };
@@ -595,6 +1212,8 @@ function setListMessage(message, stateName) {
 
     view.cursor = { entries: [], index: 0 };
     elements.list.dataset.state = stateName;
+    // Plain messages carry no kind; only setListFailure() sets one.
+    delete elements.list.dataset.errorKind;
 
     const box = createElement('div', stateName === 'error' ? 'fb-message fb-error' : 'fb-message');
     box.textContent = message;

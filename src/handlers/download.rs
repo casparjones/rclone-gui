@@ -23,6 +23,7 @@ use axum::{
     extract::Query,
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Json as ResponseJson, Response},
+    Extension,
 };
 use std::collections::HashSet;
 use std::io::{Read, Seek, Write};
@@ -31,6 +32,7 @@ use tokio_util::io::{ReaderStream, SyncIoBridge};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, DateTime as ZipDateTime, ZipWriter};
 
+use crate::handlers::auth_web::CurrentUser;
 use crate::models::ApiResponse;
 
 /// Puffer zwischen ZIP-Schreiber und Response-Body. Begrenzt den Speicher, den
@@ -87,15 +89,140 @@ impl IntoResponse for DownloadError {
     }
 }
 
-/// Erlaubter Wurzelpfad für alle Downloads.
+// ---------------------------------------------------------------------------
+// Wurzelverzeichnis
+// ---------------------------------------------------------------------------
+//
+// Die Wurzel ist seit der Datentrennung **nicht mehr global**, sondern das Home
+// des angemeldeten Nutzers (`users.home_path`). Die Jail-Prüfung selbst
+// (`resolve_within_root` / `is_within_root`) ist davon unberührt – sie bekommt
+// weiterhin eine fertig kanonisierte Wurzel und entscheidet unverändert.
+// Geändert hat sich ausschliesslich, *woher* diese Wurzel kommt.
+
+/// Rollenname, der ausserhalb des eigenen Homes navigieren darf.
+const ADMIN_ROLE: &str = "admin";
+
+/// Global konfigurierter Pfad. Seit der Datentrennung ist er **kein**
+/// Wurzelverzeichnis für normale Nutzer mehr, sondern nur noch die Wurzel des
+/// ausdrücklich angeforderten Admin-Modus (`scope=system`).
 fn configured_root() -> String {
     std::env::var("RCLONE_GUI_DEFAULT_PATH").unwrap_or_else(|_| "/mnt/home".to_string())
 }
 
-/// Kanonisiert den Wurzelpfad. Existiert er nicht, ist kein Download möglich.
-pub(crate) async fn download_root() -> Result<PathBuf, DownloadError> {
-    let root = configured_root();
-    tokio::fs::canonicalize(&root).await.map_err(|e| {
+/// Gegen welche Wurzel dieser Request aufgelöst wird.
+///
+/// `Home` ist der Normalfall und der Standard. `System` muss vom Client
+/// **ausdrücklich** über `?scope=system` angefordert werden und ist Admins
+/// vorbehalten – ein stiller Ausbruch über einen vergessenen Parameter ist
+/// damit ausgeschlossen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootScope {
+    Home,
+    System,
+}
+
+impl RootScope {
+    /// Bezeichner für die API-Antwort, damit das Frontend den Admin-Modus
+    /// sichtbar kennzeichnen kann.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            RootScope::Home => "home",
+            RootScope::System => "system",
+        }
+    }
+}
+
+/// Liest den `scope`-Parameter. Fehlt er oder ist er leer, gilt `home`.
+///
+/// Ein unbekannter Wert ist ein Fehler und kein stilles Zurückfallen auf den
+/// Standard: wer `scope=sytem` tippt, soll das merken.
+pub(crate) fn parse_scope(raw: Option<&str>) -> Result<RootScope, DownloadError> {
+    match raw.map(str::trim).unwrap_or("") {
+        "" | "home" => Ok(RootScope::Home),
+        "system" => Ok(RootScope::System),
+        other => Err(DownloadError::bad_request(format!(
+            "Unbekannter Wert für 'scope': {}",
+            other
+        ))),
+    }
+}
+
+/// `scope` aus einer `HashMap`-Query (Auflistung, Vorschau, Thumbnail).
+pub(crate) fn scope_from_map(
+    params: &std::collections::HashMap<String, String>,
+) -> Result<RootScope, DownloadError> {
+    parse_scope(params.get("scope").map(|s| s.as_str()))
+}
+
+/// `scope` aus einer Paar-Query (Download, ZIP – dort sind Parameter mehrfach
+/// erlaubt).
+pub(crate) fn scope_from_pairs(params: &[(String, String)]) -> Result<RootScope, DownloadError> {
+    parse_scope(
+        params
+            .iter()
+            .find(|(k, _)| k == "scope")
+            .map(|(_, v)| v.as_str()),
+    )
+}
+
+/// Kanonisierte Wurzel für den angemeldeten Nutzer.
+///
+/// Für `Home` ist das sein `home_path`; existiert das Verzeichnis noch nicht,
+/// wird es angelegt, damit ein frisch angelegtes Konto keinen 500er auf jedem
+/// Endpunkt bekommt. Für `System` ist es der global konfigurierte Pfad – und
+/// nur, wenn der Aufrufer Admin ist.
+pub(crate) async fn user_root(
+    current: &CurrentUser,
+    scope: RootScope,
+) -> Result<PathBuf, DownloadError> {
+    match scope {
+        RootScope::Home => {
+            let home = current.user.home_path.trim().to_string();
+            if home.is_empty() {
+                return Err(DownloadError::internal(
+                    "Für dieses Konto ist kein Home-Verzeichnis hinterlegt",
+                ));
+            }
+            let path = PathBuf::from(&home);
+            if !path.is_absolute() {
+                return Err(DownloadError::internal(format!(
+                    "Home-Verzeichnis '{}' ist kein absoluter Pfad",
+                    home
+                )));
+            }
+            if tokio::fs::metadata(&path).await.is_err() {
+                tokio::fs::create_dir_all(&path).await.map_err(|e| {
+                    DownloadError::internal(format!(
+                        "Home-Verzeichnis '{}' nicht anlegbar: {}",
+                        home, e
+                    ))
+                })?;
+                tracing::info!(
+                    "Home-Verzeichnis für '{}' angelegt: {}",
+                    current.user.username,
+                    home
+                );
+            }
+            canonicalize_root(&home).await
+        }
+        RootScope::System => {
+            if !current.user.role.eq_ignore_ascii_case(ADMIN_ROLE) {
+                tracing::warn!(
+                    "Nutzer '{}' hat den Admin-Modus 'scope=system' angefordert",
+                    current.user.username
+                );
+                return Err(DownloadError::forbidden(
+                    "Navigation ausserhalb des eigenen Bereichs ist Administratoren vorbehalten",
+                ));
+            }
+            canonicalize_root(&configured_root()).await
+        }
+    }
+}
+
+/// Kanonisiert den Wurzelpfad. Existiert er nicht, ist kein Zugriff möglich.
+async fn canonicalize_root(root: &str) -> Result<PathBuf, DownloadError> {
+    tokio::fs::canonicalize(root).await.map_err(|e| {
         DownloadError::internal(format!(
             "Wurzelverzeichnis '{}' nicht verfügbar: {}",
             root, e
@@ -272,6 +399,7 @@ fn content_disposition(name: &str) -> Result<HeaderValue, DownloadError> {
 /// chunkweise aus der Datei gelesen – auch mehrere GB belegen keinen
 /// zusätzlichen Speicher.
 pub async fn download_file(
+    Extension(current): Extension<CurrentUser>,
     Query(params): Query<Vec<(String, String)>>,
 ) -> Result<Response, DownloadError> {
     let path_param = params
@@ -280,7 +408,7 @@ pub async fn download_file(
         .map(|(_, v)| v.clone())
         .ok_or_else(|| DownloadError::bad_request("Query-Parameter 'path' fehlt"))?;
 
-    let root = download_root().await?;
+    let root = user_root(&current, scope_from_pairs(&params)?).await?;
     let path = resolve_within_root(&root, &path_param).await?;
 
     let metadata = tokio::fs::metadata(&path)
@@ -329,6 +457,7 @@ pub async fn download_file(
 /// Das Archiv wird während des Sendens erzeugt; es existiert zu keinem Zeitpunkt
 /// vollständig im Speicher oder auf der Platte, daher auch kein `Content-Length`.
 pub async fn download_zip(
+    Extension(current): Extension<CurrentUser>,
     Query(params): Query<Vec<(String, String)>>,
 ) -> Result<Response, DownloadError> {
     let requested: Vec<String> = params
@@ -343,7 +472,7 @@ pub async fn download_zip(
         ));
     }
 
-    let root = download_root().await?;
+    let root = user_root(&current, scope_from_pairs(&params)?).await?;
 
     let mut selections = Vec::with_capacity(requested.len());
     for candidate in &requested {

@@ -31,6 +31,12 @@ rclone.conf
 # Thumbnail-Cache (serverseitig generiert, ausserhalb des browsebaren Baums)
 /data/cache/
 
+# rsync-Daemon-Laufzeit. Enthaelt `secrets/rsyncd.secrets` — die Modul-Geheimnisse
+# gekoppelter Instanzen im Klartext. Entsteht, wenn RCLONE_GUI_RSYNCD_DIR auf einen
+# Pfad im Projekt zeigt (auf dem Host der uebliche Weg, weil /etc/rsyncd ohne root
+# nicht beschreibbar ist). Ohne diese Zeile landen die Geheimnisse im naechsten Commit.
+/data/rsyncd/
+
 # Temporary files
 *.tmp
 *.temp

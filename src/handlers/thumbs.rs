@@ -30,6 +30,7 @@ use axum::{
     extract::Query,
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::Response,
+    Extension,
 };
 use image::{ImageFormat, ImageReader, Limits};
 use std::collections::HashMap;
@@ -40,8 +41,9 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 use tokio::sync::Semaphore;
 
+use crate::handlers::auth_web::CurrentUser;
 use crate::handlers::download::{
-    download_root, is_within_root, resolve_within_root, DownloadError,
+    is_within_root, resolve_within_root, scope_from_map, user_root, DownloadError,
 };
 
 /// Maximale Kantenlänge des erzeugten Thumbnails. Das Seitenverhältnis bleibt
@@ -147,6 +149,7 @@ struct Thumbnail {
 
 /// `GET /api/thumb?path=…`
 pub async fn get_thumbnail(
+    Extension(current): Extension<CurrentUser>,
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Response, DownloadError> {
@@ -156,7 +159,7 @@ pub async fn get_thumbnail(
         .filter(|p| !p.is_empty())
         .ok_or_else(|| DownloadError::bad_request("Pfad fehlt"))?;
 
-    let root = download_root().await?;
+    let root = user_root(&current, scope_from_map(&params)?).await?;
     let source = resolve_within_root(&root, requested).await?;
 
     let metadata = tokio::fs::metadata(&source)

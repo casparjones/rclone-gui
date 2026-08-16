@@ -54,6 +54,9 @@ TLS_CA_CRT="${TLS_DIR}/ca.crt"
 TLS_SRV_KEY="${TLS_DIR}/srv.key"
 TLS_SRV_CRT="${TLS_DIR}/srv.crt"
 STUNNEL_CONF="${RSYNCD_DIR}/stunnel.conf"
+# stunnel-Log. Einzige Quelle der echten Peer-IP fürs Audit-Log; die App sucht
+# es per Voreinstellung neben rsyncd.conf (RCLONE_GUI_STUNNEL_LOG überschreibt).
+STUNNEL_LOG="${STUNNEL_LOG:-${RSYNCD_DIR}/stunnel.log}"
 # Vorlage: im Image unter /app/config, im Repo neben diesem Skript.
 STUNNEL_TEMPLATE="${STUNNEL_TEMPLATE:-$(dirname "${BASH_SOURCE[0]}")/stunnel-rsyncd.conf.template}"
 
@@ -255,11 +258,22 @@ rsync_tls_start() {
         -e "s#@CONNECT@#${RCLONE_GUI_RSYNC_BACKEND}#" \
         -e "s#@CERT@#${cert}#" \
         -e "s#@KEY@#${key}#" \
+        -e "s#@LOG@#${STUNNEL_LOG}#" \
         "$STUNNEL_TEMPLATE" >"$STUNNEL_CONF" || {
         echo "❌ ${STUNNEL_CONF} konnte nicht geschrieben werden" >&2
         return 1
     }
     chmod 600 "$STUNNEL_CONF"
+
+    # Das Log vorher anlegen, damit die Rechte feststehen, bevor stunnel die
+    # erste Zeile schreibt: es enthält die Adresse jeder Gegenstelle, und
+    # stunnel legt die Datei sonst mit der Standard-umask an (0644).
+    if ! ( umask 077; touch "$STUNNEL_LOG" ) 2>/dev/null; then
+        echo "⚠️  stunnel-Log ${STUNNEL_LOG} nicht anlegbar — das Audit-Log" >&2
+        echo "    kennt die echte Client-IP dann nicht (client_source=unavailable)." >&2
+    else
+        chmod 600 "$STUNNEL_LOG" 2>/dev/null
+    fi
 
     # Einen Trockenlauf gibt es nicht: stunnel 5.75 kennt keinen Test-Schalter
     # (`-test` wird als Dateiname interpretiert). Statt dessen wird unten
@@ -286,7 +300,7 @@ rsync_tls_start() {
     fi
 
     echo "🔒 stunnel läuft (PID ${STUNNEL_PID}): ${RCLONE_GUI_RSYNC_TLS_BIND}:${RCLONE_GUI_RSYNC_TLS_PORT} -> ${RCLONE_GUI_RSYNC_BACKEND}"
-    echo "   Die echte Client-IP steht im stunnel-Log ('accepted connection from'),"
+    echo "   Die echte Client-IP steht im stunnel-Log ${STUNNEL_LOG} ('accepted connection from'),"
     echo "   nicht im Daemon-Log: 'proxy protocol' ist bewusst aus (siehe README)."
     return 0
 }

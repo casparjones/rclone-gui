@@ -1,5 +1,6 @@
 use axum::{
     extract::{Path, Request},
+    http::{header, HeaderValue, Method},
     middleware::{self, Next},
     response::Html,
     routing::{delete, get, post},
@@ -11,7 +12,7 @@ use dotenvy::{dotenv, from_filename_override};
 use std::env;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tower::ServiceBuilder;
+use std::time::Duration;
 use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
 use tracing;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -149,12 +150,14 @@ async fn main() {
     println!("   POST   /api/configs/persist           -> persist_configs");
     println!("   GET    /api/files/local               -> list_local_files");
     println!("   GET    /api/files/remote              -> list_remote_files");
+    println!("   POST   /api/files/remote/mkdir        -> create_remote_directory");
     println!("   GET    /api/download/file             -> download_file");
     println!("   GET    /api/download/zip              -> download_zip");
     println!("   GET    /api/thumb                     -> get_thumbnail");
     println!("   GET    /api/preview/info              -> preview_info");
     println!("   GET    /api/preview/text              -> preview_text");
     println!("   GET    /api/preview/image             -> preview_image");
+    println!("   GET    /api/preview/video             -> preview_video");
     println!("   POST   /api/sync                      -> start_sync");
     println!("   GET    /api/sync                      -> list_sync_jobs");
     println!("   GET    /api/sync-log/:job_id          -> get_sync_log (temp route)");
@@ -209,12 +212,17 @@ async fn main() {
         )
         .route("/api/files/local", get(handlers::files::list_local_files))
         .route("/api/files/remote", get(handlers::files::list_remote_files))
+        .route(
+            "/api/files/remote/mkdir",
+            post(handlers::files::create_remote_directory),
+        )
         .route("/api/download/file", get(handlers::download::download_file))
         .route("/api/download/zip", get(handlers::download::download_zip))
         .route("/api/thumb", get(handlers::thumbs::get_thumbnail))
         .route("/api/preview/info", get(handlers::preview::preview_info))
         .route("/api/preview/text", get(handlers::preview::preview_text))
         .route("/api/preview/image", get(handlers::preview::preview_image))
+        .route("/api/preview/video", get(handlers::preview::preview_video))
         .route("/api/sync", post(handlers::sync::start_sync))
         .route("/api/sync", get(handlers::sync::list_sync_jobs))
         .route("/api/sync-log/:job_id", get(get_sync_log_handler))
@@ -258,8 +266,40 @@ async fn main() {
         .layer(TraceLayer::new_for_http())
         .layer(Extension(config_manager))
         .layer(Extension(db_pool))
-        .layer(Extension(rsyncd.clone()))
-        .layer(ServiceBuilder::new().layer(CorsLayer::permissive()));
+        .layer(Extension(rsyncd.clone()));
+
+    // ----------------------------------------------------------------------
+    // One wrapper around the finished router, for the two things that have to
+    // sit outside it.
+    //
+    // `fallback_service` and not `.layer()`: axum writes the `Allow` header of
+    // a method mismatch in the future its *own* method router returns, which is
+    // outside everything `Router::layer` can reach — a middleware added above
+    // never sees that header and cannot take it off. An empty router whose
+    // fallback is the real one does get outside it.
+    // ----------------------------------------------------------------------
+    let app = Router::new()
+        .fallback_service(app)
+        .layer(middleware::from_fn(strip_allow_header_from_401));
+
+    // ----------------------------------------------------------------------
+    // CORS, and only if somebody asked for it.
+    //
+    // The frontend is served from this very process (`serve_index` and
+    // `/static`), so it is same-origin and needs no CORS at all. The default
+    // is therefore *no layer*: no `Access-Control-Allow-Origin`, and an
+    // `OPTIONS` on a protected path falls through to the session guard (401)
+    // instead of being answered 200 by the CORS layer before the guard runs.
+    //
+    // It stays the OUTERMOST layer — added after the session guard, so a
+    // preflight (which carries no cookie, by specification) is answered here
+    // instead of being refused by the guard. Measured; do not reorder. See the
+    // block above the guard.
+    // ----------------------------------------------------------------------
+    let app = match build_cors_layer() {
+        Some(cors) => app.layer(cors),
+        None => app,
+    };
 
     let addr: SocketAddr = args.bind.parse().expect("Invalid bind address");
 
@@ -280,31 +320,75 @@ async fn main() {
     println!("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     println!("");
 
-    // Setup graceful shutdown
-    let shutdown_signal = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to install CTRL+C signal handler");
+    // Setup graceful shutdown.
+    //
+    // `signalled` fires the moment a signal arrives, so the drain deadline
+    // below can start counting from *then* rather than from the start of the
+    // process.
+    let (signalled_tx, signalled_rx) = tokio::sync::oneshot::channel::<()>();
+    let shutdown_signal = async move {
+        let signal = wait_for_shutdown_signal().await;
         println!("");
-        println!("🛑 Shutdown signal received");
+        println!("🛑 Shutdown signal received ({})", signal);
         println!("🔄 Gracefully shutting down server...");
+        let _ = signalled_tx.send(());
     };
 
-    // Run server with graceful shutdown
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal)
-        .await
-        .unwrap();
+    // Run server with graceful shutdown — but not for longer than
+    // `SERVER_DRAIN_DEADLINE`.
+    //
+    // A graceful shutdown waits for every open connection, and a request that
+    // is itself waiting on a slow remote holds one for up to its own timeout.
+    // Waiting that out costs more than it buys: `docker stop` gives the process
+    // ten seconds and then sends SIGKILL — and a process killed there never
+    // reaches the daemon cleanup below, which is precisely how an orphaned
+    // daemon with a locked pid file comes about. So the drain is bounded and
+    // the cleanup happens either way.
+    // `into_future()`: `with_graceful_shutdown` yields an `IntoFuture`, and
+    // only a real future can be selected on alongside the deadline.
+    let server = std::future::IntoFuture::into_future(
+        axum::serve(listener, app).with_graceful_shutdown(shutdown_signal),
+    );
+    tokio::pin!(server);
+
+    let drain_deadline = async {
+        let _ = signalled_rx.await;
+        tokio::time::sleep(SERVER_DRAIN_DEADLINE).await;
+    };
+
+    tokio::select! {
+        result = &mut server => {
+            if let Err(e) = result {
+                eprintln!("❌ The server stopped with an error: {}", e);
+            }
+        }
+        _ = drain_deadline => {
+            println!(
+                "   ⚠️  connections were still open after {} s; continuing with the shutdown",
+                SERVER_DRAIN_DEADLINE.as_secs()
+            );
+        }
+    }
 
     // After the server, not inside the shutdown signal: the daemon has to
     // outlive the last request that might still be using it. `shutdown` sends
     // SIGTERM and waits for the process to be gone, so no daemon survives this
     // process — and it is SIGTERM rather than SIGKILL because a hard kill
     // leaves partial `.name.XXXXXX` files behind in the shares.
-    if let Some(daemon) = rsyncd {
+    //
+    // Capped nonetheless: `shutdown` escalates to SIGKILL after its own grace
+    // period, but a daemon whose pid vanished under it could leave the wait
+    // open, and a shutdown that never ends is the same failure as one that
+    // never runs.
+    if let RsyncdState::Running(daemon) = rsyncd {
         println!("🔄 Stopping the rsync daemon...");
-        daemon.shutdown().await;
-        println!("   ✅ rsync daemon stopped");
+        match tokio::time::timeout(DAEMON_SHUTDOWN_DEADLINE, daemon.shutdown()).await {
+            Ok(()) => println!("   ✅ rsync daemon stopped"),
+            Err(_) => eprintln!(
+                "   ⚠️  the rsync daemon did not stop within {} s; giving up on waiting",
+                DAEMON_SHUTDOWN_DEADLINE.as_secs()
+            ),
+        }
     }
 
     println!("✅ Server shutdown completed");
@@ -343,6 +427,216 @@ async fn get_config_for_edit_handler(
     handlers::config::get_config_for_edit(Extension(config_manager), name).await
 }
 
+/// Take the `Allow` header off a `401`.
+///
+/// axum answers a method it does not serve with `405` plus `Allow: GET,HEAD,…`,
+/// and it attaches that header late enough that it survives the session guard's
+/// `401`. The result is an unauthenticated request that gets told the route
+/// exists and which methods it has — the same route disclosure the permissive
+/// CORS layer used to hand out through its `200` preflight, only quieter.
+///
+/// `401` means "I am not telling you anything", so nothing is told: the header
+/// is removed. A `405` for an authenticated caller, and for the public login
+/// page, keeps it — there it is a correct answer to a legitimate question.
+async fn strip_allow_header_from_401(req: Request, next: Next) -> axum::response::Response {
+    let mut response = next.run(req).await;
+    if response.status() == axum::http::StatusCode::UNAUTHORIZED {
+        response.headers_mut().remove(header::ALLOW);
+    }
+    response
+}
+
+/// Environment variable holding the cross-origin allowlist, comma separated
+/// (`https://a.example,https://b.example`). Unset or empty means: no foreign
+/// origin, which is the default and the right answer for a same-origin app.
+const CORS_ORIGINS_ENV: &str = "RCLONE_GUI_CORS_ORIGINS";
+
+/// Build the CORS layer from [`CORS_ORIGINS_ENV`], or `None` when no origin is
+/// configured.
+///
+/// Replaces `CorsLayer::permissive()`, which sent
+/// `Access-Control-Allow-Origin: *` for every method and header across the
+/// whole application. Two things were wrong with it even after the session
+/// guard arrived — the guard makes `*` harmless for reading, because without
+/// `allow_credentials` a browser sends no cookie and a foreign page gets 401:
+///
+///   * `permissive()` answers the preflight itself, so `OPTIONS` on a
+///     protected path came back 200 with `allow: GET,HEAD,POST` *before* the
+///     guard ran. Nothing leaked — there are no `OPTIONS` handlers — but the
+///     existence of a route did
+///   * the protection was a side effect of using cookies. A later switch to a
+///     token in the `Authorization` header has no cookie rule behind it, and
+///     `*` would be an open door again on the day of that change
+///
+/// What is allowed here is what the frontend actually uses: the three methods
+/// the router serves (axum answers `HEAD` through the `GET` handler) and
+/// `content-type` for JSON bodies. Nothing is granted "just in case" —
+/// `Authorization` deliberately is not in the list, and adding it is a
+/// decision for whoever introduces token auth.
+///
+/// # Do the share links from epic 4 (`/s/<token>`) need an exception?
+///
+/// Checked, and the answer is **no** — no exception now, and none expected:
+///
+///   * a share link is *navigated to*. A top-level navigation and a plain
+///     `<img>`/`<video>`/download of the target are not subject to CORS at
+///     all; the browser fetches them regardless of any allow-origin header. A
+///     link mailed to somebody works with this layer absent
+///   * CORS would only enter the picture if a foreign page read a share
+///     through `fetch`, and allowing that is the opposite of what an anonymous
+///     link needs: it would let any site in the world script-read the shared
+///     content of a token it happened to learn
+///
+/// Should embedding ever be wanted, it belongs on that route alone — a second,
+/// nested `CorsLayer` on `/s/` with `AllowOrigin::any()` and *no* credentials,
+/// as a deliberate opt-in — not by widening this one.
+/// Whether `candidate` is a serialised origin as a browser sends it:
+/// `scheme://host` with an optional `:port`, and nothing after that.
+fn is_origin(candidate: &str) -> bool {
+    let Some(rest) = candidate
+        .strip_prefix("https://")
+        .or_else(|| candidate.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    !rest.is_empty()
+        && !rest.contains('/')
+        && !rest.contains(|c: char| c.is_whitespace() || c.is_control())
+}
+
+fn build_cors_layer() -> Option<CorsLayer> {
+    let configured = env::var(CORS_ORIGINS_ENV).unwrap_or_default();
+
+    let mut origins: Vec<HeaderValue> = Vec::new();
+    for entry in configured
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        // `*` is refused rather than translated: combined with credentials it
+        // is not even a legal value, and silently turning it into "any origin"
+        // would reinstate exactly what this replaced.
+        if entry == "*" {
+            eprintln!(
+                "⚠️  CORS: '*' is not accepted in {CORS_ORIGINS_ENV}; list origins explicitly"
+            );
+            continue;
+        }
+        // An origin is scheme + host + optional port and nothing else — no
+        // path, no trailing slash, no spaces. `HeaderValue::from_str` accepts
+        // far more than that, and an entry that merely *looks* configured but
+        // never matches a browser's `Origin` is worse than a rejected one,
+        // because it fails silently at request time instead of loudly here.
+        match is_origin(entry).then(|| HeaderValue::from_str(entry).ok()).flatten() {
+            Some(value) => origins.push(value),
+            None => eprintln!(
+                "⚠️  CORS: ignoring '{entry}' — expected scheme://host[:port], e.g. https://gui.example"
+            ),
+        }
+    }
+
+    if origins.is_empty() {
+        println!("🔒 CORS: no foreign origin allowed (set {CORS_ORIGINS_ENV} to change)");
+        return None;
+    }
+
+    for origin in &origins {
+        let shown = origin.to_str().unwrap_or("<unprintable>");
+        println!("🔓 CORS: allowing origin {}", shown);
+        tracing::info!(origin = %shown, "CORS: origin allowed");
+    }
+
+    Some(
+        CorsLayer::new()
+            .allow_origin(origins)
+            // Credentials are on because a configured origin is a companion
+            // frontend of this same installation, and it needs the session
+            // cookie to get past the guard. It is only ever paired with an
+            // explicit origin list, never with a wildcard.
+            .allow_credentials(true)
+            .allow_methods([Method::GET, Method::POST, Method::DELETE])
+            .allow_headers([header::CONTENT_TYPE])
+            .max_age(Duration::from_secs(600)),
+    )
+}
+
+/// How long open connections get to finish after a shutdown signal.
+///
+/// Deliberately short: `docker stop` allows ten seconds in total before it
+/// sends SIGKILL, and everything after the drain — stopping the rsync daemon —
+/// has to fit into what is left.
+const SERVER_DRAIN_DEADLINE: Duration = Duration::from_secs(3);
+
+/// Upper bound for stopping the rsync daemon. `DaemonHandle::shutdown` has its
+/// own SIGTERM grace period and escalates to SIGKILL; this is only the guard
+/// against a wait that never returns.
+const DAEMON_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(25);
+
+/// Waits for the first shutdown signal and names it.
+///
+/// **SIGTERM belongs here just as much as Ctrl+C.** `docker stop`,
+/// `systemctl stop` and every process manager send SIGTERM, and while only
+/// `ctrl_c` was awaited, none of them reached the cleanup path: the rsync
+/// daemon stayed behind as an orphan holding an flock on its pid file, and the
+/// next start failed with `failed to lock pid file: Resource temporarily
+/// unavailable`. Reproduced twice before this was written.
+///
+/// A signal handler that cannot be installed must not take the server down —
+/// it simply never fires, and the other one still works.
+async fn wait_for_shutdown_signal() -> &'static str {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            eprintln!("⚠️  Ctrl+C handler could not be installed: {}", e);
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(e) => {
+                eprintln!("⚠️  SIGTERM handler could not be installed: {}", e);
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => "SIGINT",
+        _ = terminate => "SIGTERM",
+    }
+}
+
+/// What became of the rsync transport at startup.
+///
+/// Three states, and telling them apart is the point: a default installation
+/// has the transport switched off and must not look like a fault, while a
+/// deployment that switched it on and got no daemon has a problem that used to
+/// be invisible — both collapsed into `None` and were reported as "switched
+/// off" by `/api/rsyncd/status`.
+#[derive(Clone)]
+enum RsyncdState {
+    /// `RCLONE_GUI_RSYNCD` is not `1`. The normal state, not an error.
+    Disabled,
+    /// Switched on, but `DaemonHandle::start` failed. Carries the cause.
+    StartFailed {
+        /// Whether another process holds the port and the pid file lock — the
+        /// one failure a restart cannot fix.
+        already_running_elsewhere: bool,
+        /// The reason, verbatim, for the status display.
+        error: String,
+    },
+    /// Switched on and listening.
+    Running(Arc<handlers::rsyncd::DaemonHandle>),
+}
+
 /// Start the rsync daemon alongside the application, if it is switched on.
 ///
 /// **Off unless `RCLONE_GUI_RSYNCD=1`.** The peer-to-peer transport has no
@@ -355,10 +649,12 @@ async fn get_config_for_edit_handler(
 /// A daemon that cannot be started is logged and does not stop the server: the
 /// web GUI is the product, the rsync transport is one feature of it, and losing
 /// the whole application because rsync is missing from the image would be the
-/// wrong trade. The failure is visible at `/api/rsyncd/status`.
-async fn start_rsync_daemon() -> Option<Arc<handlers::rsyncd::DaemonHandle>> {
+/// wrong trade. The failure is visible at `/api/rsyncd/status`, as a *start
+/// failure with its cause* — not as "switched off", which is what a caller
+/// would otherwise read out of an absent handle.
+async fn start_rsync_daemon() -> RsyncdState {
     if env::var("RCLONE_GUI_RSYNCD").unwrap_or_default() != "1" {
-        return None;
+        return RsyncdState::Disabled;
     }
 
     // The layout the image creates (see the Dockerfile): /etc/rsyncd for the
@@ -380,6 +676,36 @@ async fn start_rsync_daemon() -> Option<Arc<handlers::rsyncd::DaemonHandle>> {
     match handlers::rsyncd::DaemonHandle::start(settings, registry).await {
         Ok(handle) => {
             let status = handle.status().await;
+
+            // "Running" has to mean the port is held, not merely that a
+            // process was spawned. `Ok` here already means the daemon's own
+            // log said "listening on port", but that is the daemon talking
+            // about itself into a file, and a state that claims to be one of
+            // three clean cases must not be the one that lies. So: connect.
+            //
+            // A refused connection is the honest answer to "is it listening",
+            // and the handle is shut down rather than left as an untracked
+            // child — this process reports no daemon, so it holds none.
+            if !daemon_accepts_connections(&status.address, status.port).await {
+                let error = format!(
+                    "the rsync daemon was started (pid {}) but nothing accepts connections on {}:{}",
+                    status
+                        .pid
+                        .map(|pid| pid.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    status.address,
+                    status.port
+                );
+                eprintln!("   ❌ {}", error);
+                eprintln!("      stopping it again; see GET /api/rsyncd/status");
+                handle.shutdown().await;
+                println!();
+                return RsyncdState::StartFailed {
+                    already_running_elsewhere: status.already_running_elsewhere,
+                    error,
+                };
+            }
+
             println!(
                 "   ✅ rsync daemon listening on {}:{} (pid {})",
                 status.address,
@@ -387,30 +713,110 @@ async fn start_rsync_daemon() -> Option<Arc<handlers::rsyncd::DaemonHandle>> {
                 status.pid.unwrap_or(0)
             );
             println!();
-            Some(handle)
+            RsyncdState::Running(handle)
         }
         Err(e) => {
-            eprintln!("   ❌ the rsync daemon did not start: {}", e);
+            // `{:#}` so the anyhow context chain ends up in the message the
+            // status endpoint hands out — "cannot create the daemon run
+            // directory /x: Permission denied" is actionable, the outer
+            // sentence alone is not.
+            let error = format!("{e:#}");
+            eprintln!("   ❌ the rsync daemon did not start: {}", error);
             eprintln!("      the server continues without the rsync transport");
+            eprintln!("      the reason is reported at GET /api/rsyncd/status");
             println!();
-            None
+            // `DaemonHandle::start` reports this case as prose and does not
+            // hand the handle back, so the one distinction the display makes
+            // ("blocked" versus "not running") has to be recovered from the
+            // message. Recognising it is a nicety; failing to recognise it
+            // still yields a start failure with its cause, never "disabled".
+            let already_running_elsewhere = error.contains("pid file lock");
+            RsyncdState::StartFailed {
+                already_running_elsewhere,
+                error,
+            }
         }
     }
 }
 
+/// Whether anything accepts a TCP connection at `address:port`.
+///
+/// The proof that the daemon really holds its port. Retried a few times rather
+/// than asked once: the listener is opened by a freshly forked process, and a
+/// single refused connect a few milliseconds too early would take a working
+/// daemon down. Only a port that stays refused for the whole window counts as
+/// "not listening".
+///
+/// The connection is closed immediately. rsync's daemon forks a child per
+/// connection and logs a `connect from`, so this shows up once as a connection
+/// that ends at the handshake — noise at startup, and the price of not
+/// reporting a state that is untrue.
+async fn daemon_accepts_connections(address: &str, port: u16) -> bool {
+    const ATTEMPTS: usize = 5;
+    const GAP: Duration = Duration::from_millis(300);
+    const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+    for attempt in 0..ATTEMPTS {
+        let connect = tokio::net::TcpStream::connect((address, port));
+        if let Ok(Ok(stream)) = tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
+            drop(stream);
+            return true;
+        }
+        if attempt + 1 < ATTEMPTS {
+            tokio::time::sleep(GAP).await;
+        }
+    }
+    false
+}
+
 /// Whether the daemon is running, where, and which modules it serves.
+///
+/// The three startup states of [`RsyncdState`] map onto the three cases the
+/// configuration display already tells apart, and they map onto them without
+/// asking the frontend to learn anything new:
+///
+///   * **disabled** — `data: null` plus the explanatory `error`. The panel
+///     decides on `data === null` and shows the grey "disabled" badge
+///   * **start failure** — a `DaemonStatus` with `running: false` and the cause
+///     in `last_error`. The panel renders "not running" (or "blocked", when the
+///     port belongs to another process) *and* the error box, which is exactly
+///     the wanted outcome
+///   * **running** — the live status, unchanged
 async fn rsyncd_status_handler(
-    Extension(daemon): Extension<Option<Arc<handlers::rsyncd::DaemonHandle>>>,
+    Extension(rsyncd): Extension<RsyncdState>,
 ) -> axum::response::Json<models::ApiResponse<handlers::rsyncd::DaemonStatus>> {
-    match daemon {
-        Some(daemon) => axum::response::Json(models::ApiResponse {
+    match rsyncd {
+        RsyncdState::Running(daemon) => axum::response::Json(models::ApiResponse {
             success: true,
             data: Some(daemon.status().await),
             error: None,
         }),
-        // Switched off is not an error: the configuration display shows "not
-        // running" rather than a failure the user cannot act on.
-        None => axum::response::Json(models::ApiResponse {
+        // Switched on and broken. Reported as a daemon that is not running,
+        // with the reason attached — never as "switched off", which describes
+        // the normal state and would hide the fault entirely.
+        RsyncdState::StartFailed {
+            already_running_elsewhere,
+            error,
+        } => axum::response::Json(models::ApiResponse {
+            success: true,
+            data: Some(handlers::rsyncd::DaemonStatus {
+                running: false,
+                pid: None,
+                address: handlers::rsyncd::DAEMON_ADDRESS.to_string(),
+                port: handlers::rsyncd::DAEMON_PORT,
+                modules: Vec::new(),
+                active_modules: Vec::new(),
+                connections: 0,
+                restarts: 0,
+                already_running_elsewhere,
+                zombie_children: 0,
+                last_error: Some(error),
+            }),
+            error: None,
+        }),
+        // Switched off is not an error: the configuration display shows
+        // "disabled" rather than a failure the user cannot act on.
+        RsyncdState::Disabled => axum::response::Json(models::ApiResponse {
             success: true,
             data: None,
             error: Some("the rsync transport is switched off (RCLONE_GUI_RSYNCD)".to_string()),
@@ -490,12 +896,42 @@ fn check_index_marker() {
     }
 }
 
-async fn serve_index() -> axum::response::Response {
+/// Serve the application shell.
+///
+/// `window.DEFAULT_PATH` is the directory the file browser opens on
+/// (`static/js/state.js`). Since the data separation that is **not** the global
+/// `RCLONE_GUI_DEFAULT_PATH` any more: every listing resolves against
+/// `users.home_path` and answers 403 for anything else, so injecting the global
+/// path handed every non-admin a foreign directory and a 403 on the very first
+/// request.
+///
+/// The account comes from `Extension<CurrentUser>`, which the session guard put
+/// into the request extensions — the route registration is unchanged, an
+/// `Extension` is just another extractor.
+///
+/// Note on escaping: the value now originates from the **database** and is
+/// therefore settable by an administrator rather than by whoever runs the
+/// process. `js_string_literal()` was already written for that case (it escapes
+/// `<`, `>`, `&` and the two JavaScript line separators on top of the JSON
+/// quoting), which is why a home path containing `</script>` cannot break out.
+async fn serve_index(
+    Extension(current): Extension<handlers::auth_web::CurrentUser>,
+) -> axum::response::Response {
     use axum::response::IntoResponse;
 
-    let default_path =
-        env::var("RCLONE_GUI_DEFAULT_PATH").unwrap_or_else(|_| "/mnt/home".to_string());
-    println!("🏠 Using default path: {}", default_path);
+    let default_path = current.user.home_path.trim().to_string();
+    if default_path.is_empty() {
+        // No 500 here: an account without a home still gets the shell, and the
+        // first listing reports the misconfiguration with a proper message.
+        tracing::warn!(
+            user = %current.user.username,
+            "account has no home path; the file browser will open without a start directory"
+        );
+    }
+    println!(
+        "🏠 Using home path of '{}': {}",
+        current.user.username, default_path
+    );
 
     match render_index(&read_index_html(), &default_path) {
         Some(html) => Html(html).into_response(),
@@ -819,7 +1255,6 @@ async fn handle_cli_task_execution(
     requested_user: Option<String>,
 ) {
     use crate::models::SyncRequest;
-    use axum::extract::Json;
 
     println!("🚀 Starting task '{}' from command line...", task_name);
 
@@ -874,8 +1309,31 @@ async fn handle_cli_task_execution(
         use_chunking: Some(task.use_chunking),
     };
 
-    // Start the sync job
-    let job_response = handlers::sync::start_sync(Json(sync_request)).await;
+    // Start the sync job.
+    //
+    // The CLI bypasses the router and therefore the session guard, so the
+    // `CurrentUser` the guard would have inserted is assembled here from the
+    // account resolved above. `start_sync_for` is the same core the HTTP
+    // handler calls — the source path goes through `resolve_within_root()`
+    // against this user's home either way, so `--start-task` cannot reach
+    // outside it any more than `POST /api/sync` can.
+    //
+    // The session is a stand-in: it is never written to the database, never
+    // handed out and never looked up. It exists because `CurrentUser` carries
+    // one; only `user` is read on this path.
+    let current = handlers::auth_web::CurrentUser {
+        session: database::Session {
+            id: String::new(),
+            user_id: user.id.clone(),
+            created_at: chrono::Utc::now(),
+            expires_at: chrono::Utc::now(),
+            user_agent: Some("rclone-gui --start-task".to_string()),
+            ip: None,
+        },
+        user,
+    };
+
+    let job_response = handlers::sync::start_sync_for(&current, sync_request).await;
     let job_id = match job_response.0.data {
         Some(id) => id,
         None => {

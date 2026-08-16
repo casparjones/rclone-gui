@@ -11,7 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,6 +21,7 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use argon2::password_hash::rand_core::{OsRng, RngCore};
 use tokio::io::{AsyncBufReadExt as _, BufReader};
+use tokio::net::TcpStream;
 use tokio::process::Command as TokioCommand;
 use tokio::sync::Mutex as TokioMutex;
 
@@ -119,6 +120,95 @@ pub const DAEMON_PORT: u16 = 873;
 /// somebody else's share is data loss, not merely an excess of rights.
 pub const REFUSED_OPTIONS: &str =
     "copy-links copy-dirlinks copy-unsafe-links delete remove-source-files";
+
+/// Literal marker at the front of every per-file line the daemon writes.
+///
+/// rsync's `log format` passes literal text through unchanged (measured on
+/// 3.5.0 and 3.4.3), and without such a marker a transfer line is not reliably
+/// distinguishable from the daemon's own prose: both are `[<pid>] <text>`, and
+/// a file name can be anything at all. Anchoring on a string we chose means a
+/// user cannot forge a transfer line by naming a file cleverly — the marker
+/// sits *before* every field the client controls.
+const AUDIT_SENTINEL: &str = "rclone-gui-audit";
+
+/// The `log format` every module is rendered with.
+///
+/// `%a` the address the daemon sees (always loopback behind stunnel, kept so
+/// that the proxy hop is on record), `%u` the authenticated user, `%m` the
+/// module, `%o` the operation (`send`, `recv` or `del.`), `%l` the file's size,
+/// `%b` the bytes actually transferred, `%f` the file name.
+///
+/// The file name is **last** on purpose: it is the only field that may contain
+/// spaces, so every field before it can be split off without ambiguity.
+const MODULE_LOG_FORMAT: &str = "rclone-gui-audit %a %u %m %o %l %b %f";
+
+/// How many audit events are kept in memory for the status API.
+const AUDIT_RING_CAPACITY: usize = 512;
+
+/// How many stunnel connections are kept for correlation.
+const STUNNEL_RING_CAPACITY: usize = 256;
+
+// ---------------------------------------------------------------------------
+// Size watch over the run directory (ticket 0cedda6f)
+//
+// The audit log is append-only and is **not** rotated from here; the reasoning
+// is on [`DaemonSettings::audit_file`] and it stands. What was missing is the
+// operational half of it: the image has neither logrotate nor a quota, and the
+// pid and lock files of the daemon live in the same directory. A run directory
+// that fills up therefore does not merely lose log lines, it stops the
+// transport — and the failure then looks like a daemon fault
+// (`failed to lock pid file`, `cannot create the daemon log`), not like a full
+// disk.
+//
+// So the process watches and says so, and deletes nothing. Rotation happens
+// from outside; `config/logrotate-rclone-gui.conf` is the snippet to install.
+// ---------------------------------------------------------------------------
+
+/// Warn once a single log in the run directory passes this many bytes. `0`
+/// switches the check off.
+///
+/// Applies to each of the three files that grow there — the audit log, the
+/// daemon's own log and the stunnel log — because any one of them alone can
+/// fill the volume the pid and lock file live on.
+///
+/// 64 MiB is roughly 250'000 audit lines — far beyond any plausible retention
+/// need for a single daemon lifetime, and still two orders of magnitude below
+/// the size at which a small volume is in danger. Overridable with
+/// `RCLONE_GUI_LOG_WARN_BYTES` (bytes), mainly so that the threshold can be
+/// reproduced in a test without writing 64 MiB.
+const DEFAULT_LOG_WARN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Warn once everything in the run directory together passes this many bytes.
+///
+/// Catches what the per-file limits do not: the stunnel log, the daemon log and
+/// the audit log each staying under their own threshold while the directory as
+/// a whole grows. Overridable with `RCLONE_GUI_RUN_DIR_WARN_BYTES`.
+const DEFAULT_RUN_DIR_WARN_BYTES: u64 = 256 * 1024 * 1024;
+
+/// How often the run directory is measured.
+///
+/// Once a minute: the warning has to reach somebody who started the container
+/// and left it running, so it cannot be a start-up-only check; and it must not
+/// ride on every audit event either, or it drowns in the transfer it is
+/// warning about. Measuring costs one `stat` per file plus one `read_dir`.
+const RUN_DIR_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How long a warning stays "already said" before it is repeated.
+///
+/// A file over its limit is over it on every subsequent check as well. Without
+/// this the warning would repeat every minute for as long as the container
+/// lives, which is the same as not warning at all. It is repeated when the
+/// condition persists (every 15 minutes) or when the file has doubled since
+/// the last warning, whichever comes first — growth is the part that matters.
+const RUN_DIR_WARN_REPEAT: Duration = Duration::from_secs(15 * 60);
+
+/// How far back a stunnel line may lie to still be matched by time alone.
+///
+/// Only used when the exact match over the port failed (see
+/// [`peer_port_of_child`]). Thirty seconds is generous for a connection that is
+/// being accepted and forwarded in the same instant, and short enough that an
+/// unrelated earlier connection is not silently adopted.
+const STUNNEL_MATCH_WINDOW: Duration = Duration::from_secs(30);
 
 /// Prefix of a generated module name. Carries no information about the share.
 const MODULE_NAME_PREFIX: &str = "pair";
@@ -294,7 +384,9 @@ fn canonical_share_root(root: &Path) -> Result<String> {
 // ---------------------------------------------------------------------------
 
 /// One rsync module: exactly one pairing, exactly one shared directory.
-#[derive(Debug, Clone)]
+///
+/// `Debug` is implemented by hand rather than derived; see the impl below.
+#[derive(Clone)]
 pub struct ModuleConfig {
     /// Random, unguessable module name; also the `auth users` entry.
     name: String,
@@ -310,6 +402,30 @@ pub struct ModuleConfig {
     gid: u32,
     /// Concurrent connections allowed for this module.
     max_connections: u32,
+}
+
+/// Redacts the secret.
+///
+/// The field's doc comment says "never logged", but a derived `Debug` does not
+/// enforce that — it prints every field, and one `tracing::debug!(?module)`
+/// anywhere, now or in a year, would put a module secret into the application
+/// log in plain text. The same derive reaches the secret through
+/// [`DaemonConfig`], which contains the modules and derives `Debug` itself.
+/// Redacting here is the only place that covers both, and it makes the promise
+/// in the doc comment something the compiler keeps rather than something the
+/// next author has to remember.
+impl std::fmt::Debug for ModuleConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModuleConfig")
+            .field("name", &self.name)
+            .field("secret", &"<redacted>")
+            .field("path", &self.path)
+            .field("read_only", &self.read_only)
+            .field("uid", &self.uid)
+            .field("gid", &self.gid)
+            .field("max_connections", &self.max_connections)
+            .finish()
+    }
 }
 
 impl ModuleConfig {
@@ -421,7 +537,9 @@ impl ModuleConfig {
              \x20   gid = {gid}\n\
              \x20   max connections = {max_connections}\n\
              {temp_dir}\
-             \x20   refuse options = {refused}\n",
+             \x20   refuse options = {refused}\n\
+             \x20   transfer logging = yes\n\
+             \x20   log format = {log_format}\n",
             name = self.name,
             path = self.path,
             secrets = secrets_file,
@@ -430,6 +548,7 @@ impl ModuleConfig {
             gid = self.gid,
             max_connections = self.max_connections,
             refused = REFUSED_OPTIONS,
+            log_format = MODULE_LOG_FORMAT,
         ))
     }
 
@@ -458,6 +577,11 @@ pub struct DaemonConfig {
     /// See the extensive note on [`DaemonConfig::with_proxy_protocol`]; `None`
     /// is the only setting that works with the rsync in the current image.
     proxy_protocol_hosts: Option<String>,
+    /// Where the daemon writes its log, or `None` to leave it to syslog.
+    ///
+    /// See [`DaemonConfig::with_log_file`] for why this has to be in the file
+    /// rather than on the command line.
+    log_file: Option<PathBuf>,
     modules: Vec<ModuleConfig>,
 }
 
@@ -470,8 +594,65 @@ impl DaemonConfig {
         Self {
             secrets_file: secrets_file.into(),
             proxy_protocol_hosts: None,
+            log_file: None,
             modules: Vec::new(),
         }
+    }
+
+    /// Write the daemon log to `path` — from the configuration file, not from
+    /// `--log-file`.
+    ///
+    /// # The measurement this exists for
+    ///
+    /// `--log-file=<path>` on the command line is what the lifecycle ticket
+    /// started the daemon with, and it **suppresses per-file logging
+    /// altogether**. Measured on rsync 3.5.0 (host) and 3.4.3 (alpine:3.22, the
+    /// image), with `transfer logging = yes` in the module, the whole log of a
+    /// completed transfer was:
+    ///
+    /// ```text
+    /// [21] connect from localhost (127.0.0.1)
+    /// [21] rsync allowed access on module m1 from localhost (127.0.0.1)
+    /// ```
+    ///
+    /// and nothing else. That does not change with `%i` in the format, with
+    /// `--log-file-format`, with `-v` or `-vv` on the daemon, or with `-v` on
+    /// the client — six variants, all empty. With `log file = <path>` in
+    /// `rsyncd.conf` instead, the same transfer writes:
+    ///
+    /// ```text
+    /// [21] connect from localhost (127.0.0.1)
+    /// [21] rsync allowed access on module m1 from localhost (127.0.0.1)
+    /// [21] rsync to m1/ from m1@localhost (127.0.0.1)
+    /// [21] rclone-gui-audit 127.0.0.1 m1 m1 recv 62914560 62922276 big.bin
+    /// [21] sent 40 bytes  received 62930045 bytes  total size 62914560
+    /// ```
+    ///
+    /// The reason is that the connection child re-opens its log from the
+    /// configuration once it knows which module was asked for. Setting **both**
+    /// therefore splits the log across two files — the startup line and
+    /// `connect from` go to the `--log-file` one, everything from the module
+    /// choice onwards to the configured one (measured on 3.4.3). So the switch
+    /// is dropped from [`DaemonSettings::argv`] and the path is rendered here.
+    ///
+    /// This also corrects a claim of the lifecycle ticket: "rsync logs nothing
+    /// when a connection ends" was a consequence of `--log-file`, not of the
+    /// daemon. Each child now writes its own `sent … received … total size …`
+    /// line. `/proc` stays the authority for the connection table all the same,
+    /// because an aborted connection still writes nothing.
+    pub fn with_log_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.log_file = Some(path.into());
+        self
+    }
+
+    /// Set the log file after construction. See [`DaemonConfig::with_log_file`].
+    pub fn set_log_file(&mut self, path: impl Into<PathBuf>) {
+        self.log_file = Some(path.into());
+    }
+
+    /// Where the daemon has been told to write its log.
+    pub fn log_file(&self) -> Option<&Path> {
+        self.log_file.as_deref()
     }
 
     /// Make the daemon expect a PROXY protocol header from `hosts`.
@@ -548,6 +729,17 @@ impl DaemonConfig {
         );
         out.push_str(&format!("address = {DAEMON_ADDRESS}\n"));
         out.push_str(&format!("port = {DAEMON_PORT}\n"));
+        if let Some(log_file) = &self.log_file {
+            let log_file = log_file
+                .to_str()
+                .ok_or_else(|| anyhow!("the daemon log path is not valid UTF-8"))?;
+            check_conf_value("log file", log_file)?;
+            // Not `--log-file` on the command line: that switch silences the
+            // per-file audit lines entirely. See `with_log_file`.
+            out.push_str("# \"log file\" here rather than --log-file: the command line switch\n\
+                          # suppresses per-file transfer logging. See DaemonConfig::with_log_file.\n");
+            out.push_str(&format!("log file = {log_file}\n"));
+        }
         match &self.proxy_protocol_hosts {
             Some(hosts) => {
                 check_conf_value("proxy protocol hosts", hosts)?;
@@ -768,6 +960,13 @@ impl ModuleRegistry {
     /// The configuration as it stands on disk.
     pub fn config(&self) -> &DaemonConfig {
         &self.config
+    }
+
+    /// Tell the daemon where to write its log. See
+    /// [`DaemonConfig::with_log_file`] — it belongs in the configuration file,
+    /// not on the command line, or the audit lines never appear.
+    pub fn set_log_file(&mut self, path: impl Into<PathBuf>) {
+        self.config.set_log_file(path);
     }
 
     /// The modules currently configured.
@@ -1072,6 +1271,14 @@ const RESTART_BACKOFF_MAX: Duration = Duration::from_secs(30);
 const SIGTERM_GRACE: Duration = Duration::from_secs(10);
 /// Poll interval while following the daemon's log file.
 const LOG_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// How long a start waits for the daemon to accept a connection.
+const LISTEN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Delay between connect attempts while waiting for the daemon to bind.
+///
+/// A refused connection on loopback comes back at once, so this is the whole
+/// cost of a poll. Short, because the wait sits in the application's startup
+/// path and the daemon usually binds within a few milliseconds.
+const LISTEN_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 /// A file in a module temp directory younger than this is left alone.
 ///
 /// The sweep only ever looks inside [`MODULE_TEMP_DIR`], so this is not a
@@ -1099,21 +1306,80 @@ pub struct DaemonSettings {
     extra_dparams: Vec<String>,
     temp_file_min_age: Duration,
     sweep_temp_files: bool,
+    /// Where stunnel writes its log, the only source of the real client IP.
+    stunnel_log: Option<PathBuf>,
+    /// Whether the audit log is written to disk as well as to `tracing`.
+    write_audit_file: bool,
+    /// Size of the audit log at which the watchdog warns. `0` disables it.
+    log_warn_bytes: u64,
+    /// Size of the whole run directory at which the watchdog warns.
+    run_dir_warn_bytes: u64,
 }
 
 impl DaemonSettings {
     /// Settings for the configuration at `conf_path`, with the pid, lock and
     /// log files under `run_dir`.
     pub fn new(conf_path: impl Into<PathBuf>, run_dir: impl Into<PathBuf>) -> Self {
+        let conf_path = conf_path.into();
+        let stunnel_log = default_stunnel_log(&conf_path);
         Self {
             binary: PathBuf::from(DEFAULT_RSYNC_BINARY),
-            conf_path: conf_path.into(),
+            conf_path,
             run_dir: run_dir.into(),
             port: DAEMON_PORT,
             extra_dparams: Vec::new(),
             temp_file_min_age: DEFAULT_TEMP_FILE_MIN_AGE,
             sweep_temp_files: true,
+            stunnel_log,
+            write_audit_file: true,
+            log_warn_bytes: size_limit_from_env(
+                "RCLONE_GUI_LOG_WARN_BYTES",
+                DEFAULT_LOG_WARN_BYTES,
+            ),
+            run_dir_warn_bytes: size_limit_from_env(
+                "RCLONE_GUI_RUN_DIR_WARN_BYTES",
+                DEFAULT_RUN_DIR_WARN_BYTES,
+            ),
         }
+    }
+
+    /// Read the real client addresses from the stunnel log at `path`.
+    ///
+    /// See [`StunnelIndex`] for what is read out of it and why there is no
+    /// other source for the peer address.
+    pub fn with_stunnel_log(mut self, path: impl Into<PathBuf>) -> Self {
+        self.stunnel_log = Some(path.into());
+        self
+    }
+
+    /// Do not try to correlate with stunnel at all. The audit log then records
+    /// the client address as unavailable rather than guessing.
+    pub fn without_stunnel_log(mut self) -> Self {
+        self.stunnel_log = None;
+        self
+    }
+
+    /// Keep the audit log in memory only, without the file next to the daemon's.
+    pub fn without_audit_file(mut self) -> Self {
+        self.write_audit_file = false;
+        self
+    }
+
+    /// Warn once any single log in the run directory is larger than `bytes`.
+    /// `0` turns it off.
+    ///
+    /// The watchdog only ever *reports*; see [`RunDirWatch`] for why it does
+    /// not truncate anything it looks at.
+    pub fn with_log_warn_bytes(mut self, bytes: u64) -> Self {
+        self.log_warn_bytes = bytes;
+        self
+    }
+
+    /// Warn once the whole run directory is larger than `bytes`. `0` turns it
+    /// off.
+    pub fn with_run_dir_warn_bytes(mut self, bytes: u64) -> Self {
+        self.run_dir_warn_bytes = bytes;
+        self
     }
 
     /// Use a different rsync binary, e.g. one inside a container.
@@ -1171,12 +1437,46 @@ impl DaemonSettings {
         self.run_dir.join("rsyncd.log")
     }
 
+    /// The audit log: one JSON object per line, next to the daemon's own log.
+    ///
+    /// **This file is append-only and is never rotated or truncated here.** The
+    /// in-memory ring behind [`DaemonHandle::audit_events`] is capped at
+    /// [`AUDIT_RING_CAPACITY`], the file is not: it grows with every transferred
+    /// file, for as long as the daemon runs.
+    ///
+    /// That is deliberate and it is stated rather than quietly fixed. Rotating
+    /// an audit log from inside the process that writes it means the process
+    /// can also delete evidence, and a size cap that silently drops the oldest
+    /// lines turns "there is no record of it" into an ambiguous statement.
+    /// Whoever operates this deployment rotates the file from outside
+    /// (logrotate, a volume with a quota) — but they have to know that they
+    /// must, which is what this note is for.
+    ///
+    /// Since ticket 0cedda6f they are also *told*: [`RunDirWatch`] measures
+    /// this file and the rest of the run directory once a minute and warns
+    /// when it passes [`DaemonSettings::log_warn_bytes`]. It still deletes
+    /// nothing. `config/logrotate-rclone-gui.conf` is the rotation the warning
+    /// points at; the sink opens this file per line (see [`AuditSink::record`]),
+    /// so a plain rename-and-create rotation needs no signal and loses no line.
+    pub fn audit_file(&self) -> PathBuf {
+        self.run_dir.join("audit.log")
+    }
+
+    /// Where stunnel has been told to write its log, if anywhere.
+    pub fn stunnel_log(&self) -> Option<&Path> {
+        self.stunnel_log.as_deref()
+    }
+
     /// The port the daemon listens on.
     pub fn port(&self) -> u16 {
         self.port
     }
 
     /// The full argument vector, in the order the daemon sees it.
+    ///
+    /// Deliberately **without** `--log-file`: that switch silences the per-file
+    /// audit lines, and the path is rendered into `rsyncd.conf` instead. The
+    /// full measurement is on [`DaemonConfig::with_log_file`].
     fn argv(&self) -> Vec<String> {
         let mut args = vec![
             "--daemon".to_string(),
@@ -1185,13 +1485,555 @@ impl DaemonSettings {
             format!("--port={}", self.port),
             format!("--dparam=pid file={}", self.pid_file().display()),
             format!("--dparam=lock file={}", self.lock_file().display()),
-            format!("--log-file={}", self.log_file().display()),
         ];
         for param in &self.extra_dparams {
             args.push(format!("--dparam={param}"));
         }
         args
     }
+}
+
+/// Where the stunnel log is expected when nobody says otherwise.
+///
+/// `config/rsync-tls.sh` renders `stunnel.conf` next to `rsyncd.conf` (both
+/// under `$RSYNCD_DIR`), so the log belongs there too and no deployment has to
+/// configure a path. `RCLONE_GUI_STUNNEL_LOG` overrides it for a deployment
+/// that puts it elsewhere.
+fn default_stunnel_log(conf_path: &Path) -> Option<PathBuf> {
+    if let Ok(from_env) = std::env::var("RCLONE_GUI_STUNNEL_LOG") {
+        let trimmed = from_env.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        return Some(PathBuf::from(trimmed));
+    }
+    Some(conf_path.parent()?.join("stunnel.log"))
+}
+
+// ---------------------------------------------------------------------------
+// Audit log
+//
+// The question this answers is "who used which module, when, and with what
+// effect" — and it is answered out of two log files, not one, because neither
+// of them holds the whole answer.
+//
+// What the *daemon* log holds, all of it measured on rsync 3.5.0 (host) and
+// 3.4.3 (alpine:3.22, the image), with `log file` in the configuration (see
+// `DaemonConfig::with_log_file` for why that matters):
+//
+//   [21] connect from localhost (127.0.0.1)
+//   [21] rsync allowed access on module m1 from localhost (127.0.0.1)
+//   [21] rsync to m1/ from m1@localhost (127.0.0.1)          <- write session
+//   [26] rsync on m1/ from m1@localhost (127.0.0.1)          <- read session
+//   [21] rclone-gui-audit 127.0.0.1 m1 m1 recv 6 6 a.txt     <- one per file
+//   [24] rsync: The server is configured to refuse --delete   <- refused option
+//   [21] sent 40 bytes  received 62930045 bytes  total size 62914560
+//   [45] auth failed on module m1 from localhost (127.0.0.1) for m1: password mismatch
+//   [46] unknown module 'x' tried from localhost (127.0.0.1)
+//
+// What it does **not** hold, and what no amount of verbosity produces:
+//
+//   * the client's option list. `-v` and `-vv` on the daemon were measured and
+//     add only `receiving file list` and a `./` line. rsync never logs the
+//     arguments it was given. What is recorded instead is what is observable:
+//     the direction of the session, the operation per file, and every option
+//     the daemon *refused* — which is the interesting half anyway.
+//   * the client's address. It is always loopback, because stunnel terminates
+//     TLS there. Reporting it as the client would be a lie, so it is not
+//     reported at all: see `ClientAddressSource`.
+//
+// The real address comes from the stunnel log, and the two are joined over the
+// port — see `StunnelIndex` and `peer_port_of_child`.
+// ---------------------------------------------------------------------------
+
+/// What happened, in the audit log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditAction {
+    /// A connection reached the daemon, before any module was named.
+    Connected,
+    /// Authentication succeeded for a module.
+    AccessGranted,
+    /// Authentication failed, or a module that does not exist was asked for.
+    AccessDenied,
+    /// The session's direction became known: the client is writing.
+    SessionWrite,
+    /// The session's direction became known: the client is reading.
+    SessionRead,
+    /// One file was written into the module.
+    FileReceived,
+    /// One file was read out of the module.
+    FileSent,
+    /// One file was **deleted** in the module.
+    FileDeleted,
+    /// The daemon refused an option the client asked for.
+    OptionRefused,
+    /// The session ended with rsync's own summary.
+    SessionEnd,
+    /// The daemon reported an error inside a session.
+    Error,
+}
+
+impl AuditAction {
+    /// Whether this action destroyed data, or tried to.
+    ///
+    /// The two are deliberately in one flag: today `--delete` is refused
+    /// unconditionally (see [`REFUSED_OPTIONS`]), so a real
+    /// [`AuditAction::FileDeleted`] cannot occur through a generated module at
+    /// all and the only visible destruction is the *attempt*. An audit log that
+    /// only marked successful deletions would therefore mark nothing, ever,
+    /// and would look identical whether or not anybody had tried. Both are
+    /// marked, and the action says which of the two it was.
+    fn is_destructive(self) -> bool {
+        matches!(self, AuditAction::FileDeleted)
+    }
+}
+
+/// Where the client address in an audit event came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientAddressSource {
+    /// From the stunnel log, matched to this session over the backend port.
+    /// The exact case: no guessing involved.
+    StunnelPort,
+    /// From the stunnel log, matched by time because the port lookup came up
+    /// empty (a very short connection, or `/proc` not readable). One of
+    /// several concurrent connections could in principle be confused this way,
+    /// which is why it is a distinct value and not folded into the one above.
+    StunnelTime,
+    /// No address. Either stunnel does not write a log we can read, or nothing
+    /// in it matched.
+    ///
+    /// **Not** filled in with the loopback address from the daemon log. That
+    /// address is stunnel's, not the client's, and an audit log that records
+    /// `127.0.0.1` for every peer on earth has failed at its one job while
+    /// looking complete. Absent and honest beats present and wrong.
+    Unavailable,
+}
+
+/// One line of the audit log.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct AuditEvent {
+    /// The daemon's own timestamp for the line, `YYYY/MM/DD HH:MM:SS` local.
+    /// Taken from the log rather than from the clock here, so it is the moment
+    /// the daemon acted and not the moment we got round to reading it.
+    pub at: String,
+    /// The daemon child that served this connection.
+    pub pid: u32,
+    /// The module, once it is known.
+    pub module: Option<String>,
+    /// The authenticated user, once it is known. For a generated pairing this
+    /// equals the module name (`auth users = <module>`).
+    pub user: Option<String>,
+    /// The real client address, or `None`. See [`ClientAddressSource`].
+    pub client: Option<String>,
+    /// The client's source port on the TLS side, when it is known.
+    pub client_port: Option<u16>,
+    /// How the address was established.
+    pub client_source: ClientAddressSource,
+    /// What happened.
+    pub action: AuditAction,
+    /// Whether data was destroyed. Attempts are recorded as
+    /// [`AuditAction::OptionRefused`] with `refused_option` set.
+    pub destructive: bool,
+    /// The file, for the per-file actions.
+    pub path: Option<String>,
+    /// The file's size, for the per-file actions.
+    pub size: Option<u64>,
+    /// The option the daemon refused, for [`AuditAction::OptionRefused`].
+    pub refused_option: Option<String>,
+    /// The log line this was derived from, verbatim, minus the timestamp and
+    /// pid. Keeping it means a reader is never left wondering what the daemon
+    /// actually said.
+    pub detail: String,
+}
+
+impl AuditEvent {
+    /// Whether this event is a delete or an attempt at one.
+    ///
+    /// Both halves matter and they are easy to conflate: `destructive` says
+    /// data was actually removed, this says the session was *about* removing
+    /// data. With the shipped `refuse options` only the second can ever be
+    /// true.
+    pub fn concerns_deletion(&self) -> bool {
+        self.destructive
+            || self
+                .refused_option
+                .as_deref()
+                .is_some_and(is_destructive_option)
+    }
+}
+
+/// Whether a refused option name is one that destroys data.
+///
+/// The names are the ones rsync prints in `The server is configured to refuse
+/// --<name>`, so they arrive without the leading dashes here. `delete` covers
+/// the whole family (`--delete`, `--delete-before`, … `--delete-missing-args`),
+/// `remove-source-files` empties the *sender's* directory. Both are in
+/// [`REFUSED_OPTIONS`] and both are marked.
+fn is_destructive_option(option: &str) -> bool {
+    let option = option.trim_start_matches('-');
+    option.starts_with("delete") || option == "remove-source-files" || option == "del"
+}
+
+/// What is known about one connection while it is running.
+#[derive(Debug, Clone, Default)]
+struct Session {
+    module: Option<String>,
+    user: Option<String>,
+    client: Option<String>,
+    client_port: Option<u16>,
+    client_source: Option<ClientAddressSource>,
+}
+
+/// Writes audit events to their file and into the application log.
+///
+/// The in-memory ring lives on [`DaemonState`] so that the status API can read
+/// it; this only owns the file. A failure to write is logged once and then
+/// swallowed: an audit log that cannot be written is bad, a daemon that stops
+/// serving because of it is worse, and the `tracing` copy still gets out.
+#[derive(Debug)]
+struct AuditSink {
+    path: Option<PathBuf>,
+    complained: bool,
+}
+
+impl AuditSink {
+    fn new(path: Option<PathBuf>) -> Self {
+        Self {
+            path,
+            complained: false,
+        }
+    }
+
+    /// Record one event. Never fails; see the note on the struct.
+    fn record(&mut self, event: &AuditEvent) {
+        tracing::info!(
+            target: "rsync_audit",
+            pid = event.pid,
+            module = event.module.as_deref().unwrap_or("-"),
+            user = event.user.as_deref().unwrap_or("-"),
+            client = event.client.as_deref().unwrap_or("unavailable"),
+            client_source = ?event.client_source,
+            action = ?event.action,
+            destructive = event.destructive,
+            path = event.path.as_deref().unwrap_or("-"),
+            "rsync audit: {}",
+            event.detail
+        );
+        let Some(path) = &self.path else { return };
+        let Ok(line) = serde_json::to_string(event) else {
+            return;
+        };
+        let written = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(FILE_MODE)
+            .open(path)
+            .and_then(|mut file| writeln!(file, "{line}"));
+        if let Err(e) = written {
+            if !self.complained {
+                self.complained = true;
+                tracing::warn!(
+                    audit_log = %path.display(),
+                    error = %e,
+                    "cannot write the rsync audit log; events stay in the application log"
+                );
+            }
+        }
+    }
+}
+
+/// One connection as stunnel saw it.
+#[derive(Debug, Clone)]
+struct StunnelConnection {
+    /// stunnel's own timestamp, `YYYY.MM.DD HH:MM:SS` local.
+    at: Option<chrono::NaiveDateTime>,
+    /// The real client address.
+    peer: String,
+    /// The client's source port.
+    peer_port: u16,
+    /// stunnel's source port towards the daemon — the join key.
+    backend_port: Option<u16>,
+    /// Whether a daemon session has already taken this entry.
+    claimed: bool,
+}
+
+/// Reads the stunnel log and answers "which client is behind this session".
+///
+/// # Why this file at all
+///
+/// The daemon log records `connect from localhost (127.0.0.1)` for every peer
+/// on earth, because stunnel terminates TLS on the loopback interface. The
+/// real address exists in exactly one place, stunnel's own log at `debug = 5`:
+///
+/// ```text
+/// 2026.08.16 05:44:45 LOG5[0]: Service [rsyncd-tls] accepted connection from 192.168.224.3:51840
+/// 2026.08.16 05:44:45 LOG5[0]: Service [rsyncd-tls] connected remote server from 127.0.0.1:38790
+/// ```
+///
+/// `proxy protocol` would carry the address into the daemon instead, and it
+/// was measured to work on 3.4.3 — it is off by choice, not by necessity.
+/// `proxy protocol hosts` is unknown to 3.4.3 (`Unknown Parameter
+/// encountered`), so the list of trusted proxies has no effect there and the
+/// daemon would believe any PROXY header that reached it. The address in the
+/// stunnel log cannot be forged that way. See
+/// [`DaemonConfig::with_proxy_protocol`] and `docs/rsync-transport.md`.
+///
+/// # How the two logs are joined
+///
+/// The second stunnel line gives the **source port stunnel uses towards the
+/// daemon**, and both lines carry the same thread id in `LOG5[<id>]`. On the
+/// daemon side that same port is readable from `/proc` for the connection
+/// child (see [`peer_port_of_child`]). Matching on it is exact.
+///
+/// Time is the fallback, not the method: with `max connections = 4` several
+/// sessions can open inside one second, and rsync's log resolution is one
+/// second. A match made that way is labelled [`ClientAddressSource::StunnelTime`]
+/// so a reader can tell the two apart.
+#[derive(Debug)]
+struct StunnelIndex {
+    path: PathBuf,
+    offset: u64,
+    pending: String,
+    /// stunnel thread id -> index into `connections`, to join the two lines.
+    by_thread: HashMap<String, usize>,
+    connections: std::collections::VecDeque<StunnelConnection>,
+    /// How many entries have been dropped off the front, so that the indices
+    /// in `by_thread` stay meaningful.
+    dropped: usize,
+    /// Set once the missing log has been reported, so it is said once.
+    complained: bool,
+}
+
+impl StunnelIndex {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            offset: 0,
+            pending: String::new(),
+            by_thread: HashMap::new(),
+            connections: std::collections::VecDeque::new(),
+            dropped: 0,
+            complained: false,
+        }
+    }
+
+    /// Read whatever stunnel has appended since the last call.
+    async fn refresh(&mut self) {
+        match read_from(&self.path, self.offset).await {
+            Ok((chunk, new_offset)) => {
+                self.offset = new_offset;
+                self.pending.push_str(&chunk);
+                while let Some(index) = self.pending.find('\n') {
+                    let line: String = self.pending.drain(..=index).collect();
+                    self.ingest(line.trim_end());
+                }
+            }
+            Err(e) => {
+                if !self.complained {
+                    self.complained = true;
+                    tracing::warn!(
+                        stunnel_log = %self.path.display(),
+                        error = %e,
+                        "cannot read the stunnel log, so the audit log cannot name the real \
+                         client address; add `output = <path>` to the stunnel configuration \
+                         (config/stunnel-rsyncd.conf.template) or set RCLONE_GUI_STUNNEL_LOG"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Parse one stunnel line, keeping only what a join needs.
+    fn ingest(&mut self, line: &str) {
+        let Some(thread) = stunnel_thread_id(line) else {
+            return;
+        };
+        if let Some((peer, peer_port)) = stunnel_accepted_peer(line) {
+            let connection = StunnelConnection {
+                at: parse_stunnel_time(line),
+                peer,
+                peer_port,
+                backend_port: None,
+                claimed: false,
+            };
+            self.connections.push_back(connection);
+            self.by_thread
+                .insert(thread, self.dropped + self.connections.len() - 1);
+            while self.connections.len() > STUNNEL_RING_CAPACITY {
+                self.connections.pop_front();
+                self.dropped += 1;
+            }
+            self.by_thread.retain(|_, index| *index >= self.dropped);
+            return;
+        }
+        if let Some(backend_port) = stunnel_backend_port(line) {
+            if let Some(index) = self.by_thread.get(&thread) {
+                if let Some(entry) = index
+                    .checked_sub(self.dropped)
+                    .and_then(|i| self.connections.get_mut(i))
+                {
+                    entry.backend_port = Some(backend_port);
+                }
+            }
+        }
+    }
+
+    /// The client behind a session, by port if possible, by time otherwise.
+    fn lookup(
+        &mut self,
+        backend_port: Option<u16>,
+        at: Option<chrono::NaiveDateTime>,
+    ) -> Option<(String, u16, ClientAddressSource)> {
+        if let Some(port) = backend_port {
+            if let Some(entry) = self
+                .connections
+                .iter_mut()
+                .rev()
+                .find(|c| c.backend_port == Some(port))
+            {
+                entry.claimed = true;
+                return Some((
+                    entry.peer.clone(),
+                    entry.peer_port,
+                    ClientAddressSource::StunnelPort,
+                ));
+            }
+        }
+        let at = at?;
+        let window = chrono::Duration::from_std(STUNNEL_MATCH_WINDOW).ok()?;
+        let entry = self
+            .connections
+            .iter_mut()
+            .rev()
+            .filter(|c| !c.claimed)
+            .find(|c| match c.at {
+                // stunnel accepts before the daemon logs the connection, but
+                // the two clocks are the same clock and rsync's resolution is
+                // whole seconds, so a line one second "after" is still the
+                // same connection.
+                Some(stunnel_at) => {
+                    stunnel_at <= at + chrono::Duration::seconds(1) && at - stunnel_at <= window
+                }
+                None => false,
+            })?;
+        entry.claimed = true;
+        Some((
+            entry.peer.clone(),
+            entry.peer_port,
+            ClientAddressSource::StunnelTime,
+        ))
+    }
+}
+
+/// The thread id stunnel puts in `LOG5[<id>]`.
+fn stunnel_thread_id(line: &str) -> Option<String> {
+    let start = line.find("LOG")?;
+    let open = line[start..].find('[')? + start;
+    let close = line[open..].find(']')? + open;
+    Some(line[open + 1..close].to_string())
+}
+
+/// `accepted connection from <ip>:<port>` — the real client.
+fn stunnel_accepted_peer(line: &str) -> Option<(String, u16)> {
+    let marker = "accepted connection from ";
+    split_host_port(line[line.find(marker)? + marker.len()..].trim())
+}
+
+/// `connected remote server from <ip>:<port>` — stunnel's port towards us.
+fn stunnel_backend_port(line: &str) -> Option<u16> {
+    let marker = "connected remote server from ";
+    Some(split_host_port(line[line.find(marker)? + marker.len()..].trim())?.1)
+}
+
+/// Split `<host>:<port>`, tolerating the bracketed IPv6 form.
+fn split_host_port(value: &str) -> Option<(String, u16)> {
+    let value = value.split_whitespace().next()?;
+    let colon = value.rfind(':')?;
+    let host = value[..colon].trim_matches(['[', ']']);
+    let port = value[colon + 1..].parse().ok()?;
+    if host.is_empty() {
+        return None;
+    }
+    Some((host.to_string(), port))
+}
+
+/// The `YYYY.MM.DD HH:MM:SS` at the front of a stunnel line.
+fn parse_stunnel_time(line: &str) -> Option<chrono::NaiveDateTime> {
+    chrono::NaiveDateTime::parse_from_str(line.get(..19)?, "%Y.%m.%d %H:%M:%S").ok()
+}
+
+/// The `YYYY/MM/DD HH:MM:SS` at the front of an rsync log line.
+fn parse_rsync_time(line: &str) -> Option<chrono::NaiveDateTime> {
+    chrono::NaiveDateTime::parse_from_str(line.get(..19)?, "%Y/%m/%d %H:%M:%S").ok()
+}
+
+/// The port the other end of a connection child's socket is using.
+///
+/// The child inherits the accepted socket, so `/proc/<pid>/fd` holds exactly
+/// one socket whose local port is the daemon's. Its remote port is stunnel's
+/// source port, which is what the stunnel log's second line names — that is
+/// the join. Measured against a running transfer:
+///
+/// ```text
+/// fd=3 inode=10187486 local=0100007F:22A9 remote=0100007F:9A62
+/// ```
+///
+/// (`0x22A9` = 8873, the probe's daemon port; `0x9A62` = 39522, stunnel's.)
+///
+/// `None` for a connection that has already ended, for a `/proc` this process
+/// may not read, and on anything without `/proc`. Every one of those is a
+/// fallback to the time match, not an error.
+fn peer_port_of_child(pid: u32, local_port: u16) -> Option<u16> {
+    let mut inodes = HashSet::new();
+    for entry in fs::read_dir(format!("/proc/{pid}/fd")).ok()?.flatten() {
+        let Ok(target) = fs::read_link(entry.path()) else {
+            continue;
+        };
+        let Some(target) = target.to_str() else {
+            continue;
+        };
+        if let Some(inode) = target
+            .strip_prefix("socket:[")
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            inodes.insert(inode.to_string());
+        }
+    }
+    if inodes.is_empty() {
+        return None;
+    }
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(content) = fs::read_to_string(table) else {
+            continue;
+        };
+        for line in content.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            // sl, local_address, rem_address, st, tx:rx, tr:when, retrnsmt,
+            // uid, timeout, inode
+            let (Some(local), Some(remote), Some(inode)) =
+                (fields.get(1), fields.get(2), fields.get(9))
+            else {
+                continue;
+            };
+            if !inodes.contains(*inode) {
+                continue;
+            }
+            if hex_port(local) != Some(local_port) {
+                continue;
+            }
+            if let Some(port) = hex_port(remote) {
+                return Some(port);
+            }
+        }
+    }
+    None
+}
+
+/// The port out of a `/proc/net/tcp` address, `<hex address>:<hex port>`.
+fn hex_port(address: &str) -> Option<u16> {
+    u16::from_str_radix(address.rsplit(':').next()?, 16).ok()
 }
 
 /// What the application knows about the daemon right now.
@@ -1239,9 +2081,32 @@ struct DaemonState {
     pid: Option<u32>,
     restarts: u32,
     already_running_elsewhere: bool,
+    /// The process holding the pid file lock while `already_running_elsewhere`
+    /// is set. Without it the operator is told that something blocks the start
+    /// but not what, which is the dead end this exists to end. It reaches them
+    /// through the start error and the application log; adding it to
+    /// [`DaemonStatus`] as well belongs to whoever owns the status display.
+    blocking_pid: Option<u32>,
+    /// How often a daemon attempt has finished — exited, or failed to spawn at
+    /// all — since the handle was created.
+    ///
+    /// [`DaemonHandle::wait_until_listening`] watches this so that a start
+    /// which dies immediately is reported at once instead of sitting out the
+    /// full timeout. Before it existed, a missing rsync binary delayed the
+    /// whole web server by 30 seconds.
+    exits: u32,
     last_error: Option<String>,
     /// Child pid of the daemon -> the module that connection is serving.
     connections: HashMap<u32, String>,
+    /// Child pid -> what is known about that connection so far. Kept beside
+    /// `connections` rather than inside it because `connections` is the set a
+    /// revoke signals and must not grow entries for sessions that never named
+    /// a module.
+    sessions: HashMap<u32, Session>,
+    /// The most recent audit events, newest last. Bounded by
+    /// [`AUDIT_RING_CAPACITY`]; the file next to the daemon log is the complete
+    /// record.
+    audit: std::collections::VecDeque<AuditEvent>,
 }
 
 /// A running daemon, plus the modules it serves.
@@ -1258,6 +2123,12 @@ pub struct DaemonHandle {
     state: Arc<TokioMutex<DaemonState>>,
     stopping: Arc<AtomicBool>,
     supervisor: TokioMutex<Option<tokio::task::JoinHandle<()>>>,
+    /// Reports on the size of the run directory; see [`RunDirWatch`]. Separate
+    /// from the supervisor because it has to keep talking while the supervisor
+    /// is stuck in a start that fails — a full volume is one of the reasons a
+    /// start fails. Like the supervision task it outlives a dropped handle and
+    /// is ended by [`DaemonHandle::shutdown`], not by `Drop`.
+    watchdog: TokioMutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl DaemonHandle {
@@ -1279,11 +2150,28 @@ impl DaemonHandle {
                 settings.run_dir.display()
             )
         })?;
-        registry
-            .lock()
-            .await
-            .apply()
-            .context("cannot publish the module configuration before starting the daemon")?;
+        {
+            let mut registry = registry.lock().await;
+            // Has to happen before `apply`: the path goes into the generated
+            // file, because `--log-file` on the command line would silence the
+            // per-file audit lines. See `DaemonConfig::with_log_file`.
+            registry.set_log_file(settings.log_file());
+            registry
+                .apply()
+                .context("cannot publish the module configuration before starting the daemon")?;
+        }
+        if let Some(stunnel_log) = settings.stunnel_log() {
+            tighten_stunnel_log(stunnel_log);
+            if !stunnel_log.exists() {
+                tracing::warn!(
+                    stunnel_log = %stunnel_log.display(),
+                    "the stunnel log is not there, so the audit log cannot name the real client \
+                     address and will record it as unavailable — it will not fall back to the \
+                     loopback address of the TLS terminator; add `output = <path>` to \
+                     config/stunnel-rsyncd.conf.template or set RCLONE_GUI_STUNNEL_LOG"
+                );
+            }
+        }
 
         let handle = Arc::new(Self {
             settings,
@@ -1291,6 +2179,7 @@ impl DaemonHandle {
             state: Arc::new(TokioMutex::new(DaemonState::default())),
             stopping: Arc::new(AtomicBool::new(false)),
             supervisor: TokioMutex::new(None),
+            watchdog: TokioMutex::new(None),
         });
 
         let task = tokio::spawn({
@@ -1298,6 +2187,12 @@ impl DaemonHandle {
             async move { handle.supervise().await }
         });
         *handle.supervisor.lock().await = Some(task);
+
+        let watch = RunDirWatch::new(&handle.settings);
+        *handle.watchdog.lock().await = Some(tokio::spawn(watch_run_dir(
+            watch,
+            Arc::clone(&handle.stopping),
+        )));
 
         handle.wait_until_listening().await?;
         Ok(handle)
@@ -1332,6 +2227,42 @@ impl DaemonHandle {
             zombie_children: state.pid.map(count_zombie_children).unwrap_or(0),
             last_error: state.last_error.clone(),
         }
+    }
+
+    /// The most recent audit events, oldest first.
+    ///
+    /// This is the in-memory tail for a status display, capped at
+    /// [`AUDIT_RING_CAPACITY`]. The complete record is the file at
+    /// [`DaemonSettings::audit_file`], one JSON object per line — the ring is
+    /// for looking, the file is for keeping.
+    pub async fn audit_events(&self, limit: usize) -> Vec<AuditEvent> {
+        let state = self.state.lock().await;
+        let skip = state.audit.len().saturating_sub(limit);
+        state.audit.iter().skip(skip).cloned().collect()
+    }
+
+    /// The audit events that concern deletion — actual or attempted.
+    ///
+    /// Separate because that is the question an audit gets asked: with
+    /// [`REFUSED_OPTIONS`] as it stands, every one of these is an *attempt*,
+    /// and a caller that filtered on `destructive` alone would find nothing and
+    /// conclude nothing had happened. See [`AuditEvent::concerns_deletion`].
+    pub async fn deletion_events(&self, limit: usize) -> Vec<AuditEvent> {
+        let state = self.state.lock().await;
+        let mut events: Vec<AuditEvent> = state
+            .audit
+            .iter()
+            .filter(|event| event.concerns_deletion())
+            .cloned()
+            .collect();
+        let skip = events.len().saturating_sub(limit);
+        events.drain(..skip);
+        events
+    }
+
+    /// Where the audit log is written.
+    pub fn audit_file(&self) -> PathBuf {
+        self.settings.audit_file()
     }
 
     /// Remove a module *and* end the transfers that are already running on it.
@@ -1409,6 +2340,12 @@ impl DaemonHandle {
     /// and rsync never picks those up again. SIGKILL follows only after [`SIGTERM_GRACE`], and
     /// says in the log what it is going to cost.
     pub async fn shutdown(&self) {
+        // Stopped first and by abort, not by waiting: it only reads file sizes,
+        // so there is nothing to finish, and it would otherwise hold the
+        // shutdown for up to one check interval.
+        if let Some(task) = self.watchdog.lock().await.take() {
+            task.abort();
+        }
         if self.stopping.swap(true, Ordering::SeqCst) {
             // Somebody else is already doing it; wait for the task either way.
             self.join_supervisor(SIGTERM_GRACE * 2).await;
@@ -1454,34 +2391,87 @@ impl DaemonHandle {
         }
     }
 
-    /// Block until the daemon reports that it is listening, or give up.
+    /// Block until the daemon accepts a connection, or give up.
+    ///
+    /// **Not** by waiting for the daemon's `listening on port` line: rsync
+    /// writes that while parsing its configuration, *before* it binds. Waiting
+    /// for it therefore reports readiness while there is no socket yet, and the
+    /// first connection after a successful start can be refused. Two agents ran
+    /// into it independently and a third reproduced it; on a fast machine it
+    /// almost never shows, under load it shows regularly, which is how it ends
+    /// up being written off as flaky.
+    ///
+    /// A TCP connect tests the property that is actually needed, so that is
+    /// what is done here. The daemon binds loopback only ([`DAEMON_ADDRESS`]),
+    /// so a refused connection comes back immediately and the poll costs
+    /// nothing.
+    ///
+    /// A daemon that dies on the way — no rsync binary, port taken,
+    /// unreadable configuration — is reported the moment it dies rather than
+    /// after the full timeout: [`DaemonState::exits`] counts finished attempts,
+    /// and one that finishes while this waits *is* the answer. Measured before:
+    /// a missing rsync binary held the whole web server for 30 seconds.
     async fn wait_until_listening(&self) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        while tokio::time::Instant::now() < deadline {
-            {
+        let deadline = tokio::time::Instant::now() + LISTEN_TIMEOUT;
+        let address = format!("{DAEMON_ADDRESS}:{}", self.settings.port);
+        loop {
+            let (blocked, blocking_pid, exits, last_error) = {
                 let state = self.state.lock().await;
-                if state.already_running_elsewhere {
-                    return Err(anyhow!(
-                        "another rsync daemon already holds the pid file lock at {}; \
-                         refusing to run a second one",
-                        self.settings.pid_file().display()
-                    ));
-                }
-                if state.pid.is_some()
-                    && fs::read_to_string(self.settings.log_file())
-                        .map(|log| log.contains("listening on port"))
-                        .unwrap_or(false)
-                {
-                    return Ok(());
-                }
+                (
+                    state.already_running_elsewhere,
+                    state.blocking_pid,
+                    state.exits,
+                    state.last_error.clone(),
+                )
+            };
+            if blocked {
+                return Err(self.blocked_by_another_daemon(blocking_pid));
             }
-            tokio::time::sleep(LOG_POLL_INTERVAL).await;
+            if exits > 0 {
+                return Err(anyhow!(
+                    "the rsync daemon did not survive its start{}",
+                    last_error.map(|e| format!(": {e}")).unwrap_or_default()
+                ));
+            }
+            if TcpStream::connect(&address).await.is_ok() {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(LISTEN_RETRY_INTERVAL).await;
         }
         let last = self.state.lock().await.last_error.clone();
         Err(anyhow!(
-            "the rsync daemon did not start within 30 seconds{}",
+            "the rsync daemon did not accept a connection on {address} within {} seconds{}",
+            LISTEN_TIMEOUT.as_secs(),
             last.map(|e| format!(": {e}")).unwrap_or_default()
         ))
+    }
+
+    /// The error for "somebody else holds the pid file lock", naming them.
+    ///
+    /// `known` is what the start already found out, if anything; when the
+    /// daemon itself reported the lock failure first there is no pid yet and
+    /// the pid file is asked again here. Naming the process is the whole point:
+    /// the state is not repairable from inside the application (see
+    /// [`pid_file_holder`]), so the message has to be enough for an operator to
+    /// act on without going looking.
+    fn blocked_by_another_daemon(&self, known: Option<u32>) -> anyhow::Error {
+        let pid_file = self.settings.pid_file();
+        let who = known
+            .map(|pid| PidFileHolder {
+                pid: Some(pid),
+                command: process_command_line(pid),
+            })
+            .or_else(|| pid_file_blocker(&pid_file))
+            .map(|holder| holder.to_string())
+            .unwrap_or_else(|| "an unidentified process".to_string());
+        anyhow!(
+            "another rsync daemon already holds the pid file lock at {} ({who}); refusing to \
+             run a second one — stop that process and the transport comes up by itself",
+            pid_file.display()
+        )
     }
 
     /// Start the daemon, wait for it, restart it, until told to stop.
@@ -1491,6 +2481,9 @@ impl DaemonHandle {
             let started = tokio::time::Instant::now();
             match self.run_once().await {
                 Ok(status) => {
+                    // Counted before the shutdown check: a waiting start has to
+                    // learn that this attempt is over either way.
+                    self.state.lock().await.exits += 1;
                     if self.stopping.load(Ordering::SeqCst) {
                         tracing::info!(?status, "the rsync daemon exited during shutdown");
                         break;
@@ -1500,7 +2493,13 @@ impl DaemonHandle {
                 }
                 Err(e) => {
                     tracing::error!(error = %e, "cannot start the rsync daemon");
-                    self.state.lock().await.last_error = Some(e.to_string());
+                    {
+                        let mut state = self.state.lock().await;
+                        state.last_error = Some(e.to_string());
+                        // After `last_error`, so that a start woken by the
+                        // counter finds the cause already recorded.
+                        state.exits += 1;
+                    }
                     if self.stopping.load(Ordering::SeqCst) {
                         break;
                     }
@@ -1531,6 +2530,31 @@ impl DaemonHandle {
             // is in them is rsync's by construction, and nothing is in flight
             // before the daemon exists.
             sweep_module_temp_dirs(&temp_dirs, self.settings.temp_file_min_age);
+        }
+
+        // Is somebody else's daemon still on our pid file? Asking before the
+        // spawn turns a dead end into a message: without it the attempt fails
+        // with `failed to lock pid file: Resource temporarily unavailable`,
+        // every 30 seconds, forever, and nothing says *which* process is in the
+        // way. That is the state a hard kill of the application leaves behind —
+        // the daemon outlives it and keeps the lock.
+        //
+        // This does not open a race. It refuses only when the lock is provably
+        // held; when it looks free, the spawn goes ahead and rsync's own
+        // `flock` remains the authority, so two applications starting at the
+        // same instant still produce exactly one daemon and the loser reports
+        // the lock failure as before.
+        let pid_file = self.settings.pid_file();
+        if let Some(holder) = pid_file_holder(&pid_file) {
+            {
+                let mut state = self.state.lock().await;
+                state.already_running_elsewhere = true;
+                state.blocking_pid = holder.pid;
+            }
+            return Err(anyhow!(
+                "{} is locked by {holder}; refusing to start a second rsync daemon on it",
+                pid_file.display()
+            ));
         }
 
         // Start from an empty log: the mirror reads from the beginning and
@@ -1564,7 +2588,9 @@ impl DaemonHandle {
             let mut state = self.state.lock().await;
             state.pid = Some(pid);
             state.connections.clear();
+            state.sessions.clear();
             state.already_running_elsewhere = false;
+            state.blocking_pid = None;
         }
         tracing::info!(
             pid,
@@ -1575,10 +2601,22 @@ impl DaemonHandle {
         );
 
         let finished = Arc::new(AtomicBool::new(false));
+        let audit = AuditContext::new(
+            AuditSink::new(
+                self.settings
+                    .write_audit_file
+                    .then(|| self.settings.audit_file()),
+            ),
+            self.settings
+                .stunnel_log()
+                .map(|path| StunnelIndex::new(path.to_path_buf())),
+            self.settings.port,
+        );
         let mirror = tokio::spawn(mirror_log_file(
             log_path,
             Arc::clone(&self.state),
             Arc::clone(&finished),
+            audit,
         ));
         let stdout = child
             .stdout
@@ -1603,8 +2641,20 @@ impl DaemonHandle {
             let mut state = self.state.lock().await;
             state.pid = None;
             state.connections.clear();
+            state.sessions.clear();
             if !status.success() {
                 state.last_error = Some(format!("the rsync daemon exited with {status}"));
+            }
+            // The daemon lost the race for the lock rather than this process
+            // finding it taken beforehand: name the winner now, while it is
+            // still there to be named.
+            if state.already_running_elsewhere && state.blocking_pid.is_none() {
+                state.blocking_pid = pid_file_blocker(&pid_file).and_then(|holder| holder.pid);
+                tracing::warn!(
+                    pid_file = %pid_file.display(),
+                    blocking_pid = state.blocking_pid,
+                    "the rsync daemon could not take the pid file lock; another daemon holds it"
+                );
             }
         }
         Ok(status)
@@ -1617,6 +2667,39 @@ fn restart_backoff(failures: u32) -> Duration {
     RESTART_BACKOFF_MIN
         .saturating_mul(factor)
         .min(RESTART_BACKOFF_MAX)
+}
+
+/// Take group and world off the stunnel log if it is there.
+///
+/// The file lists the address of every peer that connected, and it is written
+/// by *stunnel*, a separate process started from `start.sh` with its own umask
+/// — the default one produces a world-readable log. `config/rsync-tls.sh`
+/// creates it with mode 0600, and this is the second belt: it also catches a
+/// file that predates that change or was created by an operator by hand.
+///
+/// Deliberately does **not** create the file. A missing stunnel log is a
+/// configuration problem worth reporting (the warning right after this), and
+/// creating an empty one here would hide it while producing exactly nothing to
+/// correlate against.
+fn tighten_stunnel_log(path: &Path) {
+    let Ok(meta) = fs::metadata(path) else { return };
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 == 0 {
+        return;
+    }
+    match fs::set_permissions(path, fs::Permissions::from_mode(FILE_MODE)) {
+        Ok(()) => tracing::warn!(
+            stunnel_log = %path.display(),
+            was = format!("{mode:04o}"),
+            "the stunnel log was readable by others; tightened to 0600 — it holds every peer \
+             address"
+        ),
+        Err(e) => tracing::warn!(
+            stunnel_log = %path.display(),
+            error = %e,
+            "cannot restrict the stunnel log; it holds every peer address"
+        ),
+    }
 }
 
 /// Empty the log file so the mirror starts at the current daemon's first line.
@@ -1633,6 +2716,252 @@ fn write_truncated_log(path: &Path) -> Result<()> {
         .open(path)
         .with_context(|| format!("cannot create the daemon log {}", path.display()))?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Run directory watchdog (ticket 0cedda6f)
+// ---------------------------------------------------------------------------
+
+/// A size limit from the environment, `default` if unset or unreadable.
+///
+/// An empty or non-numeric value is a configuration mistake, not a reason to
+/// silently pick a different limit, so it is reported once and the default
+/// stands. `0` is valid and means "do not watch this".
+fn size_limit_from_env(var: &str, default: u64) -> u64 {
+    let Ok(raw) = std::env::var(var) else {
+        return default;
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(
+                variable = var,
+                value = %raw,
+                error = %e,
+                default_bytes = default,
+                "cannot read the size limit from the environment; keeping the default"
+            );
+            default
+        }
+    }
+}
+
+/// One file the watchdog reports on, with the state that keeps it from
+/// repeating itself.
+#[derive(Debug)]
+struct WatchedFile {
+    path: PathBuf,
+    /// What the file is, for the warning text.
+    kind: &'static str,
+    /// Bytes above which it is reported. `0` means it is not watched.
+    limit: u64,
+    /// When it was last reported and how large it was then.
+    warned: Option<(std::time::Instant, u64)>,
+}
+
+/// What the watchdog found over its limit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SizeWarning {
+    kind: &'static str,
+    path: PathBuf,
+    bytes: u64,
+    limit: u64,
+}
+
+/// Watches the daemon's run directory and **only** reports on it.
+///
+/// # Why it reports instead of rotating
+///
+/// The audit log must not be rotated by the process that writes it — a process
+/// that can shorten its own audit trail can also remove evidence from it. That
+/// decision is older than this type and is not reversed here (see
+/// [`DaemonSettings::audit_file`]).
+///
+/// What is new is that the run directory is not only the audit log. The pid
+/// file, the lock file and the daemon's own log live in it as well, so a
+/// directory that fills up takes the transport down with it, and the symptom
+/// (`failed to lock pid file`, a daemon that will not start) points at the
+/// daemon rather than at the disk. Warning early makes the real cause visible
+/// while there is still room to act.
+///
+/// # The stunnel log is treated the same way, deliberately
+///
+/// It is tempting to cap that one for real — it is a connection log, not an
+/// audit trail, so the evidence argument seems not to apply. It does apply,
+/// one step removed, and it was measured before deciding:
+///
+/// * the real peer address exists in **no other place**. The daemon log records
+///   `127.0.0.1` for every client on earth because stunnel terminates TLS on
+///   loopback, and `proxy protocol` is off by choice (see
+///   [`DaemonConfig::with_proxy_protocol`]). Every `client` field in the audit
+///   log is joined out of this file by [`StunnelIndex`], so truncating it turns
+///   audit events into `client_source=unavailable` — it destroys audit content
+///   without touching the audit file;
+/// * [`StunnelIndex`] follows the file by byte offset. A rotation underneath a
+///   running daemon drops whatever had not been read yet, which is precisely
+///   the newest connections, i.e. the ones still being joined;
+/// * the file belongs to *stunnel*, a separate process started from `start.sh`
+///   with its own open descriptor. Truncating a file another process holds open
+///   is a race this module has no way to win.
+///
+/// So both files are reported and neither is touched. `copytruncate` for the
+/// stunnel log is a matter for the operator, and the shipped logrotate snippet
+/// says when it is safe.
+///
+/// # What it never does
+///
+/// It opens nothing for writing, creates nothing and removes nothing. The only
+/// operations are `metadata` and one `read_dir` of the run directory. In
+/// particular it is unrelated to [`sweep_module_temp_dirs`], which stays
+/// restricted to [`DaemonConfig::temp_dirs`].
+#[derive(Debug)]
+struct RunDirWatch {
+    run_dir: PathBuf,
+    files: Vec<WatchedFile>,
+    /// Bytes above which the directory as a whole is reported. `0` disables.
+    run_dir_limit: u64,
+    warned: Option<(std::time::Instant, u64)>,
+}
+
+impl RunDirWatch {
+    fn new(settings: &DaemonSettings) -> Self {
+        let mut files = vec![
+            WatchedFile {
+                path: settings.audit_file(),
+                kind: "audit log",
+                limit: settings.log_warn_bytes,
+                warned: None,
+            },
+            WatchedFile {
+                path: settings.log_file(),
+                kind: "daemon log",
+                limit: settings.log_warn_bytes,
+                warned: None,
+            },
+        ];
+        if let Some(stunnel_log) = settings.stunnel_log() {
+            files.push(WatchedFile {
+                path: stunnel_log.to_path_buf(),
+                kind: "stunnel log",
+                limit: settings.log_warn_bytes,
+                warned: None,
+            });
+        }
+        Self {
+            run_dir: settings.run_dir.clone(),
+            files,
+            run_dir_limit: settings.run_dir_warn_bytes,
+            warned: None,
+        }
+    }
+
+    /// Measure everything once and return what is due to be reported.
+    ///
+    /// `now` is passed in rather than read here so that the repeat interval can
+    /// be tested without waiting a quarter of an hour.
+    fn check(&mut self, now: std::time::Instant) -> Vec<SizeWarning> {
+        let mut warnings = Vec::new();
+        for file in &mut self.files {
+            if file.limit == 0 {
+                continue;
+            }
+            // A missing file is not a problem the watchdog has an opinion on:
+            // the audit log does not exist before the first event, and the
+            // stunnel log is already reported elsewhere when it is absent.
+            let Ok(meta) = fs::metadata(&file.path) else {
+                continue;
+            };
+            let bytes = meta.len();
+            if bytes <= file.limit {
+                continue;
+            }
+            if due(&mut file.warned, now, bytes) {
+                warnings.push(SizeWarning {
+                    kind: file.kind,
+                    path: file.path.clone(),
+                    bytes,
+                    limit: file.limit,
+                });
+            }
+        }
+
+        if self.run_dir_limit > 0 {
+            let total = directory_bytes(&self.run_dir);
+            if total > self.run_dir_limit && due(&mut self.warned, now, total) {
+                warnings.push(SizeWarning {
+                    kind: "run directory",
+                    path: self.run_dir.clone(),
+                    bytes: total,
+                    limit: self.run_dir_limit,
+                });
+            }
+        }
+        warnings
+    }
+}
+
+/// Whether a condition that is still true should be reported again.
+///
+/// Repeats when it has persisted for [`RUN_DIR_WARN_REPEAT`] or when the file
+/// has doubled since the last report, and records the decision in `state`.
+fn due(state: &mut Option<(std::time::Instant, u64)>, now: std::time::Instant, bytes: u64) -> bool {
+    let repeat = match state {
+        None => true,
+        Some((at, then)) => {
+            now.saturating_duration_since(*at) >= RUN_DIR_WARN_REPEAT
+                || bytes >= then.saturating_mul(2)
+        }
+    };
+    if repeat {
+        *state = Some((now, bytes));
+    }
+    repeat
+}
+
+/// Bytes held by the plain files directly in `dir`. Not recursive.
+///
+/// The run directory has no subdirectories of its own; anything mounted into it
+/// is somebody else's accounting. Unreadable entries are skipped rather than
+/// guessed at — an under-count delays a warning, an over-count invents one.
+fn directory_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|entry| entry.metadata().ok())
+        .filter(|meta| meta.is_file())
+        .map(|meta| meta.len())
+        .sum()
+}
+
+/// Report the run directory's size for as long as the daemon is supervised.
+///
+/// Runs beside the supervision task rather than inside the log mirror on
+/// purpose: the case worth warning about is a daemon that cannot start *because*
+/// the directory is full, and in that case no mirror is running to notice.
+///
+/// The warnings go to `tracing` and therefore to the application log — never
+/// into the audit log or anything else under the run directory. A warning about
+/// a full directory that is written into that same directory would be the last
+/// thing lost when it matters.
+async fn watch_run_dir(mut watch: RunDirWatch, stopping: Arc<AtomicBool>) {
+    while !stopping.load(Ordering::SeqCst) {
+        for warning in watch.check(std::time::Instant::now()) {
+            tracing::warn!(
+                what = warning.kind,
+                path = %warning.path.display(),
+                bytes = warning.bytes,
+                limit_bytes = warning.limit,
+                "the rsync {} has passed its size limit and is NOT rotated by this process — the \
+                 run directory also holds the daemon's pid and lock file, so a full volume stops \
+                 the transport. Rotate from outside (config/logrotate-rclone-gui.conf) or give \
+                 the run directory more room; nothing has been deleted",
+                warning.kind
+            );
+        }
+        tokio::time::sleep(RUN_DIR_CHECK_INTERVAL).await;
+    }
 }
 
 /// Mirror one of the daemon's pipes into the application log.
@@ -1686,19 +3015,21 @@ async fn mirror_log_file(
     path: PathBuf,
     state: Arc<TokioMutex<DaemonState>>,
     finished: Arc<AtomicBool>,
+    mut audit: AuditContext,
 ) {
     let mut offset: u64 = 0;
     let mut pending = String::new();
     let mut last_prune = tokio::time::Instant::now();
     loop {
         let done = finished.load(Ordering::SeqCst);
+        audit.refresh_stunnel().await;
         match read_from(&path, offset).await {
             Ok((chunk, new_offset)) => {
                 offset = new_offset;
                 pending.push_str(&chunk);
                 while let Some(index) = pending.find('\n') {
                     let line: String = pending.drain(..=index).collect();
-                    handle_log_line(line.trim_end(), &state).await;
+                    handle_log_line(line.trim_end(), &state, &mut audit).await;
                 }
             }
             Err(e) => {
@@ -1707,7 +3038,7 @@ async fn mirror_log_file(
         }
         if done {
             if !pending.is_empty() {
-                handle_log_line(pending.trim_end(), &state).await;
+                handle_log_line(pending.trim_end(), &state, &mut audit).await;
             }
             return;
         }
@@ -1739,8 +3070,415 @@ async fn read_from(path: &Path, offset: u64) -> std::io::Result<(String, u64)> {
     Ok((String::from_utf8_lossy(&buf).into_owned(), offset + read))
 }
 
+/// Everything the log reader needs besides the shared state.
+///
+/// Kept out of [`DaemonState`] on purpose: the stunnel index does blocking file
+/// reads and only the mirroring task ever touches it, so putting it behind the
+/// state mutex would make every status call wait for a file read it does not
+/// care about.
+#[derive(Debug)]
+struct AuditContext {
+    sink: AuditSink,
+    stunnel: Option<StunnelIndex>,
+    /// The port the daemon listens on, to pick the right socket out of `/proc`.
+    daemon_port: u16,
+}
+
+impl AuditContext {
+    fn new(sink: AuditSink, stunnel: Option<StunnelIndex>, daemon_port: u16) -> Self {
+        Self {
+            sink,
+            stunnel,
+            daemon_port,
+        }
+    }
+
+    /// Pull in whatever stunnel has logged since the last pass.
+    async fn refresh_stunnel(&mut self) {
+        if let Some(index) = &mut self.stunnel {
+            index.refresh().await;
+        }
+    }
+
+    /// Establish the real client behind a freshly opened session.
+    ///
+    /// The port comes from `/proc` and makes the match exact; the timestamp is
+    /// the fallback. Returns the loopback-free answer — when nothing matches,
+    /// the address stays absent rather than becoming `127.0.0.1`.
+    fn resolve_client(
+        &mut self,
+        pid: u32,
+        at: Option<chrono::NaiveDateTime>,
+    ) -> (Option<String>, Option<u16>, ClientAddressSource) {
+        let backend_port = peer_port_of_child(pid, self.daemon_port);
+        let Some(index) = &mut self.stunnel else {
+            return (None, None, ClientAddressSource::Unavailable);
+        };
+        match index.lookup(backend_port, at) {
+            Some((peer, port, source)) => (Some(peer), Some(port), source),
+            None => (None, None, ClientAddressSource::Unavailable),
+        }
+    }
+}
+
+/// Turn one daemon log line into audit events, if it carries any.
+///
+/// The lines that are recognised are listed with an example each in the audit
+/// section header above; every one of them was taken off a real daemon rather
+/// than out of the rsync manual.
+async fn record_audit(
+    line: &str,
+    body: &str,
+    pid: u32,
+    state: &Arc<TokioMutex<DaemonState>>,
+    audit: &mut AuditContext,
+) {
+    let at = parse_rsync_time(line);
+    let stamp = line.get(..19).unwrap_or("").to_string();
+
+    // A new connection: this is the only moment the peer can still be looked
+    // up in /proc, because the socket disappears with the child.
+    if body.starts_with("connect from") {
+        let (client, client_port, client_source) = audit.resolve_client(pid, at);
+        let session = Session {
+            module: None,
+            user: None,
+            client: client.clone(),
+            client_port,
+            client_source: Some(client_source),
+        };
+        state.lock().await.sessions.insert(pid, session);
+        emit(
+            state,
+            audit,
+            AuditEvent {
+                at: stamp,
+                pid,
+                module: None,
+                user: None,
+                client,
+                client_port,
+                client_source,
+                action: AuditAction::Connected,
+                destructive: false,
+                path: None,
+                size: None,
+                refused_option: None,
+                detail: body.to_string(),
+            },
+        )
+        .await;
+        return;
+    }
+
+    if let Some(module) = module_from_access_line(body) {
+        set_session(state, pid, |s| s.module = Some(module.clone())).await;
+        emit_for(
+            state,
+            audit,
+            pid,
+            stamp,
+            AuditAction::AccessGranted,
+            body,
+            None,
+            None,
+            None,
+        )
+        .await;
+        return;
+    }
+
+    // `rsync to <module>/ from <user>@<host> (<ip>)` for a client that writes,
+    // `rsync on <module>/ …` for one that reads. This is where the
+    // authenticated user first appears.
+    if let Some((module, user, writing)) = session_direction_line(body) {
+        set_session(state, pid, |s| {
+            s.module.get_or_insert(module.clone());
+            s.user = Some(user.clone());
+        })
+        .await;
+        let action = if writing {
+            AuditAction::SessionWrite
+        } else {
+            AuditAction::SessionRead
+        };
+        emit_for(state, audit, pid, stamp, action, body, None, None, None).await;
+        return;
+    }
+
+    if let Some(transfer) = parse_transfer_line(body) {
+        set_session(state, pid, |s| {
+            s.module.get_or_insert(transfer.module.clone());
+            s.user.get_or_insert(transfer.user.clone());
+        })
+        .await;
+        emit_for(
+            state,
+            audit,
+            pid,
+            stamp,
+            transfer.action,
+            body,
+            Some(transfer.path),
+            transfer.size,
+            None,
+        )
+        .await;
+        return;
+    }
+
+    if let Some(option) = refused_option(body) {
+        emit_for(
+            state,
+            audit,
+            pid,
+            stamp,
+            AuditAction::OptionRefused,
+            body,
+            None,
+            None,
+            Some(option),
+        )
+        .await;
+        return;
+    }
+
+    if let Some((module, user)) = auth_failure_line(body) {
+        set_session(state, pid, |s| {
+            s.module = Some(module.clone());
+            s.user = user.clone();
+        })
+        .await;
+        emit_for(
+            state,
+            audit,
+            pid,
+            stamp,
+            AuditAction::AccessDenied,
+            body,
+            None,
+            None,
+            None,
+        )
+        .await;
+        return;
+    }
+
+    if body.contains("tried from") && body.contains("unknown module") {
+        emit_for(
+            state,
+            audit,
+            pid,
+            stamp,
+            AuditAction::AccessDenied,
+            body,
+            None,
+            None,
+            None,
+        )
+        .await;
+        return;
+    }
+
+    if body.contains("rsync error:") {
+        emit_for(
+            state,
+            audit,
+            pid,
+            stamp,
+            AuditAction::Error,
+            body,
+            None,
+            None,
+            None,
+        )
+        .await;
+        return;
+    }
+
+    // The per-connection summary. The daemon writes an identical line for
+    // itself when it shuts down, but with its own pid, which never has a
+    // session — so that one is dropped here rather than logged as a phantom
+    // connection ending.
+    if is_transfer_summary_line(body) && state.lock().await.sessions.contains_key(&pid) {
+        emit_for(
+            state,
+            audit,
+            pid,
+            stamp,
+            AuditAction::SessionEnd,
+            body,
+            None,
+            None,
+            None,
+        )
+        .await;
+        state.lock().await.sessions.remove(&pid);
+    }
+}
+
+/// Update what is known about a session, if it is still open.
+async fn set_session(
+    state: &Arc<TokioMutex<DaemonState>>,
+    pid: u32,
+    update: impl FnOnce(&mut Session),
+) {
+    let mut state = state.lock().await;
+    update(state.sessions.entry(pid).or_default());
+}
+
+/// Emit an event, filling module, user and client in from the session.
+#[allow(clippy::too_many_arguments)]
+async fn emit_for(
+    state: &Arc<TokioMutex<DaemonState>>,
+    audit: &mut AuditContext,
+    pid: u32,
+    at: String,
+    action: AuditAction,
+    detail: &str,
+    path: Option<String>,
+    size: Option<u64>,
+    refused_option: Option<String>,
+) {
+    let session = state.lock().await.sessions.get(&pid).cloned();
+    let session = session.unwrap_or_default();
+    let event = AuditEvent {
+        at,
+        pid,
+        module: session.module.clone(),
+        user: session.user.clone(),
+        client: session.client.clone(),
+        client_port: session.client_port,
+        client_source: session
+            .client_source
+            .unwrap_or(ClientAddressSource::Unavailable),
+        action,
+        destructive: action.is_destructive(),
+        path,
+        size,
+        refused_option,
+        detail: detail.to_string(),
+    };
+    emit(state, audit, event).await;
+}
+
+/// Write an event to the sink and to the in-memory ring.
+async fn emit(state: &Arc<TokioMutex<DaemonState>>, audit: &mut AuditContext, event: AuditEvent) {
+    audit.sink.record(&event);
+    let mut state = state.lock().await;
+    state.audit.push_back(event);
+    while state.audit.len() > AUDIT_RING_CAPACITY {
+        state.audit.pop_front();
+    }
+}
+
+/// One per-file line of the daemon's transfer log.
+struct TransferLine {
+    module: String,
+    user: String,
+    action: AuditAction,
+    path: String,
+    size: Option<u64>,
+}
+
+/// Parse a line rendered with [`MODULE_LOG_FORMAT`].
+///
+/// The shape is `<sentinel> <addr> <user> <module> <op> <len> <bytes> <file>`,
+/// and the file name is last precisely so that it may contain spaces. `<op>` is
+/// rsync's `%o`: `recv`, `send`, or `del.` for a deletion.
+fn parse_transfer_line(body: &str) -> Option<TransferLine> {
+    let rest = body.strip_prefix(AUDIT_SENTINEL)?.trim_start();
+    let mut fields = rest.splitn(7, ' ');
+    let _address = fields.next()?;
+    let user = fields.next()?;
+    let module = fields.next()?;
+    let operation = fields.next()?;
+    let size = fields.next()?;
+    let _bytes = fields.next()?;
+    let path = fields.next()?;
+    let action = match operation {
+        "recv" => AuditAction::FileReceived,
+        "send" => AuditAction::FileSent,
+        // rsync writes the operation for a deletion as `del.`, with the dot.
+        "del." | "del" => AuditAction::FileDeleted,
+        _ => return None,
+    };
+    if path.is_empty() {
+        return None;
+    }
+    Some(TransferLine {
+        module: module.to_string(),
+        user: user.to_string(),
+        action,
+        path: path.to_string(),
+        size: size.parse().ok(),
+    })
+}
+
+/// `rsync to <module>/ from <user>@<host> (<ip>)` and its `on` counterpart.
+///
+/// `to` is a client that writes into the module, `on` one that reads from it.
+/// Returns `(module, user, is_writing)`.
+fn session_direction_line(body: &str) -> Option<(String, String, bool)> {
+    let (rest, writing) = if let Some(rest) = body.strip_prefix("rsync to ") {
+        (rest, true)
+    } else {
+        (body.strip_prefix("rsync on ")?, false)
+    };
+    let (module, rest) = rest.split_once(' ')?;
+    let module = module.trim_end_matches('/');
+    let user = rest.strip_prefix("from ")?.split('@').next()?;
+    if module.is_empty() || user.is_empty() {
+        return None;
+    }
+    Some((module.to_string(), user.to_string(), writing))
+}
+
+/// The option out of `rsync: The server is configured to refuse --<option>`.
+///
+/// This is the line that makes a delete *attempt* visible. Since `--delete` is
+/// refused unconditionally today, it is the only trace a deletion ever leaves —
+/// there is no successful deletion to log. Measured verbatim on 3.5.0 and
+/// 3.4.3:
+///
+/// ```text
+/// [24] rsync: The server is configured to refuse --delete
+/// ```
+fn refused_option(body: &str) -> Option<String> {
+    let marker = "is configured to refuse ";
+    let rest = &body[body.find(marker)? + marker.len()..];
+    let option = rest.split_whitespace().next()?.trim_start_matches('-');
+    if option.is_empty() {
+        None
+    } else {
+        Some(option.to_string())
+    }
+}
+
+/// `auth failed on module <m> from <host> (<ip>) for <user>: <reason>`.
+fn auth_failure_line(body: &str) -> Option<(String, Option<String>)> {
+    let rest = body.strip_prefix("auth failed on module ")?;
+    let module = rest.split_whitespace().next()?;
+    let user = rest
+        .split(" for ")
+        .nth(1)
+        .and_then(|tail| tail.split(':').next())
+        .map(|user| user.trim().to_string())
+        .filter(|user| !user.is_empty());
+    Some((module.to_string(), user))
+}
+
+/// rsync's `sent … received … total size …` summary.
+fn is_transfer_summary_line(body: &str) -> bool {
+    body.contains("sent ") && body.contains(" received ") && body.contains(" total size ")
+}
+
 /// Mirror one log line and update the connection table from it.
-async fn handle_log_line(line: &str, state: &Arc<TokioMutex<DaemonState>>) {
+async fn handle_log_line(
+    line: &str,
+    state: &Arc<TokioMutex<DaemonState>>,
+    audit: &mut AuditContext,
+) {
     if line.is_empty() {
         return;
     }
@@ -1768,6 +3506,19 @@ async fn handle_log_line(line: &str, state: &Arc<TokioMutex<DaemonState>>) {
         state.lock().await.connections.insert(pid, module);
     } else if is_connection_closed_line(line) {
         state.lock().await.connections.remove(&pid);
+    }
+
+    // Everything after the pid, so the parsers below never have to care about
+    // the timestamp or the bracketed pid again.
+    let body = log_line_body(line);
+    record_audit(line, body, pid, state, audit).await;
+}
+
+/// The part of a log line after `<timestamp> [<pid>] `.
+fn log_line_body(line: &str) -> &str {
+    match line.find("] ") {
+        Some(index) => line[index + 2..].trim(),
+        None => line.trim(),
     }
 }
 
@@ -1838,6 +3589,146 @@ async fn send_signal(pid: u32, signal: &str) -> bool {
     }
 }
 
+/// The process holding the exclusive lock on the daemon's pid file.
+///
+/// `pid` is optional because "the lock is held" and "the holder can be named"
+/// are two different findings: `/proc/locks` may be unreadable in a restricted
+/// container, and the pid file's content is only a hint. A message that says
+/// "held, owner unknown" is still true; one that omits the difference is not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PidFileHolder {
+    pid: Option<u32>,
+    /// Its command line, so that an operator recognises what to stop.
+    command: Option<String>,
+}
+
+impl std::fmt::Display for PidFileHolder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match (self.pid, &self.command) {
+            (Some(pid), Some(command)) => write!(f, "pid {pid}: {command}"),
+            (Some(pid), None) => write!(f, "pid {pid}"),
+            (None, _) => write!(f, "an unidentified process"),
+        }
+    }
+}
+
+/// Who holds the `flock` on `pid_file`, or `None` when nobody does.
+///
+/// This is the answer to the question a blocked start has to ask, and it is
+/// asked of the kernel rather than of the file's content: rsync locks its pid
+/// file for its whole life, and the lock is dropped by the kernel when that
+/// process dies, however it dies. So a lock that is still held always belongs
+/// to a *living* process — "orphaned lock" is not a state that exists. A
+/// leftover pid file whose process is gone carries no lock and does not block
+/// anything, which is why a stale file is deliberately not deleted here: it is
+/// harmless, and removing a file another instance is about to lock is not.
+///
+/// **The holder is not killed, by design.** It cannot be proven to be ours: the
+/// run directory can be shared, the pid may have been reused, and rsync
+/// terminated mid-transfer leaves its children's partial files behind (85 MB in
+/// the spike). Killing a process that only *looks* like our daemon is a worse
+/// failure than refusing to start with a message that names it. The refusal is
+/// reported as `already_running_elsewhere`, which the frontend already shows as
+/// blocked rather than as a start failure.
+///
+/// `None` is also the answer when nothing can be determined — a missing pid
+/// file, an unreadable `/proc`. The start then goes ahead and rsync's own lock
+/// decides, which is where the authority belonged all along.
+fn pid_file_holder(pid_file: &Path) -> Option<PidFileHolder> {
+    let meta = fs::metadata(pid_file).ok()?;
+    let locks = fs::read_to_string("/proc/locks").ok()?;
+    let pid = flock_holder(&locks, meta.dev(), meta.ino())?;
+    Some(PidFileHolder {
+        pid: Some(pid),
+        command: process_command_line(pid),
+    })
+}
+
+/// Best effort answer for a message, once the lock is known to be taken.
+///
+/// [`pid_file_holder`] is the strict form: it must never claim a holder that is
+/// not there, because a start is refused on its word. This one runs after the
+/// daemon itself has already reported the lock failure, so the question is no
+/// longer *whether* somebody holds it but *who*, and the pid file's content is
+/// worth reading — as long as that process is still alive, which is checked.
+fn pid_file_blocker(pid_file: &Path) -> Option<PidFileHolder> {
+    if let Some(holder) = pid_file_holder(pid_file) {
+        return Some(holder);
+    }
+    let pid: u32 = fs::read_to_string(pid_file).ok()?.trim().parse().ok()?;
+    let command = process_command_line(pid)?;
+    Some(PidFileHolder {
+        pid: Some(pid),
+        command: Some(command),
+    })
+}
+
+/// The pid holding an `flock` on the file with `dev`/`inode`, per `/proc/locks`.
+///
+/// A line looks like
+///
+/// ```text
+/// 3: FLOCK  ADVISORY  WRITE 1234 08:03:1310721 0 EOF
+/// ```
+///
+/// The device is printed as hexadecimal `major:minor`, the inode as decimal.
+/// Lines for processes *waiting* on a lock carry a `->` after the number and
+/// are skipped: a waiter does not block us, the holder does. The columns before
+/// the device triple differ between lock types, so the triple is located by
+/// shape and the pid taken from the field in front of it, rather than counted
+/// from the start of the line.
+fn flock_holder(locks: &str, dev: u64, inode: u64) -> Option<u32> {
+    let wanted = format!("{:02x}:{:02x}:{inode}", dev_major(dev), dev_minor(dev));
+    for line in locks.lines() {
+        if line.contains("->") {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let Some(index) = fields.iter().position(|field| *field == wanted) else {
+            continue;
+        };
+        if index == 0 {
+            continue;
+        }
+        if let Ok(pid) = fields[index - 1].parse::<u32>() {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+/// Major device number, in the encoding `/proc/locks` prints.
+fn dev_major(dev: u64) -> u64 {
+    ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff)
+}
+
+/// Minor device number, in the encoding `/proc/locks` prints.
+fn dev_minor(dev: u64) -> u64 {
+    (dev & 0xff) | ((dev >> 12) & !0xff)
+}
+
+/// The command line of `pid`, or `None` when that process is gone.
+///
+/// Doubles as the liveness check: `/proc/<pid>` disappears with the process, so
+/// a `None` here is the difference between "somebody is holding it" and "the
+/// pid file is a leftover". A kernel thread has an empty `cmdline`, so its name
+/// is read from `comm` instead — otherwise a live process would look dead.
+fn process_command_line(pid: u32) -> Option<String> {
+    if let Ok(raw) = fs::read(format!("/proc/{pid}/cmdline")) {
+        let joined = raw
+            .split(|byte| *byte == 0)
+            .filter(|part| !part.is_empty())
+            .map(String::from_utf8_lossy)
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !joined.is_empty() {
+            return Some(joined);
+        }
+    }
+    let comm = fs::read_to_string(format!("/proc/{pid}/comm")).ok()?;
+    Some(comm.trim().to_string())
+}
+
 /// Whether `pid` is still a child of `parent`, according to `/proc`.
 ///
 /// The guard before signalling a connection: a pid whose closing log line was
@@ -1872,9 +3763,13 @@ fn is_child_of(pid: u32, parent: u32) -> bool {
 fn prune_connections(state: &mut DaemonState) {
     let Some(daemon) = state.pid else {
         state.connections.clear();
+        state.sessions.clear();
         return;
     };
     state.connections.retain(|pid, _| is_child_of(*pid, daemon));
+    // The session table is closed the same way and for the same reason: an
+    // aborted connection writes no closing line, so /proc is the authority.
+    state.sessions.retain(|pid, _| is_child_of(*pid, daemon));
 }
 
 /// Count children of `parent` that have exited and not been reaped.
@@ -2071,7 +3966,9 @@ mod tests {
              \x20   max connections = 4\n\
              \x20   temp dir = /.rsync-tmp\n\
              \x20   refuse options = copy-links copy-dirlinks copy-unsafe-links delete \
-             remove-source-files\n",
+             remove-source-files\n\
+             \x20   transfer logging = yes\n\
+             \x20   log format = rclone-gui-audit %a %u %m %o %l %b %f\n",
             name = module.name(),
             path = module.path(),
         );
@@ -2618,11 +4515,19 @@ mod tests {
         assert!(argv
             .iter()
             .any(|a| a == "--dparam=pid file=/run/rsyncd/rsyncd.pid"));
-        // Without --log-file the daemon logs to syslog and there is nothing to
-        // mirror; measured, stderr stays empty.
-        assert!(argv
-            .iter()
-            .any(|a| a == "--log-file=/run/rsyncd/rsyncd.log"));
+        // And emphatically **without** --log-file. The log path is real and
+        // required — without it the daemon logs to syslog and there is nothing
+        // to mirror — but it belongs in the configuration file: measured on
+        // 3.5.0 and 3.4.3, the command line switch suppresses every per-file
+        // audit line, and setting both splits the log across two files. See
+        // `DaemonConfig::with_log_file`.
+        assert!(!argv.iter().any(|a| a.starts_with("--log-file")));
+        let mut cfg = DaemonConfig::new("/etc/rsyncd/secrets");
+        cfg.set_log_file(settings.log_file());
+        assert!(cfg
+            .render_conf()
+            .unwrap()
+            .contains("\nlog file = /run/rsyncd/rsyncd.log\n"));
         assert!(argv.iter().any(|a| a == "--config=/etc/rsyncd/rsyncd.conf"));
         assert!(argv.iter().any(|a| a == &format!("--port={DAEMON_PORT}")));
 
@@ -2682,6 +4587,411 @@ mod tests {
         assert!(!is_chroot_failure_line(
             "2026/08/16 04:12:01 [42] rsyncd version 3.4.3 starting, listening on port 873"
         ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Audit log (ticket 9f3d4888)
+    //
+    // Every literal below was copied out of a real daemon's log — 3.5.0 on the
+    // host and 3.4.3 in alpine:3.22 — not out of the manual. That matters:
+    // the previous attempt at reading this log assumed a closing line the
+    // daemon does not write, and was wrong for all 40 of 40 connections.
+    // -----------------------------------------------------------------------
+
+    /// Drive a batch of log lines through the reader and return the events.
+    async fn audit_from(lines: &[&str]) -> Vec<AuditEvent> {
+        let state = Arc::new(TokioMutex::new(DaemonState {
+            pid: Some(std::process::id()),
+            ..DaemonState::default()
+        }));
+        // No file and no stunnel log: this exercises the parsing, and the
+        // client column is asserted to be honestly empty as a result.
+        let mut audit = AuditContext::new(AuditSink::new(None), None, DAEMON_PORT);
+        for line in lines {
+            handle_log_line(line, &state, &mut audit).await;
+        }
+        let state = state.lock().await;
+        state.audit.iter().cloned().collect()
+    }
+
+    /// One complete session as the daemon really logs it.
+    fn a_session() -> Vec<&'static str> {
+        vec![
+            "2026/08/16 07:37:44 [21] connect from localhost (127.0.0.1)",
+            "2026/08/16 07:37:44 [21] rsync allowed access on module pair2ef0d77e70d831e0 from localhost (127.0.0.1)",
+            "2026/08/16 07:37:44 [21] rsync to pair2ef0d77e70d831e0/ from pair2ef0d77e70d831e0@localhost (127.0.0.1)",
+            "2026/08/16 07:37:44 [21] receiving file list",
+            "2026/08/16 07:37:44 [21] rclone-gui-audit 127.0.0.1 pair2ef0d77e70d831e0 pair2ef0d77e70d831e0 recv 62914560 62922276 urlaub 2026/bild 1.jpg",
+            "2026/08/16 07:37:45 [21] sent 40 bytes  received 62930045 bytes  total size 62914560",
+        ]
+    }
+
+    #[tokio::test]
+    async fn a_module_access_is_recorded_with_module_user_time_and_operation() {
+        let events = audit_from(&a_session()).await;
+
+        let granted = events
+            .iter()
+            .find(|e| e.action == AuditAction::AccessGranted)
+            .expect("the access must be in the audit log");
+        assert_eq!(granted.at, "2026/08/16 07:37:44");
+        assert_eq!(granted.module.as_deref(), Some("pair2ef0d77e70d831e0"));
+        assert_eq!(granted.pid, 21);
+
+        // The direction is the only statement about the client's options the
+        // daemon ever makes: `rsync to` is a client that writes.
+        let session = events
+            .iter()
+            .find(|e| e.action == AuditAction::SessionWrite)
+            .expect("the direction must be recorded");
+        assert_eq!(session.user.as_deref(), Some("pair2ef0d77e70d831e0"));
+
+        // The per-file line, including a name with spaces and a slash — which
+        // is why the file name is the last field of the format.
+        let file = events
+            .iter()
+            .find(|e| e.action == AuditAction::FileReceived)
+            .expect("the transferred file must be recorded");
+        assert_eq!(file.path.as_deref(), Some("urlaub 2026/bild 1.jpg"));
+        assert_eq!(file.size, Some(62914560));
+        assert_eq!(file.module.as_deref(), Some("pair2ef0d77e70d831e0"));
+        assert_eq!(file.user.as_deref(), Some("pair2ef0d77e70d831e0"));
+        assert!(!file.destructive);
+
+        assert!(events.iter().any(|e| e.action == AuditAction::SessionEnd));
+    }
+
+    #[tokio::test]
+    async fn without_the_stunnel_log_the_client_column_is_empty_and_not_the_proxy() {
+        let events = audit_from(&a_session()).await;
+        // The daemon log says `127.0.0.1` on every one of these lines. That is
+        // stunnel, not the peer, and writing it into the audit log would make
+        // every client on earth look like it came from the loopback interface.
+        for event in &events {
+            assert_eq!(event.client, None, "{:?} carried a client address", event);
+            assert_eq!(event.client_source, ClientAddressSource::Unavailable);
+            let rendered = serde_json::to_string(event).unwrap();
+            assert!(
+                !rendered.contains("\"client\":\"127.0.0.1\""),
+                "the proxy address must never be reported as the client: {rendered}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_delete_attempt_is_marked_even_though_the_delete_itself_is_refused() {
+        // Measured verbatim: with `refuse options` as shipped, this is the
+        // *only* trace a deletion leaves, because there is no deletion. An
+        // audit log that waited for a successful delete would show nothing at
+        // all and look identical to a peer that never tried.
+        let events = audit_from(&[
+            "2026/08/16 07:37:44 [24] connect from localhost (127.0.0.1)",
+            "2026/08/16 07:37:44 [24] rsync allowed access on module pairaaaa from localhost (127.0.0.1)",
+            "2026/08/16 07:37:44 [24] rsync to pairaaaa/ from pairaaaa@localhost (127.0.0.1)",
+            "2026/08/16 07:37:44 [24] rsync: The server is configured to refuse --delete",
+            "2026/08/16 07:37:44 [24] rsync error: requested action not supported (code 4) at clientserver.c(1185) [Receiver=3.4.3]",
+        ])
+        .await;
+
+        let refused = events
+            .iter()
+            .find(|e| e.action == AuditAction::OptionRefused)
+            .expect("a refused option must be recorded");
+        assert_eq!(refused.refused_option.as_deref(), Some("delete"));
+        assert!(refused.concerns_deletion());
+        // Nothing was destroyed, so `destructive` stays false — the two
+        // questions are kept apart on purpose.
+        assert!(!refused.destructive);
+        assert_eq!(refused.module.as_deref(), Some("pairaaaa"));
+        assert_eq!(refused.user.as_deref(), Some("pairaaaa"));
+
+        // The other way of destroying data through a pairing.
+        let events = audit_from(&[
+            "2026/08/16 07:37:44 [25] connect from localhost (127.0.0.1)",
+            "2026/08/16 07:37:44 [25] rsync: The server is configured to refuse --remove-source-files",
+        ])
+        .await;
+        let refused = events
+            .iter()
+            .find(|e| e.action == AuditAction::OptionRefused)
+            .unwrap();
+        assert_eq!(
+            refused.refused_option.as_deref(),
+            Some("remove-source-files")
+        );
+        assert!(refused.concerns_deletion());
+    }
+
+    #[tokio::test]
+    async fn a_real_deletion_is_marked_destructive() {
+        // Not reachable through a generated module today, because `delete` is
+        // in `REFUSED_OPTIONS`. It becomes reachable the day `rsync:delete`
+        // exists, and these are the lines rsync writes then — measured against
+        // a module with the refusals removed, not guessed from the format
+        // string. A deletion carries `0 0` for size and bytes, so the file name
+        // still begins at the seventh field.
+        let events = audit_from(&[
+            "2026/08/16 07:37:44 [48] connect from localhost (127.0.0.1)",
+            "2026/08/16 07:37:44 [48] rsync allowed access on module m1 from localhost (127.0.0.1)",
+            "2026/08/16 07:37:44 [48] rclone-gui-audit 127.0.0.1 m1 m1 del. 0 0 victim.txt",
+            "2026/08/16 07:37:44 [48] rclone-gui-audit 127.0.0.1 m1 m1 del. 0 0 mit leer zeichen.txt",
+            "2026/08/16 07:37:44 [48] rclone-gui-audit 127.0.0.1 m1 m1 recv 6 46 a.txt",
+        ])
+        .await;
+        let deleted: Vec<_> = events
+            .iter()
+            .filter(|e| e.action == AuditAction::FileDeleted)
+            .collect();
+        assert_eq!(deleted.len(), 2, "both deletions must be recorded");
+        assert!(deleted.iter().all(|e| e.destructive));
+        assert!(deleted.iter().all(|e| e.concerns_deletion()));
+        assert_eq!(deleted[0].path.as_deref(), Some("victim.txt"));
+        assert_eq!(deleted[1].path.as_deref(), Some("mit leer zeichen.txt"));
+        // The write in the same session is not swept up as destructive.
+        assert!(events
+            .iter()
+            .any(|e| e.action == AuditAction::FileReceived && !e.destructive));
+    }
+
+    #[tokio::test]
+    async fn a_rejected_connection_is_recorded_too() {
+        let events = audit_from(&[
+            "2026/08/16 07:37:45 [93] connect from localhost (127.0.0.1)",
+            "2026/08/16 07:37:45 [93] auth failed on module m1 from localhost (127.0.0.1) for m1: password mismatch",
+            "2026/08/16 07:37:45 [94] connect from localhost (127.0.0.1)",
+            "2026/08/16 07:37:45 [94] unknown module 'gibtsnicht' tried from localhost (127.0.0.1)",
+        ])
+        .await;
+        let denied: Vec<_> = events
+            .iter()
+            .filter(|e| e.action == AuditAction::AccessDenied)
+            .collect();
+        assert_eq!(denied.len(), 2, "both refusals must be recorded");
+        assert_eq!(denied[0].module.as_deref(), Some("m1"));
+        assert_eq!(denied[0].user.as_deref(), Some("m1"));
+    }
+
+    #[tokio::test]
+    async fn a_file_name_cannot_forge_an_audit_line() {
+        // The sentinel sits in front of every field the client controls, so a
+        // file called like a log line cannot inject one. The daemon writes the
+        // name into the *last* field.
+        let events = audit_from(&[
+            "2026/08/16 07:37:44 [21] connect from localhost (127.0.0.1)",
+            "2026/08/16 07:37:44 [21] rsync allowed access on module m1 from localhost (127.0.0.1)",
+            "2026/08/16 07:37:44 [21] rclone-gui-audit 127.0.0.1 m1 m1 recv 6 6 rclone-gui-audit 9.9.9.9 root evil del. 0 0 boese.txt",
+        ])
+        .await;
+        let file = events
+            .iter()
+            .find(|e| e.action == AuditAction::FileReceived)
+            .expect("the file must be recorded as received, not as a deletion");
+        assert!(!events.iter().any(|e| e.destructive));
+        assert_eq!(file.module.as_deref(), Some("m1"));
+        assert_eq!(
+            file.path.as_deref(),
+            Some("rclone-gui-audit 9.9.9.9 root evil del. 0 0 boese.txt")
+        );
+    }
+
+    #[tokio::test]
+    async fn the_daemons_own_shutdown_summary_is_not_a_session() {
+        // `sent … received … total size …` is written twice: by each child at
+        // the end of its transfer, and by the daemon itself when it stops. The
+        // second one has the daemon's pid and no session — mistaking it for a
+        // connection ending is exactly the error that produced 40 stale
+        // entries out of 40 in an earlier attempt.
+        let events =
+            audit_from(&["2026/08/16 07:37:46 [18] sent 0 bytes  received 0 bytes  total size 0"])
+                .await;
+        assert!(events.is_empty(), "got {events:?}");
+    }
+
+    #[test]
+    fn the_stunnel_log_is_read_for_the_peer_address() {
+        // Copied from a real stunnel 5.75 at `debug = 5`. Both lines carry the
+        // same thread id; the second names the port stunnel uses towards the
+        // daemon, and that port is what makes the join exact.
+        let accepted =
+            "2026.08.16 05:44:45 LOG5[0]: Service [rsyncd-tls] accepted connection from 192.168.224.3:51840";
+        let connected =
+            "2026.08.16 05:44:45 LOG5[0]: Service [rsyncd-tls] connected remote server from 127.0.0.1:38790";
+
+        assert_eq!(stunnel_thread_id(accepted).as_deref(), Some("0"));
+        assert_eq!(
+            stunnel_accepted_peer(accepted),
+            Some(("192.168.224.3".to_string(), 51840))
+        );
+        assert_eq!(stunnel_backend_port(connected), Some(38790));
+        // The "accepted" line must not be read as a backend port and vice
+        // versa, or every address would be the loopback one again.
+        assert_eq!(stunnel_backend_port(accepted), None);
+        assert_eq!(stunnel_accepted_peer(connected), None);
+        assert!(parse_stunnel_time(accepted).is_some());
+        // stunnel's own startup chatter carries a non-numeric thread id and no
+        // connection at all.
+        let startup = "2026.08.16 05:44:44 LOG5[ui]: Configuration successful";
+        assert_eq!(stunnel_thread_id(startup).as_deref(), Some("ui"));
+        assert_eq!(stunnel_accepted_peer(startup), None);
+    }
+
+    #[test]
+    fn the_two_logs_are_joined_over_the_port_and_only_then_over_the_time() {
+        let mut index = StunnelIndex::new(PathBuf::from("/nonexistent"));
+        for line in [
+            "2026.08.16 05:44:45 LOG5[0]: Service [rsyncd-tls] accepted connection from 192.168.224.3:51840",
+            "2026.08.16 05:44:45 LOG5[0]: Service [rsyncd-tls] connected remote server from 127.0.0.1:38790",
+            "2026.08.16 05:44:45 LOG5[1]: Service [rsyncd-tls] accepted connection from 10.0.0.9:2222",
+            "2026.08.16 05:44:45 LOG5[1]: Service [rsyncd-tls] connected remote server from 127.0.0.1:38791",
+        ] {
+            index.ingest(line);
+        }
+
+        let at = parse_rsync_time("2026/08/16 05:44:45 [21] connect from localhost (127.0.0.1)");
+        // Two connections in the same second: only the port tells them apart,
+        // and it does so exactly. This is the case `max connections = 4` makes
+        // ordinary and that a time-only match would get wrong half the time.
+        assert_eq!(
+            index.lookup(Some(38791), at),
+            Some((
+                "10.0.0.9".to_string(),
+                2222,
+                ClientAddressSource::StunnelPort
+            ))
+        );
+        // Without a port the newest unclaimed entry within the window wins,
+        // and it is labelled as the weaker match it is.
+        let (peer, _, source) = index.lookup(None, at).expect("a time match");
+        assert_eq!(peer, "192.168.224.3");
+        assert_eq!(source, ClientAddressSource::StunnelTime);
+        // Claimed entries are not handed out twice by the time path.
+        assert_eq!(index.lookup(None, at), None);
+        // A connection from long before the window is not adopted.
+        let much_later =
+            parse_rsync_time("2026/08/16 06:44:45 [21] connect from localhost (127.0.0.1)");
+        assert_eq!(index.lookup(None, much_later), None);
+    }
+
+    #[test]
+    fn the_audit_file_is_json_lines_with_mode_0600() {
+        let base = scratch("audit-9f3d4888");
+        fs::create_dir_all(&base).unwrap();
+        let path = base.join("audit.log");
+        let mut sink = AuditSink::new(Some(path.clone()));
+        let event = AuditEvent {
+            at: "2026/08/16 07:37:44".to_string(),
+            pid: 21,
+            module: Some("pairaaaa".to_string()),
+            user: Some("pairaaaa".to_string()),
+            client: Some("192.168.224.3".to_string()),
+            client_port: Some(51840),
+            client_source: ClientAddressSource::StunnelPort,
+            action: AuditAction::FileReceived,
+            destructive: false,
+            path: Some("bild.jpg".to_string()),
+            size: Some(6),
+            refused_option: None,
+            detail: "rclone-gui-audit …".to_string(),
+        };
+        sink.record(&event);
+        sink.record(&event);
+
+        let written = fs::read_to_string(&path).unwrap();
+        assert_eq!(written.lines().count(), 2, "one JSON object per line");
+        let parsed: serde_json::Value = serde_json::from_str(written.lines().next().unwrap())
+            .expect("every line must be valid JSON on its own");
+        assert_eq!(parsed["module"], "pairaaaa");
+        assert_eq!(parsed["client"], "192.168.224.3");
+        assert_eq!(parsed["client_source"], "stunnel_port");
+        assert_eq!(parsed["action"], "file_received");
+        // The audit log names who connected from where; it is not world
+        // readable, for the same reason the secrets file is not.
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, FILE_MODE, "audit log mode is {mode:o}");
+        fs::remove_dir_all(&base).ok();
+    }
+
+    /// The one failure mode that would make this audit log worse than none.
+    ///
+    /// A log that records who accessed what is useful; a log that records the
+    /// credential alongside it hands an attacker every pairing at once, in a
+    /// file that exists precisely so it can be read later. So: drive a full
+    /// session for a *real* module through the reader, with the sink writing to
+    /// disk, and assert the secret is in none of it — not in an event, not in
+    /// the serialised JSON, not in the file, and not in a `Debug` rendering of
+    /// the configuration that holds it.
+    #[tokio::test]
+    async fn the_module_secret_reaches_neither_the_audit_log_nor_a_debug_rendering() {
+        let base = scratch("audit-secret-9f3d4888");
+        let share = base.join("share");
+        fs::create_dir_all(&share).unwrap();
+        let module = module_in(&share, true);
+        let name = module.name().to_string();
+        let secret = module.secret().to_string();
+        assert!(!secret.is_empty());
+
+        let audit_path = base.join("audit.log");
+        let state = Arc::new(TokioMutex::new(DaemonState {
+            pid: Some(std::process::id()),
+            ..DaemonState::default()
+        }));
+        let mut audit =
+            AuditContext::new(AuditSink::new(Some(audit_path.clone())), None, DAEMON_PORT);
+        // A whole session for this module, including the failed-auth line —
+        // the one place where a daemon could conceivably echo a credential.
+        for line in [
+            "2026/08/16 07:37:44 [21] connect from localhost (127.0.0.1)".to_string(),
+            format!(
+                "2026/08/16 07:37:44 [21] auth failed on module {name} from localhost (127.0.0.1) for {name}: password mismatch"
+            ),
+            format!(
+                "2026/08/16 07:37:44 [21] rsync allowed access on module {name} from localhost (127.0.0.1)"
+            ),
+            format!(
+                "2026/08/16 07:37:44 [21] rsync to {name}/ from {name}@localhost (127.0.0.1)"
+            ),
+            format!("2026/08/16 07:37:44 [21] rclone-gui-audit 127.0.0.1 {name} {name} recv 6 6 a.txt"),
+            "2026/08/16 07:37:45 [21] sent 40 bytes  received 62 bytes  total size 6".to_string(),
+        ] {
+            handle_log_line(&line, &state, &mut audit).await;
+        }
+
+        let events: Vec<AuditEvent> = state.lock().await.audit.iter().cloned().collect();
+        assert!(
+            !events.is_empty(),
+            "the session must have produced audit events at all"
+        );
+        // The access is attributable: module and peer-source are on record.
+        assert!(events
+            .iter()
+            .any(|e| e.module.as_deref() == Some(name.as_str())));
+        for event in &events {
+            let rendered = serde_json::to_string(event).unwrap();
+            assert!(
+                !rendered.contains(&secret),
+                "the module secret leaked into an audit event: {rendered}"
+            );
+            assert!(
+                !format!("{event:?}").contains(&secret),
+                "the module secret leaked into an audit event's Debug output"
+            );
+        }
+
+        let written = fs::read_to_string(&audit_path).unwrap();
+        assert!(!written.is_empty(), "the audit file must have been written");
+        assert!(
+            !written.contains(&secret),
+            "the module secret leaked into the audit file on disk"
+        );
+
+        // And the derive that would have leaked it: `ModuleConfig` redacts, and
+        // `DaemonConfig` inherits that through it.
+        let mut cfg = DaemonConfig::new(base.join("secrets"));
+        cfg.add_module(module);
+        assert!(!format!("{cfg:?}").contains(&secret));
+        assert!(format!("{cfg:?}").contains("<redacted>"));
+
+        fs::remove_dir_all(&base).ok();
     }
 
     #[test]
@@ -2861,6 +5171,379 @@ mod tests {
         assert!(!is_child_of(u32::MAX, me));
         assert_eq!(count_zombie_children(u32::MAX), 0);
     }
+
+    // -----------------------------------------------------------------------
+    // Start-up: readiness and a blocked pid file (tickets e3e971ee, f581f435)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_lock_holder_is_read_out_of_proc_locks_by_device_and_inode() {
+        // Real shape, including a waiter line (`->`) and a foreign file. The
+        // waiter does not hold anything and must never be reported as the
+        // blocker; the columns before the device triple differ per lock type,
+        // which is why the pid is taken from in front of the triple.
+        let locks = "\
+1: POSIX  ADVISORY  WRITE 411 08:03:1310721 0 EOF
+2: FLOCK  ADVISORY  WRITE 4242 08:03:1310722 0 EOF
+2: -> FLOCK  ADVISORY  WRITE 4243 08:03:1310722 0 EOF
+3: FLOCK  ADVISORY  WRITE 99 fd:00:22 0 EOF
+";
+        let dev = 0x0803_u64;
+        assert_eq!(flock_holder(locks, dev, 1310722), Some(4242));
+        assert_eq!(flock_holder(locks, dev, 1310721), Some(411));
+        // Same inode on a different device is a different file.
+        assert_eq!(flock_holder(locks, 0xfd00, 1310722), None);
+        assert_eq!(flock_holder(locks, dev, 999), None);
+    }
+
+    #[test]
+    fn the_device_numbers_are_encoded_the_way_proc_locks_prints_them() {
+        // st_dev for major 8, minor 3 — the usual sda3.
+        let dev = (8u64 << 8) | 3;
+        assert_eq!(dev_major(dev), 8);
+        assert_eq!(dev_minor(dev), 3);
+    }
+
+    #[test]
+    fn a_pid_file_nobody_holds_does_not_block_a_start() {
+        let base = scratch("free-pid-file");
+        let pid_file = base.join("rsyncd.pid");
+        // Not there at all.
+        assert_eq!(pid_file_holder(&pid_file), None);
+        assert_eq!(pid_file_blocker(&pid_file), None);
+        // There, but nothing locks it, and its content names a pid that cannot
+        // exist: a leftover from a daemon that was killed. The kernel dropped
+        // the lock with the process, so this must not read as "running".
+        fs::write(&pid_file, format!("{}\n", u32::MAX)).unwrap();
+        assert_eq!(pid_file_holder(&pid_file), None);
+        assert_eq!(pid_file_blocker(&pid_file), None);
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn a_live_process_named_in_the_pid_file_is_reported_with_its_command() {
+        let base = scratch("stale-pid-file");
+        let pid_file = base.join("rsyncd.pid");
+        // The fallback path: the lock could not be attributed, but the file
+        // names a process that is still there — this one.
+        fs::write(&pid_file, format!("{}\n", std::process::id())).unwrap();
+        let holder = pid_file_blocker(&pid_file).expect("a live pid must be reported");
+        assert_eq!(holder.pid, Some(std::process::id()));
+        assert!(holder
+            .to_string()
+            .contains(&format!("pid {}", std::process::id())));
+        assert!(
+            holder.command.is_some(),
+            "the command line belongs in the message"
+        );
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[tokio::test]
+    async fn a_daemon_that_cannot_be_spawned_fails_at_once_instead_of_after_the_timeout() {
+        // The measurement behind the ticket: with the old log-line wait a
+        // missing rsync binary delayed the whole application by the full 30
+        // seconds, because nothing was watching the child. It has to be over
+        // in well under a second now.
+        let base = scratch("no-binary");
+        let conf = base.join("rsyncd.conf");
+        let registry = Arc::new(TokioMutex::new(ModuleRegistry::new(
+            &conf,
+            base.join("secrets"),
+        )));
+        let settings = DaemonSettings::new(&conf, base.join("run"))
+            .with_binary(base.join("no-such-rsync"))
+            .with_port(free_port())
+            .without_stunnel_log()
+            .without_audit_file();
+
+        let started = std::time::Instant::now();
+        let error = match DaemonHandle::start(settings, registry).await {
+            Err(e) => e,
+            Ok(_) => panic!("a daemon whose binary does not exist cannot start"),
+        };
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "a failed start took {elapsed:?}; it must not sit out the {}s timeout",
+            LISTEN_TIMEOUT.as_secs()
+        );
+        let message = error.to_string();
+        assert!(
+            message.contains("did not survive its start"),
+            "the cause has to be in the message: {message}"
+        );
+        assert!(
+            message.contains("is rsync installed"),
+            "the underlying spawn error has to be in the message: {message}"
+        );
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[tokio::test]
+    async fn readiness_is_a_connection_and_not_a_log_line() {
+        // The old wait read the daemon's log file, which rsync writes *before*
+        // it binds — a wait that returns while nothing listens is exactly the
+        // bug. Here nothing ever writes a log line at all, and the wait still
+        // has to succeed, but not one moment before the port answers.
+        let base = scratch("connect-readiness");
+        let conf = base.join("rsyncd.conf");
+        let port = free_port();
+        let registry = Arc::new(TokioMutex::new(ModuleRegistry::new(
+            &conf,
+            base.join("secrets"),
+        )));
+        let settings = DaemonSettings::new(&conf, base.join("run"))
+            .with_port(port)
+            .without_stunnel_log()
+            .without_audit_file();
+
+        // Bind after a delay, from outside: the wait must not return before.
+        let opened = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            tokio::net::TcpListener::bind(format!("{DAEMON_ADDRESS}:{port}"))
+                .await
+                .expect("the stand-in listener")
+        });
+
+        let started = std::time::Instant::now();
+        // What is under test is the wait itself, so it runs on a handle that
+        // supervises nothing: no process, no log, only the socket.
+        let handle = DaemonHandle {
+            settings,
+            registry,
+            state: Arc::new(TokioMutex::new(DaemonState::default())),
+            stopping: Arc::new(AtomicBool::new(false)),
+            supervisor: TokioMutex::new(None),
+            watchdog: TokioMutex::new(None),
+        };
+        handle
+            .wait_until_listening()
+            .await
+            .expect("the wait must return once the port answers");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "the wait returned after {elapsed:?}, before anything was listening"
+        );
+        let _listener = opened.await.expect("the listener task");
+        fs::remove_dir_all(&base).ok();
+    }
+
+    /// A port nothing is using, for a test that must not meet a real daemon.
+    fn free_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+        let port = listener.local_addr().expect("the bound address").port();
+        drop(listener);
+        port
+    }
+
+    // -----------------------------------------------------------------------
+    // Run directory watchdog (ticket 0cedda6f)
+    // -----------------------------------------------------------------------
+
+    /// Settings whose run directory is `dir`, with the watchdog limits given.
+    fn watch_settings(dir: &Path, log_limit: u64, run_dir_limit: u64) -> DaemonSettings {
+        DaemonSettings::new(dir.join("rsyncd.conf"), dir)
+            .without_stunnel_log()
+            .with_log_warn_bytes(log_limit)
+            .with_run_dir_warn_bytes(run_dir_limit)
+    }
+
+    fn fill(path: &Path, bytes: usize) {
+        fs::write(path, vec![b'x'; bytes]).expect("fill");
+    }
+
+    #[test]
+    fn an_oversized_audit_log_is_reported_and_is_not_touched() {
+        let dir = scratch("0cedda6f-report");
+        let settings = watch_settings(&dir, 1024, 0);
+        let audit = settings.audit_file();
+        fill(&audit, 4096);
+        let before = fs::read(&audit).expect("audit log");
+
+        let mut watch = RunDirWatch::new(&settings);
+        let warnings = watch.check(std::time::Instant::now());
+
+        assert_eq!(
+            warnings.len(),
+            1,
+            "exactly the audit log is over the limit: {warnings:?}"
+        );
+        assert_eq!(warnings[0].kind, "audit log");
+        assert_eq!(warnings[0].bytes, 4096);
+        // The whole point of the ticket: it warns, it does not rotate.
+        assert_eq!(
+            fs::read(&audit).expect("audit log after the check"),
+            before,
+            "the watchdog must not shorten the audit log"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_log_under_its_limit_is_not_reported() {
+        let dir = scratch("0cedda6f-quiet");
+        let settings = watch_settings(&dir, 4096, 0);
+        fill(&settings.audit_file(), 4096);
+
+        let mut watch = RunDirWatch::new(&settings);
+        assert!(
+            watch.check(std::time::Instant::now()).is_empty(),
+            "exactly at the limit is not over it"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_warning_repeats_on_growth_and_after_the_interval_but_not_every_check() {
+        let dir = scratch("0cedda6f-repeat");
+        let settings = watch_settings(&dir, 1024, 0);
+        let audit = settings.audit_file();
+        fill(&audit, 2048);
+
+        let mut watch = RunDirWatch::new(&settings);
+        let now = std::time::Instant::now();
+        assert_eq!(watch.check(now).len(), 1, "the first crossing is reported");
+
+        // A minute later, unchanged: still over the limit, and silent — a
+        // warning every minute for the life of the container is noise.
+        assert!(
+            watch.check(now + RUN_DIR_CHECK_INTERVAL).is_empty(),
+            "the same size must not be reported again immediately"
+        );
+
+        // Doubled: that is news even inside the quiet window.
+        fill(&audit, 4096);
+        assert_eq!(
+            watch.check(now + RUN_DIR_CHECK_INTERVAL * 2).len(),
+            1,
+            "a file that doubled has to be reported again"
+        );
+
+        // And a condition that simply persists is repeated eventually, so it
+        // reaches somebody who was not watching at the moment it started.
+        assert!(
+            watch
+                .check(now + RUN_DIR_CHECK_INTERVAL * 2 + RUN_DIR_WARN_REPEAT)
+                .len()
+                == 1,
+            "a persisting condition has to be repeated after the interval"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_directory_total_is_reported_even_when_no_single_file_is_over() {
+        let dir = scratch("0cedda6f-total");
+        let settings = watch_settings(&dir, 1024 * 1024, 3000);
+        fill(&settings.audit_file(), 1024);
+        fill(&settings.log_file(), 1024);
+        fill(&dir.join("stunnel.log"), 1024);
+
+        let mut watch = RunDirWatch::new(&settings);
+        let warnings = watch.check(std::time::Instant::now());
+
+        assert_eq!(warnings.len(), 1, "only the directory total: {warnings:?}");
+        assert_eq!(warnings[0].kind, "run directory");
+        assert_eq!(warnings[0].bytes, 3072);
+        assert!(
+            settings.audit_file().exists() && settings.log_file().exists(),
+            "nothing in the run directory may be removed"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_limit_of_zero_switches_the_check_off() {
+        let dir = scratch("0cedda6f-off");
+        let settings = watch_settings(&dir, 0, 0);
+        fill(&settings.audit_file(), 65536);
+
+        let mut watch = RunDirWatch::new(&settings);
+        assert!(
+            watch.check(std::time::Instant::now()).is_empty(),
+            "a limit of 0 means the file is not watched"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The warning really leaves the process, from the task that produces it.
+    ///
+    /// `#[ignore]`d because it installs a global `tracing` subscriber, which
+    /// only one test per process may do. Run it on its own:
+    ///
+    /// ```text
+    /// cargo test the_watchdog_task_really_prints_the_warning -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore]
+    async fn the_watchdog_task_really_prints_the_warning() {
+        let dir = scratch("0cedda6f-task");
+        let settings = watch_settings(&dir, 1024, 0);
+        let audit = settings.audit_file();
+        fill(&audit, 8192);
+
+        let captured = dir.join("application.log");
+        let sink = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || {
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&sink)
+                    .expect("the capture file")
+            })
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).expect("one subscriber per process");
+
+        let stopping = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn(watch_run_dir(RunDirWatch::new(&settings), stopping));
+        // The first measurement happens before the first sleep, so the warning
+        // is out long before RUN_DIR_CHECK_INTERVAL.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        task.abort();
+
+        let text = fs::read_to_string(&captured).expect("the captured application log");
+        println!("{text}");
+        assert!(
+            text.contains("audit log"),
+            "the warning names the file: {text}"
+        );
+        assert!(
+            text.contains("NOT rotated by this process"),
+            "the warning says who is responsible: {text}"
+        );
+        assert!(
+            text.contains("nothing has been deleted"),
+            "the warning says what it did not do: {text}"
+        );
+        assert_eq!(
+            fs::metadata(&audit).expect("the audit log").len(),
+            8192,
+            "the task must not have shortened the audit log"
+        );
+        // And it did not write its own warning into the directory it warns about.
+        assert!(
+            !captured.starts_with(settings.run_dir.join("audit.log")),
+            "the warning must not land in the audit log"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_missing_run_directory_is_measured_as_empty_rather_than_failing() {
+        let dir = scratch("0cedda6f-missing");
+        let settings = watch_settings(&dir, 1024, 1);
+        let _ = fs::remove_dir_all(&dir);
+
+        let mut watch = RunDirWatch::new(&settings);
+        assert!(
+            watch.check(std::time::Instant::now()).is_empty(),
+            "nothing there is nothing to report"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2948,7 +5631,6 @@ mod real_rsync_probe {
     // that has to use a known one.
     // -----------------------------------------------------------------------
 
-    use std::os::unix::fs::MetadataExt as _;
     use std::process::{Child, Command, Output, Stdio};
     use std::sync::atomic::AtomicU16;
     use std::time::Instant;
@@ -3860,6 +6542,361 @@ mod real_rsync_probe {
             );
         }
 
+        let _ = fs::remove_dir_all(&probe.base);
+    }
+
+    // -----------------------------------------------------------------------
+    // Audit log against a real daemon (ticket 9f3d4888)
+    //
+    //     RSYNCD_PROBE_DIR=<dir> cargo test audit_log_on_the_real_daemon -- --ignored
+    //
+    // The unit tests above parse lines that were copied out of a real log. This
+    // one produces them: it runs the shipped configuration against the rsync on
+    // this machine, puts a stunnel-shaped forwarder in front of the daemon so
+    // the merge of the two logs is exercised for real, and then asserts what
+    // ends up in the audit log — including what stands in the client column.
+    // -----------------------------------------------------------------------
+
+    /// A stand-in for stunnel: forwards to the daemon and logs like stunnel does.
+    ///
+    /// It is not a TLS terminator and does not need to be. What is being tested
+    /// is the join between two log files, and the only things that join depends
+    /// on are the two log lines and the loopback port pair — which this
+    /// reproduces exactly, down to the `LOG5[<id>]` thread id.
+    async fn stunnel_shaped_forwarder(listen: tokio::net::TcpListener, backend: u16, log: PathBuf) {
+        let mut id = 0u32;
+        loop {
+            let Ok((mut inbound, peer)) = listen.accept().await else {
+                return;
+            };
+            let Ok(mut outbound) = tokio::net::TcpStream::connect(("127.0.0.1", backend)).await
+            else {
+                return;
+            };
+            let local = outbound.local_addr().expect("local address");
+            let now = chrono::Local::now().format("%Y.%m.%d %H:%M:%S");
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log)
+                .expect("stunnel log");
+            writeln!(
+                file,
+                "{now} LOG5[{id}]: Service [rsyncd-tls] accepted connection from {}:{}",
+                peer.ip(),
+                peer.port()
+            )
+            .expect("stunnel log");
+            writeln!(
+                file,
+                "{now} LOG5[{id}]: Service [rsyncd-tls] connected remote server from 127.0.0.1:{}",
+                local.port()
+            )
+            .expect("stunnel log");
+            drop(file);
+            id += 1;
+            tokio::spawn(async move {
+                let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+            });
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn audit_log_on_the_real_daemon() {
+        let probe = LifecycleProbe::new();
+        let (uid, gid) = (0, 0); // inside the user namespace the probe user is root
+
+        let source = probe.path("src");
+        fs::write(source.join("bericht.txt"), "hallo\n").unwrap();
+        fs::write(source.join("mit leer zeichen.txt"), "auch hallo\n").unwrap();
+
+        let share = probe.share("share");
+        let victim = share.join("victim.txt");
+        fs::write(&victim, "do not delete me\n").unwrap();
+
+        let mut registry =
+            ModuleRegistry::new(probe.path("etc/rsyncd.conf"), probe.path("etc/secrets"));
+        let module = registry.add_pairing(&share, true, uid, gid, 8).unwrap();
+        let registry = Arc::new(TokioMutex::new(registry));
+
+        let stunnel_log = probe.path("etc/stunnel.log");
+        let settings = probe.settings().with_stunnel_log(&stunnel_log);
+        let audit_file = settings.audit_file();
+        let daemon = DaemonHandle::start(settings, Arc::clone(&registry))
+            .await
+            .expect("the daemon must start");
+
+        // The generated configuration must carry the log file and the format;
+        // without either the daemon writes nothing worth auditing.
+        let conf = fs::read_to_string(probe.path("etc/rsyncd.conf")).unwrap();
+        assert!(conf.contains("\nlog file = "), "conf:\n{conf}");
+        assert!(
+            conf.contains("    transfer logging = yes\n"),
+            "conf:\n{conf}"
+        );
+        assert!(
+            conf.contains(&format!("    log format = {MODULE_LOG_FORMAT}\n")),
+            "conf:\n{conf}"
+        );
+
+        // The forwarder stands where stunnel stands: the client talks to it,
+        // it talks to the daemon on loopback.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("forwarder port");
+        let front_port = listener.local_addr().unwrap().port();
+        let forwarder = tokio::spawn(stunnel_shaped_forwarder(
+            listener,
+            probe.port,
+            stunnel_log.clone(),
+        ));
+
+        let password = probe.password_file(&module);
+        let through_stunnel = |extra: Vec<&str>| {
+            Command::new("rsync")
+                .arg("-a")
+                .arg(format!("--password-file={}", password.display()))
+                .args(extra)
+                .arg(format!("{}/", source.display()))
+                .arg(format!(
+                    "rsync://{name}@127.0.0.1:{front_port}/{name}/",
+                    name = module.name()
+                ))
+                .output()
+                .expect("cannot run rsync")
+        };
+
+        // --- 1. an ordinary access ------------------------------------------
+        let out = through_stunnel(vec![]);
+        assert!(out.status.success(), "push: {}", stderr(&out));
+
+        // --- 2. an attempt to delete ----------------------------------------
+        let out = through_stunnel(vec!["--delete"]);
+        assert!(!out.status.success(), "--delete must be refused");
+        assert!(victim.exists(), "the victim file was deleted");
+
+        // The mirror polls; give it a moment to catch up with the daemon.
+        until(
+            "the audit log to be written",
+            Duration::from_secs(30),
+            || {
+                fs::read_to_string(&audit_file)
+                    .map(|log| log.contains("option_refused"))
+                    .unwrap_or(false)
+            },
+        )
+        .await;
+
+        let events = daemon.audit_events(usize::MAX).await;
+        assert!(!events.is_empty(), "the audit log must not be empty");
+
+        // Who used which module, when, with what effect.
+        let received: Vec<&AuditEvent> = events
+            .iter()
+            .filter(|e| e.action == AuditAction::FileReceived)
+            .collect();
+        assert!(
+            received
+                .iter()
+                .any(|e| e.path.as_deref() == Some("bericht.txt")),
+            "the transferred file is missing from the audit log: {events:#?}"
+        );
+        assert!(
+            received
+                .iter()
+                .any(|e| e.path.as_deref() == Some("mit leer zeichen.txt")),
+            "a file name with spaces was mangled: {events:#?}"
+        );
+        for event in &received {
+            assert_eq!(event.module.as_deref(), Some(module.name()));
+            assert_eq!(event.user.as_deref(), Some(module.name()));
+            assert!(
+                parse_rsync_time(&format!("{} x", event.at)).is_some(),
+                "unparseable timestamp {:?}",
+                event.at
+            );
+        }
+        // The direction of the session is the one statement about the client's
+        // options the daemon makes; `rsync to` is a client that writes.
+        assert!(
+            events.iter().any(|e| e.action == AuditAction::SessionWrite),
+            "the session direction is missing: {events:#?}"
+        );
+
+        // The delete attempt, marked as such.
+        let deletions = daemon.deletion_events(usize::MAX).await;
+        assert!(
+            deletions
+                .iter()
+                .any(|e| e.refused_option.as_deref() == Some("delete")),
+            "the delete attempt is not marked in the audit log: {events:#?}"
+        );
+
+        // --- 3. the client column -------------------------------------------
+        // The whole point of the exercise: the daemon says 127.0.0.1 for every
+        // peer, and the audit log must not repeat that.
+        let with_client: Vec<&AuditEvent> = events.iter().filter(|e| e.client.is_some()).collect();
+        assert!(
+            !with_client.is_empty(),
+            "no event carries a client address, so the two logs were not joined: {events:#?}"
+        );
+        assert!(
+            with_client
+                .iter()
+                .any(|e| e.client_source == ClientAddressSource::StunnelPort),
+            "the port match never fired; only the weaker time match did: {with_client:#?}"
+        );
+        for event in &with_client {
+            assert!(
+                event.client_port.is_some(),
+                "an address without the port it came from: {event:#?}"
+            );
+        }
+
+        // And the audit file holds the same thing, one JSON object per line.
+        let written = fs::read_to_string(&audit_file).expect("audit log");
+        for line in written.lines() {
+            let value: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| panic!("bad audit line {line:?}: {e}"));
+            assert!(value["at"].is_string());
+        }
+        assert!(
+            written.contains("\"refused_option\":\"delete\""),
+            "the delete attempt is missing from the audit file"
+        );
+        // The secret must not leak into the audit log along the way.
+        assert!(
+            !written.contains(module.secret()),
+            "the module secret reached the audit log"
+        );
+
+        // The probe exists to be read, not only to pass: print what was
+        // actually recorded, so the evidence is in the test output rather than
+        // in somebody's terminal history.
+        println!("--- daemon log ---");
+        println!(
+            "{}",
+            fs::read_to_string(probe.path("run/rsyncd.log")).unwrap_or_default()
+        );
+        println!("--- stunnel log ---");
+        println!("{}", fs::read_to_string(&stunnel_log).unwrap_or_default());
+        println!("--- audit log ---");
+        println!("{written}");
+
+        forwarder.abort();
+        daemon.shutdown().await;
+        let _ = fs::remove_dir_all(&probe.base);
+    }
+
+    // -----------------------------------------------------------------------
+    // An orphaned daemon on the pid file (ticket f581f435)
+    //
+    // The state a hard kill of the application leaves behind: the daemon
+    // outlives it and keeps the `flock` on the pid file, so every later start
+    // fails with `failed to lock pid file: Resource temporarily unavailable`
+    // and nothing says which process is in the way. Reproduced here with a
+    // real rsync daemon that this process does not supervise — which is
+    // exactly what an orphan is.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    #[ignore]
+    async fn a_daemon_holding_the_pid_file_is_named_and_stops_blocking_once_it_is_gone() {
+        let probe = LifecycleProbe::new();
+        let run_dir = probe.path("run");
+        fs::create_dir_all(&run_dir).expect("run dir");
+        let pid_file = run_dir.join("rsyncd.pid");
+
+        // The orphan: a daemon with no modules — it only has to hold the lock.
+        let orphan_conf = probe.path("etc/orphan.conf");
+        fs::write(
+            &orphan_conf,
+            format!(
+                "pid file = {}\nlock file = {}\nlog file = {}\naddress = 127.0.0.1\n",
+                pid_file.display(),
+                run_dir.join("rsyncd.lock").display(),
+                run_dir.join("orphan.log").display(),
+            ),
+        )
+        .expect("orphan configuration");
+        let orphan_port = probe.port + 4;
+        let mut orphan = Command::new("rsync")
+            .args([
+                "--daemon".to_string(),
+                "--no-detach".to_string(),
+                format!("--config={}", orphan_conf.display()),
+                format!("--port={orphan_port}"),
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the orphaned daemon");
+        let orphan_pid = orphan.id();
+        for _ in 0..100 {
+            if fs::read_to_string(&pid_file)
+                .map(|content| !content.trim().is_empty())
+                .unwrap_or(false)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // A start against the same run directory now has to refuse, at once,
+        // and say who is holding it.
+        let conf = probe.path("etc/rsyncd.conf");
+        let registry = Arc::new(TokioMutex::new(ModuleRegistry::new(
+            &conf,
+            probe.path("etc/secrets"),
+        )));
+        let settings = DaemonSettings::new(&conf, &run_dir)
+            .with_port(probe.port)
+            .without_stunnel_log()
+            .without_audit_file();
+        let started = Instant::now();
+        let error = match DaemonHandle::start(settings, Arc::clone(&registry)).await {
+            Err(e) => e,
+            Ok(_) => panic!("a second daemon on a locked pid file must not start"),
+        };
+        let blocked_after = started.elapsed();
+        println!("blocked start took {blocked_after:?}: {error}");
+        assert!(
+            error.to_string().contains(&format!("pid {orphan_pid}")),
+            "the message has to name the blocking process: {error}"
+        );
+        assert!(
+            blocked_after < Duration::from_secs(2),
+            "the refusal took {blocked_after:?}; it must not sit out the timeout"
+        );
+
+        // SIGTERM, not SIGKILL: the kernel drops the lock with the process
+        // either way, but a hard kill is what leaves the partial files behind.
+        assert!(
+            send_signal(orphan_pid, "TERM").await,
+            "SIGTERM to the orphan"
+        );
+        let _ = orphan.wait();
+
+        // With the orphan gone the lock is gone with it, and the same settings
+        // start normally — no leftover state to clean up by hand.
+        let settings = DaemonSettings::new(&conf, &run_dir)
+            .with_port(probe.port)
+            .without_stunnel_log()
+            .without_audit_file();
+        let started = Instant::now();
+        let daemon = DaemonHandle::start(settings, registry)
+            .await
+            .expect("the start has to succeed once the lock is gone");
+        println!("start after the orphan took {:?}", started.elapsed());
+        assert!(
+            tokio::net::TcpStream::connect(format!("{DAEMON_ADDRESS}:{}", probe.port))
+                .await
+                .is_ok(),
+            "the daemon reported ready, so the port has to answer"
+        );
+        daemon.shutdown().await;
         let _ = fs::remove_dir_all(&probe.base);
     }
 }
