@@ -1,184 +1,186 @@
 # continue.md — Wiederaufnahme
 
-Stand: 18.08.2026. Vorheriger Lauf endete am Token-Limit, Alle Agenten **geordnet gestoppt**,
-nicht abgestürzt.
+Stand: 19.08.2026, 00:30. Lauf zur vereinbarten Frist geordnet beendet.
 Arbeitsanweisung: `AGENTS.md`. Board: https://plankton.tiny-dev.de/p/rclone-gui
 
 ---
 
-## 1. Zustand des Arbeitsbaums
+## 1. Wo die Arbeit liegt
 
-**Grün, und zwar geprüft, nicht angenommen:**
+**Branch `feat/epic1-ui-rework-und-sicherheitshaertung`, gepusht.** Von dort
+weiterarbeiten und später nach `main` mergen.
+
+```
+1672d62  Epic 1 UI-Rework, Auth-Fundament und Sicherheitshaertung
+7f99967  Passwort-Reset, Delete-Option und Haertung des Schreibwegs
+```
+
+**`.env` ist bewusst nicht committet** — dort steht ein echtes Admin-Passwort im
+Klartext. Die Datei ist inzwischen gitignored; das Risiko ist damit strukturell weg.
+
+### Eine Lehre, die Geld gekostet hat
+Der erste Commit entstand, **während Agenten liefen**, und hat ihre Arbeit eingesammelt.
+Ein Nachfolger las danach „Teilarbeit liegt uncommittet im Baum", fand einen sauberen
+`git status` und hätte zwei fertige Tickets beinahe neu geschrieben.
+
+**Ein sauberer Arbeitsbaum heisst hier nicht, dass nichts getan wurde.**
+Vor dem Neuschreiben immer `git log -p -- <datei>` und den Ist-Zustand ansehen.
+
+---
+
+## 2. Zustand des Baums
+
+**Grün, gemessen nach dem Ende aller Agenten:**
 
 ```
 cargo check      0 Fehler
-cargo test       343 bestanden, 0 Fehlschläge, 8 ignoriert
+cargo test       395 bestanden, 0 Fehlschläge, 9 ignoriert
 JS-Module        alle 21 als ESM syntaktisch sauber
 Marker           <!-- RCLONE_GUI_SCRIPTS --> vorhanden
 clippy           18 Findings, alle vorbestehend
                  (main.rs 13, sync.rs 5) — Ticket e81f29bb
 ```
 
-**Alles ist committet** — Branch `feat/epic1-ui-rework-und-sicherheitshaertung`,
-Commit `1672d62`, gepusht nach `origin`. Von dort aus weiterarbeiten und später nach
-`main` mergen.
-
-**`.env` ist bewusst NICHT im Commit**: dort steht ein echtes Admin-Passwort im
-Klartext, und die Datei wird getrackt. Ein Push hätte es nach GitHub getragen, wo es
-auch nach dem Löschen in der Historie bliebe. Wer `git add -A` benutzt, muss das
-mitdenken — oder `git rm --cached .env` + Eintrag in `.gitignore` + ein `.env.example`
-ohne Werte. Das ist eine Entscheidung des Nutzers, weil es alle Klonenden betrifft.
-
-`.gitignore` wurde um `/data/rsyncd/` ergänzt — dort liegt `secrets/rsyncd.secrets` im
-Klartext, das wäre sonst mitcommittet worden.
-
 ---
 
-## 2. Board
+## 3. Board
 
 | Spalte | Anzahl |
 |---|---|
-| Done | **61** |
-| Testing | 5 (ungeprüft, siehe unten) |
+| Done | **78** |
+| Testing | 2 |
 | In Progress | 0 |
-| Todo | 75 |
+| Todo | 74 |
 
-### In `Testing`, noch von niemandem geprüft
-| Ticket | Was |
-|---|---|
-| `07267d40` | SSRF-Schutz, **Nachbesserung** nach Rückweisung |
-| `e3e971ee` | `wait_until_listening` per TCP-Connect statt Logzeile |
-| `f581f435` | Gesperrte PID-Datei — nur die `rsyncd.rs`-Hälfte |
-| `88b8c455` | stunnel schreibt jetzt ein Log |
-| `e2d122fb` | 401-Behandlung in `api.js` |
-
-### Zurück in `Todo`, weil der Agent mittendrin gestoppt wurde
-
-**Korrektur (nachträglich, wichtig):** Die Annahme „Teilarbeit liegt uncommittet im
-Arbeitsbaum" war **falsch**. Der Commit `1672d62` wurde gemacht, *während* diese Agenten
-liefen, und hat ihre Arbeit **mit eingesammelt** — genau der Fall, vor dem `AGENTS.md`
-warnt. Zwei der vier Tickets waren dadurch bereits vollständig umgesetzt; ein Nachfolger
-hätte sie beinahe neu geschrieben.
-
-**Also: erst `git log -p` und den Ist-Zustand der Datei ansehen, nicht nur
-`git status`.** Ein sauberer Arbeitsbaum heisst hier *nicht*, dass nichts getan wurde.
-
-| Ticket | Stand beim Abbruch |
-|---|---|
-| `40103f77` | Passwort-Reset per Token. **Praktisch nichts** — Agent war beim Lesen. |
-| `0cedda6f` | Audit-Log-Grössengrenze. Weit fortgeschritten; `config/logrotate-rclone-gui.conf` existiert bereits. |
-| `8cc0df6b` | `start.sh`-Krücke entfernen. Unklar wie weit. |
-| `c9a674ee` | Atomarer Config-Schreibweg. War bei `remove_key_from_contents` / `write_config_atomically` in `config_manager.rs`. |
+In `Testing` liegen `7f74ec7b` (rsync-Exit-Codes) und `374aff19` (atomares
+`save_to_file`). Beide sind gebaut und gemessen, nur die Abnahme fehlt.
 
 ---
 
-## 3. Epic-Stand
+## 4. Epic-Stand
 
-**Epic 1 (UI-Rework) ist bis auf ein Ticket fertig.** 12 von 13 in `Done`; offen nur
-`27e3e014` (Downloader „Von URL holen"), dessen Vorbedingung — die Datentrennung —
-inzwischen erfüllt ist. **Das ist der kürzeste Weg zu einem abschliessbaren Epic und
-damit zum ersten Commit.**
+**Epic 1 (UI-Rework) ist bis auf ein Ticket fertig** — offen nur `27e3e014`
+(Downloader „Von URL holen"). Der SSRF-Baustein dafür (`07267d40`) ist **abgenommen**;
+was fehlt, ist der produktive Transport (`c9857502`): eine TLS-fähige, **streamende**
+Client-Bibliothek in `Cargo.toml`. **Das ist der kürzeste Weg zu einem abgeschlossenen
+Epic.**
 
-Der SSRF-Baustein (`07267d40`) ist die Grundlage dafür und liegt bereits in `Testing`.
+Beim Einbau zwingend: der Client darf **nicht selbst auflösen** — er bekommt die
+geprüften Adressen aus `vet_url` und verbindet nur mit `target.addr`; Redirects führt
+`fetch_guarded` selbst, damit jeder Sprung erneut geprüft wird
+(`redirect::Policy::none()`). Ein Client mit eigener Auflösung hängt den
+Rebinding-Schutz aus.
 
 ---
 
-## 4. Was der Nutzer zuletzt wollte
+## 5. Beim Testen auf dem Host
 
-1. **`40103f77` Passwort-Reset per Terminal-Token** — ausdrücklicher Wunsch, noch nicht
-   gebaut. Begründung im Wortlaut: *„damit ich rein komme wenn ich es mal vergessen
-   sollte."* `ADMIN_PASSWORD_DEFAULT` wurde auf seinen Wunsch **verworfen**,
-   `RCLONE_GUI_ADMIN_PASSWORD` genügt.
-2. **Er testet die Anwendung selbst auf dem Host.** Zwei seiner Fehlermeldungen führten
-   zu Tickets: `bb6e1f0b` (erledigt) und `50c8ec48` (rootloser rsync-Daemon, offen).
-
-### Beim Testen auf dem Host: der Admin-Zugang
-In `data/tasks.db` liegt ein Konto `admin` mit Home-Pfad `/`, **dessen Passwort niemand
-kennt**. Um hineinzukommen:
+### Admin-Zugang
+In `data/tasks.db` liegt ein Konto `admin` mit Home-Pfad `/`, dessen Passwort niemand
+kennt. **Dafür gibt es jetzt den Reset** (fertig und abgenommen):
 
 ```bash
-cp data/tasks.db data/tasks.db.bak
-sqlite3 data/tasks.db "delete from sessions; delete from users;"
-RCLONE_GUI_ADMIN_PASSWORD='<passwort>' cargo run -- --bind 127.0.0.1:8080
+cargo run -- --reset-password=admin      # Token wird einmalig ausgegeben
+# dann http://<host>/reset?token=<token> öffnen
 ```
 
-Der Home-Pfad `/` ist ein zweiter Grund für das Neuanlegen: seit der Datentrennung ist
-der Home-Pfad die Wurzel des erlaubten Bereichs.
+Alternativ Tabelle leeren und `RCLONE_GUI_ADMIN_PASSWORD` setzen. Der Home-Pfad `/` ist
+ein Grund zum Neuanlegen: seit der Datentrennung ist er die Wurzel des erlaubten
+Bereichs.
 
-### rsync-Daemon auf dem Host
-`RCLONE_GUI_RSYNCD_DIR=$PWD/data/rsyncd` behebt `os error 13`. Danach folgt aber der
-nächste Anschlag (Port 873 ist privilegiert), dann chroot, dann uid/gid — deshalb
-Ticket `50c8ec48`.
-
----
-
-## 5. Korrekturen an früheren Annahmen
-
-Diese Datei hat schon einmal Falsches behauptet. Was inzwischen widerlegt ist:
-
-- **`rclone` liegt auf dem Host** (`/usr/bin/rclone`, v1.75.0), nicht nur im Container.
-  `AGENTS.md` behauptete lange das Gegenteil, und der Orchestrator hat dem Nutzer auf
-  dieser Grundlage eine falsche Fehlerdiagnose gegeben. Im Image ist es **1.70.1** —
-  Versionsabhängiges gegen beide prüfen. `rsync` ist weiterhin nur im Container.
-- **Eine *verwaiste* `flock` gibt es nicht.** Der Kernel gibt die Sperre mit dem Prozess
-  frei, egal wie er stirbt. Wer die PID-Datei hält, **lebt**. Die ursprüngliche Annahme
-  von `f581f435` war falsch; die Lösung fragt jetzt `/proc/locks`.
-- **`node --check datei.js` ist für `static/js/**` wertlos** — siehe nächster Abschnitt.
+### rsync-Daemon
+`RCLONE_GUI_RSYNCD_DIR=$PWD/data/rsyncd` behebt `os error 13`. Danach folgt Port 873
+(privilegiert), dann chroot, dann uid/gid — deshalb Ticket `50c8ec48` (rootloser
+Betrieb). `/data/rsyncd/` ist gitignored, dort liegen Modul-Geheimnisse im Klartext.
 
 ---
 
-## 6. Der teuerste Fehler dieses Laufs
+## 6. Belegte Umgebungstatsachen
 
-`static/js/ui/config.js` deklarierte `setHidden` zweimal. Als ES-Modul ist das ein
+Nicht raten, das hat schon dreimal Zeit gekostet:
+
+- **`rclone` liegt auf dem Host** (`/usr/bin/rclone`, v1.75.0). Im Image ist es
+  **1.70.1** — Versionsabhängiges gegen beide prüfen. `rsync` und `stunnel` gibt es
+  **nur im Container**.
+- **Port 873 ist auf diesem Host nicht bindbar** (`net.ipv4.ip_unprivileged_port_start
+  = 1024`). Daemon-Tests laufen im Container oder in `unshare -rn`.
+- **Eine verwaiste `flock` gibt es nicht.** Der Kernel gibt die Sperre mit dem Prozess
+  frei, egal wie er stirbt. Wer die PID-Datei hält, **lebt**.
+- **`peer_port_of_child` ist im Container strukturell nicht verfügbar.** Das
+  Verbindungskind läuft unter der uid des Moduls; nach einem uid-Wechsel ist der Prozess
+  nicht mehr dumpable, `/proc/<pid>/fd` braucht `CAP_SYS_PTRACE`. Bewusst **nicht**
+  vergeben — Rechtezuwachs für ein Logfeld. Der Zeitpfad trägt die Zuordnung allein.
+- **`mount` braucht root**, ein 64k-tmpfs geht also nicht überall. Ersatz für einen
+  erzwungenen Schreibfehler: Verzeichnis auf 0500 (EACCES).
+
+---
+
+## 7. Der teuerste Fehler des ersten Laufs
+
+`static/js/ui/config.js` deklarierte `setHidden` zweimal. Als ES-Modul ein
 `SyntaxError`, der die Importkette von `main.js` nie anlaufen lässt: **die gesamte
 Oberfläche war tot**, ohne sichtbare Fehlermeldung.
 
-**Drei Agenten haben brav `node --check` ausgeführt und grün gemeldet** — Node parst
-`.js` als CommonJS-Script, und dort sind doppelte Funktionsdeklarationen erlaubt. Der in
-`AGENTS.md` vorgeschriebene Prüfschritt konnte diese Fehlerklasse nicht finden.
+**Drei Agenten hatten `node --check` ausgeführt und grün gemeldet** — Node parst `.js`
+als CommonJS, wo doppelte Funktionsdeklarationen erlaubt sind. Der damals in `AGENTS.md`
+vorgeschriebene Prüfschritt konnte die Fehlerklasse gar nicht finden. Gefunden hat es
+erst ein Tester, der die Seite **tatsächlich öffnete**.
 
-Gefunden hat es erst ein Tester, der die Seite **tatsächlich öffnete**. Der Prüfschritt
-in `AGENTS.md` ist korrigiert (`.mjs`), aber die Lehre ist die grössere:
+`AGENTS.md` ist korrigiert (`.mjs`-Kopie). Die grössere Lehre bleibt:
 **ein Werkzeuglauf ersetzt nicht, das Ding einmal anzufassen.**
 
 ---
 
-## 7. Was sich in diesem Lauf bewährt hat
+## 8. Was sich bewährt hat
 
-Diese Muster haben echte Fehler gefunden, die reines Lesen übersehen hätte — sie gehören
-in jeden künftigen Prompt:
+Diese Muster haben in zwei Läufen echte Fehler gefunden, die reines Lesen übersehen
+hätte. Sie gehören in jeden künftigen Prompt:
 
-- **Gegenprobe bei jedem Null-Ergebnis.** „Kein XSS gefunden" ist wertlos, solange nicht
-  gezeigt ist, dass derselbe Aufbau ein echtes XSS **melden würde**. Ein Tester hat so
-  bewiesen, dass sein argv-Log-Beweis trägt (365/365 Treffer im Kontrollfall,
-  0/2589 im Echtfall).
-- **Mutationstest bei Nebenläufigkeit.** Zweimal wurde die Implementierung durch eine
-  naive ersetzt, um zu zeigen, dass der Test **durchfällt**. Beim zweiten Mal deckte das
-  auf, dass ein atomares `UPDATE` mit nachfolgendem `SELECT` immer noch falsch zählt.
-- **Tests wieder verwerfen, die nicht fehlschlagen können.** Ein Entwickler hat einen
-  eigenen neuen Test gestrichen, weil er in der Gegenprobe grün blieb: „hätte nur
-  Vertrauen erzeugt."
-- **Eigene Kopie des Baums**, wenn parallel gearbeitet wird — plus `sha256sum` der
-  geprüften Dateien im Ticketkommentar. Sonst gilt ein Urteil für eine Fassung, die es
-  nicht mehr gibt.
-- **Eigene Chrome-Instanz** statt des geteilten Browsers. Im geteilten Chrome bleiben
-  Tabs auf `hidden`, und dort verzögert Chrome das Media-Preload so weit, dass gar keine
-  Anfrage kommt — ein Tester hätte fast „funktioniert nicht" gemeldet.
-- **Melden statt bauen**, wenn eine fremde Datei im Weg ist. Ein Agent hat ein bereits
-  hinzugefügtes Feld **zurückgenommen**, statt `main.rs` anzupassen. Genau richtig.
+- **Jedes Null-Ergebnis braucht eine Gegenprobe.** „Kein XSS gefunden" ist wertlos,
+  solange nicht gezeigt ist, dass derselbe Aufbau ein echtes XSS **melden würde**.
+  Beispiele, die trugen: 365/365 Treffer im Kontrollfall gegen 0/2589 im Echtfall;
+  Log-Suche mit 0 Treffern auf den Token, aber 3 auf `alice` und 27 auf `/reset`.
+- **Mutationstest statt grünem Testlauf.** Mehrfach hat ein Agent die Implementierung
+  durch die naive ersetzt, um zu zeigen, dass der Test **durchfällt**. Einmal deckte das
+  auf, dass ein atomares `UPDATE` mit **nachfolgendem `SELECT`** immer noch falsch zählt
+  — der grüne Test hätte das nie gezeigt.
+- **Tests wieder verwerfen, die nicht fehlschlagen können.** Ein Entwickler strich einen
+  eigenen neuen Test, weil er in der Gegenprobe grün blieb: „hätte nur Vertrauen
+  erzeugt."
+- **Prüfen, ob der eigene Beweis überhaupt greifen kann.** Drei Agenten stellten fest,
+  dass ihr Test in **beiden** Zweigen besteht, und wiesen separat nach, dass der
+  Fehlerzweig lief.
+- **Eigene Kopie des Baums** bei paralleler Arbeit, plus `sha256sum` der geprüften
+  Dateien im Ticketkommentar.
+- **Eigene Chrome-Instanz.** Im geteilten Chrome bleiben Tabs auf `hidden`; dort feuern
+  `requestAnimationFrame`/`IntersectionObserver` nicht, und Chrome verzögert das
+  Media-Preload so weit, dass gar keine Anfrage kommt.
+- **Melden statt bauen**, wenn eine fremde Datei im Weg ist. Ein Agent nahm ein bereits
+  hinzugefügtes Feld **zurück**, statt `main.rs` anzupassen. Ein anderer **verweigerte**
+  ein Ticket, dessen Kriterien heute nicht nachstellbar sind, und hinterlegte stattdessen
+  die Vorarbeit.
+- **Eigene Fehlurteile korrigieren.** Ein Tester wies ein Ticket zurück, fand die Ursache
+  in seiner Umgebung (Zeitzonen), zog es nach `Done` und liess **beide** Kommentare
+  stehen.
 
-### Ein wiederkehrendes Muster, fünfmal gefunden
+### Ein Muster, fünfmal gefunden — die Serie ist geschlossen
 `derive(Debug)` mit einem Geheimnis im Struct: `LoginOutcome`, `ModuleConfig`,
 `RcloneConfig`, `ConfigRequest`, `NewShare`. Ein Tester hat `src/**` abschliessend
-durchsucht — **die Serie ist bei fünf geschlossen**. Bei jedem neuen Struct mit
-Geheimnis: handgeschriebenes `Debug` **und ein Test**, sonst entsteht es wieder.
+durchsucht. Bei jedem neuen Struct mit Geheimnis: handgeschriebenes `Debug` **und ein
+Test**, sonst entsteht es wieder.
 
 ---
 
-## 8. Fallstricke im Werkzeug
+## 9. Fallstricke im Werkzeug
 
 - **Plankton akzeptiert nur volle UUIDs.** `move_task` mit einer Kurz-ID läuft **ohne
-  Fehler ins Leere** (`null`), das Ticket bleibt liegen. Ein Agent hat so einen
-  Statuswechsel verloren, ohne es zu merken.
+  Fehler ins Leere** (`null`); ein Agent hat so einen Statuswechsel verloren, ohne es zu
+  merken.
+- **Die `blocks`-Prüfung greift nur für manche Spalten** — ein Zug nach `In Progress`
+  wurde abgelehnt, derselbe Zug nach `Testing` ging durch. Ticket `763fbf6b`.
 - `add_log` ist deprecated und wird auf `add_comment` umgeleitet. Argumente:
   `project_id`, `task_id`, **`text`**.
+- **Kein `git checkout --` auf Projektdateien.** Ein Tester löschte damit nicht
+  committete Arbeit und musste sie aus einem Backup rekonstruieren — etwa 15 Zeilen
+  Doc-Kommentar sind nur sinngleich wiederhergestellt (`rsyncd.rs`, an
+  `peer_port_of_child`). Beim nächsten Anfassen gegenlesen.
