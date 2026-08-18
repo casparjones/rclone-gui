@@ -44,6 +44,17 @@ struct Args {
         help = "User name the CLI run is attributed to (required with --start-task when more than one account exists)"
     )]
     user: Option<String>,
+    /// Issue a one-shot password reset token for an account and exit.
+    ///
+    /// Takes the *user name*, never a secret: `argv` is readable by every
+    /// process on the machine, so nothing confidential may be passed this way.
+    /// The token is printed on stdout, once.
+    #[arg(
+        long,
+        value_name = "USERNAME",
+        help = "Print a one-time password reset token for the given account and exit"
+    )]
+    reset_password: Option<String>,
 }
 
 #[tokio::main]
@@ -83,6 +94,16 @@ async fn main() {
     // to, which is resolved from the database — see `resolve_cli_user`.
     if let Some(task_name) = args.start_task {
         return handle_cli_task_execution(db_pool, task_name, args.user).await;
+    }
+
+    // Password reset from the terminal.
+    //
+    // Also before the router is built, and for the same reason as above: the
+    // person running this is locked out of the web interface, which is the
+    // whole point. What comes back is printed and then dropped — the token
+    // exists in this process's memory and nowhere else in plaintext.
+    if let Some(username) = args.reset_password {
+        return handle_cli_password_reset(db_pool, &username, &args.bind).await;
     }
 
     // Jobs, die einen Neustart nicht überlebt haben, in einen Endzustand
@@ -173,6 +194,8 @@ async fn main() {
     println!("   GET    /login                         -> login_page            [public]");
     println!("   POST   /login                         -> login_form_submit     [public]");
     println!("   POST   /api/auth/login                -> login_json_submit     [public]");
+    println!("   GET    /reset                         -> reset_page             [public]");
+    println!("   POST   /reset                         -> reset_submit           [public]");
     println!("   GET    /logout                        -> logout_page");
     println!("   POST   /logout                        -> logout_page");
     println!("   POST   /api/auth/logout               -> logout_json");
@@ -197,6 +220,10 @@ async fn main() {
             post(handlers::auth_web::login_json_submit),
         )
         .route("/api/auth/logout", post(handlers::auth_web::logout_json))
+        .route(
+            handlers::auth_web::RESET_PATH,
+            get(handlers::auth_web::reset_page).post(handlers::auth_web::reset_submit),
+        )
         .route("/api/auth/me", get(handlers::auth_web::me))
         .with_state(auth_state.clone());
 
@@ -263,7 +290,17 @@ async fn main() {
             handlers::auth_web::require_session,
         ))
         .layer(middleware::from_fn(request_logging_middleware))
-        .layer(TraceLayer::new_for_http())
+        // The default span of `TraceLayer` records the raw URI, which at
+        // `RUST_LOG=debug` would put a reset token into the log. Same
+        // redaction as the printed line above.
+        .layer(TraceLayer::new_for_http().make_span_with(|req: &Request<_>| {
+            tracing::info_span!(
+                "request",
+                method = %req.method(),
+                uri = %log_safe_uri(req.uri()),
+                version = ?req.version(),
+            )
+        }))
         .layer(Extension(config_manager))
         .layer(Extension(db_pool))
         .layer(Extension(rsyncd.clone()));
@@ -1068,9 +1105,40 @@ async fn cleanup_orphaned_log_files() {
 }
 
 /// Middleware function to log all HTTP requests
+/// A request URI that is safe to write down.
+///
+/// The reset link carries its token in the query string — that is what a link
+/// can do — so every place that logs a URI would otherwise write a live
+/// account-takeover token into stdout, into the log file the operator redirects
+/// it to, and into every backup of that file. Measured, not assumed: before
+/// this existed, the token showed up four times per page view in the server
+/// log of a test run.
+///
+/// Any query parameter named `token` loses its value; everything else is kept,
+/// because a redacted log that hides the path helps nobody.
+fn log_safe_uri(uri: &axum::http::Uri) -> String {
+    let path = uri.path();
+    let Some(query) = uri.query() else {
+        return path.to_string();
+    };
+
+    let redacted = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((key, _)) if key.eq_ignore_ascii_case("token") => {
+                format!("{key}=<redacted>")
+            }
+            _ => pair.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+
+    format!("{path}?{redacted}")
+}
+
 async fn request_logging_middleware(req: Request, next: Next) -> axum::response::Response {
     let method = req.method().clone();
-    let uri = req.uri().clone();
+    let uri = log_safe_uri(req.uri());
     let headers = req.headers().clone();
 
     // Extract client IP (simplified)
@@ -1152,6 +1220,47 @@ fn setup_tracing() {
 /// also never put in `argv`, which is why there is no `--admin-password` flag.
 ///
 /// Nothing happens when accounts already exist — this can never overwrite a
+/// `--reset-password=<user>`: issue a one-shot reset token and print it.
+///
+/// The token goes out with `println!` and **never** through `tracing`, for the
+/// same reason as the bootstrap password a few functions down: `tracing` output
+/// ends up in a log file, in a log bundle and in every backup of it, and a live
+/// reset token there is an account takeover waiting to be found. stdout belongs
+/// to the person standing at the terminal and disappears with it.
+///
+/// Unlike the web page, this side names the problem plainly — an unknown or
+/// disabled account gets a clear message. Whoever can run this command already
+/// has server access, so there is nothing left to hide from them, and a silent
+/// no-op would just get the operator to reissue tokens for a typo forever.
+async fn handle_cli_password_reset(db_pool: sqlx::Pool<sqlx::Sqlite>, username: &str, bind: &str) {
+    match handlers::auth::issue_password_reset(&db_pool, username).await {
+        Ok(issued) => {
+            println!("🔑 Password reset for '{}':", issued.username);
+            println!("   Reset-Token: {}", issued.token.expose());
+            println!(
+                "   ⏳ Valid until {} UTC, usable exactly once",
+                issued.expires_at.format("%Y-%m-%d %H:%M")
+            );
+            println!(
+                "   🔗 http://{}/reset?token={}",
+                bind,
+                issued.token.expose()
+            );
+            println!();
+            println!("   ⚠️  Shown once and not written to any log. Anyone who reads it can");
+            println!("       take over the account until it is used or expires.");
+        }
+        Err(e) => {
+            if let handlers::auth::ResetIssueError::Internal(ref cause) = e {
+                eprintln!("❌ Could not issue a reset token: {:#}", cause);
+            } else {
+                eprintln!("❌ Could not issue a reset token: {}", e);
+            }
+            std::process::exit(1);
+        }
+    }
+}
+
 /// password or resurrect a deleted account.
 async fn ensure_bootstrap_user(pool: &sqlx::Pool<sqlx::Sqlite>) -> anyhow::Result<()> {
     let existing = database::count_users(pool).await?;
@@ -1301,12 +1410,18 @@ async fn handle_cli_task_execution(
     println!("");
 
     // Convert task to sync request
+    // Die Löschoption trägt ein Task heute nicht mit (Spalte fehlt in
+    // `tasks`); `--start-task` kopiert deshalb, es spiegelt nicht.
     let sync_request = SyncRequest {
         source_path: task.source_path,
         remote_name: task.remote_name,
         remote_path: task.remote_path,
         chunk_size: task.chunk_size,
         use_chunking: Some(task.use_chunking),
+        delete_target: None,
+        delete_confirmed: None,
+        dry_run: None,
+        backup_dir: None,
     };
 
     // Start the sync job.
@@ -1457,5 +1572,40 @@ mod index_tests {
             "\"/mnt/it's \\\"here\\\"\\\\x\""
         );
         assert_eq!(js_string_literal("/a&b"), "\"/a\\u0026b\"");
+    }
+}
+
+#[cfg(test)]
+mod reset_logging_tests {
+    use super::*;
+
+    /// The reset token must not survive its trip through the request log. This
+    /// is not hypothetical: a measured test run wrote the live token into the
+    /// server log four times before [`log_safe_uri`] existed.
+    #[test]
+    fn a_reset_token_is_redacted_from_a_logged_uri() {
+        let token = "5d5b56a584d753f29f940ab7dde302eaae2e773473ce1812a418275cfb6c0771";
+        let uri: axum::http::Uri = format!("/reset?token={token}").parse().unwrap();
+
+        let logged = log_safe_uri(&uri);
+        assert!(!logged.contains(token), "the token survived: {logged}");
+        assert_eq!(logged, "/reset?token=<redacted>");
+    }
+
+    #[test]
+    fn everything_else_about_a_uri_is_kept() {
+        let plain: axum::http::Uri = "/api/files/local".parse().unwrap();
+        assert_eq!(log_safe_uri(&plain), "/api/files/local");
+
+        let mixed: axum::http::Uri = "/x?path=/tmp/a&token=secret&depth=2".parse().unwrap();
+        assert_eq!(log_safe_uri(&mixed), "/x?path=/tmp/a&token=<redacted>&depth=2");
+
+        // Case is not a hiding place.
+        let upper: axum::http::Uri = "/x?TOKEN=secret".parse().unwrap();
+        assert_eq!(log_safe_uri(&upper), "/x?TOKEN=<redacted>");
+
+        // A parameter that merely ends in "token" is a different parameter.
+        let other: axum::http::Uri = "/x?next_token=abc".parse().unwrap();
+        assert_eq!(log_safe_uri(&other), "/x?next_token=abc");
     }
 }

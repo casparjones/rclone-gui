@@ -182,6 +182,60 @@ impl Share {
     }
 }
 
+/// A one-shot password-reset grant, handed out by `--reset-password` on the
+/// terminal and redeemed once on the public `/reset` page.
+///
+/// Only the SHA-256 of the token is stored, exactly as for `sessions.id` and
+/// `shares.token_hash`: whoever reads a stolen `tasks.db` must not be able to
+/// pull a working reset link out of it.
+///
+/// `used_at` is the one-shot flag. It is `NULL` while the grant is open, and
+/// the redemption sets it in the same statement that selects on it being
+/// `NULL` (see [`consume_password_reset`]) — that single atomic `UPDATE` is
+/// what makes "exactly once" true under two concurrent requests, not the
+/// column itself.
+///
+/// `Debug` is hand-written for the same reason as on [`User`], [`Session`] and
+/// [`Share`]: `token_hash` is the server-side lookup key of a grant that can
+/// take over an account, and a derived `Debug` would write it into every
+/// `tracing::debug!(?reset)` line and every backup of that log.
+#[derive(Clone, FromRow)]
+pub struct PasswordReset {
+    pub id: String,
+    /// SHA-256 of the reset token, lowercase hex.
+    pub token_hash: String,
+    pub user_id: String,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    /// `None` while the grant is open; set the moment it is redeemed.
+    pub used_at: Option<DateTime<Utc>>,
+}
+
+// No `Serialize`/`Deserialize` on purpose: a password-reset grant has no
+// business in a JSON response, and deriving them is how it would get there.
+
+impl std::fmt::Debug for PasswordReset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PasswordReset")
+            .field("id", &self.id)
+            .field("token_hash", &"<redacted>")
+            .field("user_id", &self.user_id)
+            .field("created_at", &self.created_at)
+            .field("expires_at", &self.expires_at)
+            .field("used_at", &self.used_at)
+            .finish()
+    }
+}
+
+impl PasswordReset {
+    /// Whether the grant could still be redeemed at `now`. Advisory only —
+    /// [`consume_password_reset`] enforces the same test in SQL, and that is
+    /// the one that decides.
+    pub fn is_usable_at(&self, now: DateTime<Utc>) -> bool {
+        self.used_at.is_none() && self.expires_at > now
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Setup / migration
 // ---------------------------------------------------------------------------
@@ -307,6 +361,43 @@ pub async fn run_migrations(pool: &Pool<Sqlite>) -> Result<()> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_shares_expires_at ON shares(expires_at)")
         .execute(pool)
         .await?;
+
+    // One-shot password-reset grants, issued by `--reset-password` on the
+    // terminal. `token_hash` is UNIQUE for the same two reasons as on `shares`:
+    // it is the lookup key of a public request, and the constraint turns an
+    // (astronomically unlikely) token collision into a failed INSERT rather
+    // than two accounts answering to the same link.
+    //
+    // `used_at` lives in the same row as the expiry so that "still open, not
+    // yet expired, now claimed" is one atomic `UPDATE ... WHERE used_at IS
+    // NULL` (see [`consume_password_reset`]) instead of a read followed by a
+    // write that a second request can slip between.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS password_resets (
+            id TEXT PRIMARY KEY,
+            token_hash TEXT NOT NULL UNIQUE,
+            user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            used_at TEXT
+        )
+    "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_password_resets_user_id ON password_resets(user_id)",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_password_resets_expires_at ON password_resets(expires_at)",
+    )
+    .execute(pool)
+    .await?;
 
     Ok(())
 }
@@ -862,6 +953,129 @@ pub async fn delete_expired_shares(pool: &Pool<Sqlite>, now: DateTime<Utc>) -> R
         .bind(now.to_rfc3339())
         .execute(pool)
         .await?;
+
+    Ok(result.rows_affected())
+}
+
+// ---------------------------------------------------------------------------
+// Password resets
+// ---------------------------------------------------------------------------
+
+/// Every column of `password_resets`, in declaration order. Shared by the
+/// `SELECT`s and by the `RETURNING` of the claim so the row maps the same way
+/// everywhere.
+const PASSWORD_RESET_COLUMNS: &str = "id, token_hash, user_id, created_at, expires_at, used_at";
+
+pub async fn create_password_reset(pool: &Pool<Sqlite>, reset: &PasswordReset) -> Result<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO password_resets (id, token_hash, user_id, created_at, expires_at, used_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    "#,
+    )
+    .bind(&reset.id)
+    .bind(&reset.token_hash)
+    .bind(&reset.user_id)
+    .bind(reset.created_at.to_rfc3339())
+    .bind(reset.expires_at.to_rfc3339())
+    .bind(reset.used_at.map(|when| when.to_rfc3339()))
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Look a grant up without changing it. For tests and diagnostics — never for
+/// deciding whether a reset may proceed; that is [`consume_password_reset`].
+pub async fn get_password_reset_by_hash(
+    pool: &Pool<Sqlite>,
+    token_hash: &str,
+) -> Result<Option<PasswordReset>> {
+    let sql = format!("SELECT {PASSWORD_RESET_COLUMNS} FROM password_resets WHERE token_hash = ?");
+
+    let reset = sqlx::query_as::<_, PasswordReset>(&sql)
+        .bind(token_hash)
+        .fetch_optional(pool)
+        .await?;
+
+    Ok(reset)
+}
+
+/// Claim a reset grant: **the** one-shot step.
+///
+/// A single `UPDATE ... WHERE used_at IS NULL ... RETURNING`, deliberately not
+/// a `SELECT` followed by an `UPDATE`. Two requests arriving with the same
+/// token race inside SQLite's write lock, and the second one matches no row —
+/// so exactly one of them gets `Some` and may set a password. The read-then-
+/// write shape would let both pass the check before either wrote.
+///
+/// The same statement also enforces the expiry and that the account still
+/// exists and is enabled, so none of those can be forgotten by a caller.
+pub async fn consume_password_reset(
+    pool: &Pool<Sqlite>,
+    token_hash: &str,
+    now: DateTime<Utc>,
+) -> Result<Option<PasswordReset>> {
+    let sql = format!(
+        "UPDATE password_resets \
+            SET used_at = ? \
+          WHERE token_hash = ? \
+            AND used_at IS NULL \
+            AND expires_at > ? \
+            AND EXISTS (SELECT 1 FROM users WHERE id = user_id AND is_active = 1) \
+      RETURNING {PASSWORD_RESET_COLUMNS}"
+    );
+
+    let reset = sqlx::query_as::<_, PasswordReset>(&sql)
+        .bind(now.to_rfc3339())
+        .bind(token_hash)
+        .bind(now.to_rfc3339())
+        .fetch_optional(pool)
+        .await?;
+
+    Ok(reset)
+}
+
+/// Burn every still-open grant of one account, without redeeming any of them.
+///
+/// Called right after a successful reset: if two tokens were issued because the
+/// operator ran the command twice, the second one must not stay live once the
+/// password has already been changed. Returns how many were closed.
+pub async fn invalidate_password_resets_for_user(
+    pool: &Pool<Sqlite>,
+    user_id: &str,
+    now: DateTime<Utc>,
+) -> Result<u64> {
+    let result =
+        sqlx::query("UPDATE password_resets SET used_at = ? WHERE user_id = ? AND used_at IS NULL")
+            .bind(now.to_rfc3339())
+            .bind(user_id)
+            .execute(pool)
+            .await?;
+
+    Ok(result.rows_affected())
+}
+
+/// Housekeeping: drop grants that have expired, and spent ones that are old
+/// enough that nobody is going to ask about them any more.
+///
+/// A spent row is kept for a grace period on purpose — it is what makes a
+/// second attempt with the same token look like "already used" in the audit
+/// trail instead of vanishing without trace.
+pub async fn delete_expired_password_resets(
+    pool: &Pool<Sqlite>,
+    now: DateTime<Utc>,
+    spent_grace: chrono::Duration,
+) -> Result<u64> {
+    let result = sqlx::query(
+        "DELETE FROM password_resets \
+          WHERE expires_at <= ? \
+             OR (used_at IS NOT NULL AND used_at <= ?)",
+    )
+    .bind(now.to_rfc3339())
+    .bind((now - spent_grace).to_rfc3339())
+    .execute(pool)
+    .await?;
 
     Ok(result.rows_affected())
 }
@@ -1766,5 +1980,227 @@ mod tests {
         assert!(!json.contains("deadbeefcafe0000"), "{json}");
         assert!(!json.contains("$argon2"), "{json}");
         assert!(json.contains("report.pdf"), "{json}");
+    }
+
+    // -----------------------------------------------------------------------
+    // Password resets
+    // -----------------------------------------------------------------------
+
+    fn sample_reset(id: &str, user_id: &str, expires_in: Duration) -> PasswordReset {
+        PasswordReset {
+            id: id.to_string(),
+            token_hash: format!("hash-{id}"),
+            user_id: user_id.to_string(),
+            created_at: Utc::now(),
+            expires_at: Utc::now() + expires_in,
+            used_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn stores_and_finds_a_password_reset() {
+        let (pool, _dir) = temp_pool().await;
+        create_user(&pool, &sample_user("u1", "alice"))
+            .await
+            .unwrap();
+        create_password_reset(&pool, &sample_reset("r1", "u1", Duration::hours(1)))
+            .await
+            .unwrap();
+
+        let found = get_password_reset_by_hash(&pool, "hash-r1")
+            .await
+            .unwrap()
+            .expect("stored");
+        assert_eq!(found.user_id, "u1");
+        assert!(found.used_at.is_none());
+        assert!(found.is_usable_at(Utc::now()));
+        assert!(get_password_reset_by_hash(&pool, "hash-nope")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_grant_is_refused_when_expired_used_or_the_account_is_off() {
+        let (pool, _dir) = temp_pool().await;
+        create_user(&pool, &sample_user("u1", "alice"))
+            .await
+            .unwrap();
+        create_user(&pool, &sample_user("u2", "bob")).await.unwrap();
+        let now = Utc::now();
+
+        create_password_reset(&pool, &sample_reset("r-exp", "u1", Duration::minutes(-1)))
+            .await
+            .unwrap();
+        create_password_reset(&pool, &sample_reset("r-ok", "u1", Duration::hours(1)))
+            .await
+            .unwrap();
+        create_password_reset(&pool, &sample_reset("r-off", "u2", Duration::hours(1)))
+            .await
+            .unwrap();
+        set_user_active(&pool, "u2", false).await.unwrap();
+
+        assert!(consume_password_reset(&pool, "hash-r-exp", now)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(consume_password_reset(&pool, "hash-r-off", now)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(consume_password_reset(&pool, "hash-nothing", now)
+            .await
+            .unwrap()
+            .is_none());
+
+        // The good one works, once.
+        let claimed = consume_password_reset(&pool, "hash-r-ok", now)
+            .await
+            .unwrap()
+            .expect("must be claimable");
+        assert!(claimed.used_at.is_some());
+        assert!(consume_password_reset(&pool, "hash-r-ok", now)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn outstanding_grants_can_be_closed_in_bulk() {
+        let (pool, _dir) = temp_pool().await;
+        create_user(&pool, &sample_user("u1", "alice"))
+            .await
+            .unwrap();
+        create_user(&pool, &sample_user("u2", "bob")).await.unwrap();
+        for (id, user) in [("r1", "u1"), ("r2", "u1"), ("r3", "u2")] {
+            create_password_reset(&pool, &sample_reset(id, user, Duration::hours(1)))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            invalidate_password_resets_for_user(&pool, "u1", Utc::now())
+                .await
+                .unwrap(),
+            2
+        );
+        let now = Utc::now();
+        assert!(consume_password_reset(&pool, "hash-r1", now)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(consume_password_reset(&pool, "hash-r2", now)
+            .await
+            .unwrap()
+            .is_none());
+        // the other account's grant is untouched
+        assert!(consume_password_reset(&pool, "hash-r3", now)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn cleanup_drops_expired_and_long_spent_grants() {
+        let (pool, _dir) = temp_pool().await;
+        create_user(&pool, &sample_user("u1", "alice"))
+            .await
+            .unwrap();
+        let now = Utc::now();
+
+        create_password_reset(&pool, &sample_reset("r-live", "u1", Duration::hours(1)))
+            .await
+            .unwrap();
+        create_password_reset(&pool, &sample_reset("r-exp", "u1", Duration::minutes(-5)))
+            .await
+            .unwrap();
+
+        let mut spent_recently = sample_reset("r-fresh-spent", "u1", Duration::hours(1));
+        spent_recently.used_at = Some(now - Duration::minutes(5));
+        create_password_reset(&pool, &spent_recently).await.unwrap();
+
+        let mut spent_long_ago = sample_reset("r-old-spent", "u1", Duration::hours(1));
+        spent_long_ago.used_at = Some(now - Duration::hours(30));
+        create_password_reset(&pool, &spent_long_ago).await.unwrap();
+
+        let removed = delete_expired_password_resets(&pool, now, Duration::hours(24))
+            .await
+            .unwrap();
+        assert_eq!(removed, 2, "expired and long-spent grants must go");
+        assert!(get_password_reset_by_hash(&pool, "hash-r-live")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(get_password_reset_by_hash(&pool, "hash-r-fresh-spent")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(get_password_reset_by_hash(&pool, "hash-r-exp")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(get_password_reset_by_hash(&pool, "hash-r-old-spent")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    /// The reason [`consume_password_reset`] is one statement: N concurrent
+    /// redemptions of the same token must produce exactly **one** winner.
+    ///
+    /// Deliberately hostile to a read-then-write implementation, same recipe as
+    /// `access_counting_is_atomic_under_concurrency`:
+    ///
+    ///   * `flavor = "multi_thread"` so the claims overlap on real threads and
+    ///     not only at `await` points of one;
+    ///   * a [`tokio::sync::Barrier`] releases them at the same instant, and it
+    ///     is waited on *before* a pool connection is taken (waiting while
+    ///     holding one deadlocks against the pool limit);
+    ///   * more tasks than the pool has connections (default 10), so they
+    ///     genuinely queue against SQLite's write lock.
+    ///
+    /// Counter-checked while writing: replacing the single `UPDATE` with a
+    /// `SELECT` followed by an `UPDATE` makes this test fail with several
+    /// winners, so it is testing what it claims to test.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_reset_grant_is_claimed_exactly_once_under_concurrency() {
+        let (pool, _dir) = temp_pool().await;
+        create_user(&pool, &sample_user("u1", "alice"))
+            .await
+            .unwrap();
+        create_password_reset(&pool, &sample_reset("r1", "u1", Duration::hours(1)))
+            .await
+            .unwrap();
+
+        const ATTEMPTS: usize = 24;
+        let now = Utc::now();
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(ATTEMPTS));
+
+        let mut handles = Vec::new();
+        for _ in 0..ATTEMPTS {
+            let pool = pool.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                consume_password_reset(&pool, "hash-r1", now).await
+            }));
+        }
+
+        let mut winners = 0;
+        for handle in handles {
+            if handle.await.expect("join").expect("query").is_some() {
+                winners += 1;
+            }
+        }
+
+        assert_eq!(
+            winners, 1,
+            "a one-shot token was redeemed {winners} times — the claim is not atomic"
+        );
+        let after = get_password_reset_by_hash(&pool, "hash-r1")
+            .await
+            .unwrap()
+            .expect("row stays");
+        assert!(after.used_at.is_some(), "the winner did not mark it spent");
     }
 }

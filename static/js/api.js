@@ -57,7 +57,12 @@ let sessionProbe = null;
 // A probe that cannot reach the server returns `false`: "the network is down"
 // is not a verdict, and leaving for the login page would only trade one failed
 // request for a failed navigation. The next 401 asks again.
-function sessionHasExpired() {
+// Exported for the one caller that cannot go through `request()`: the video
+// preview needs range requests and a byte stream (`ui/preview-video.js`), so it
+// keeps its own `fetch` and asks this function itself when it sees a 401. The
+// probe, its de-duplication and its verdict are therefore shared — there is no
+// second implementation of the rule that could drift from this one.
+export function sessionHasExpired() {
     if (sessionProbe) {
         return sessionProbe;
     }
@@ -300,8 +305,28 @@ export function fetchPreviewImageError(path) {
 
 // Sync -----------------------------------------------------------------------
 
+// Announced on `window` whenever this module has just asked the server to
+// start a job. The job list polls on a timer that slows right down while
+// nothing is running (see `ui/jobs.js`), and a job the user started himself
+// must not wait for that timer — he is looking at the screen.
+//
+// A DOM event rather than a direct call: `ui/jobs.js` already imports this
+// module, and importing it back would close a cycle for the sake of one
+// notification. Listeners are optional by construction; nothing here depends
+// on anyone hearing it.
+export const SYNC_STARTED_EVENT = 'rclone-gui:sync-started';
+
+// Fired only after the server has accepted the request. A rejected start has
+// no job to show, and announcing it would make the list refresh for nothing.
+function announceSyncStarted(result) {
+    if (result && result.ok) {
+        window.dispatchEvent(new CustomEvent(SYNC_STARTED_EVENT));
+    }
+    return result;
+}
+
 export function startSync(syncRequest) {
-    return postJson('/api/sync', syncRequest);
+    return postJson('/api/sync', syncRequest).then(announceSyncStarted);
 }
 
 export function fetchSyncJobs() {
@@ -361,6 +386,8 @@ export function deleteTask(taskId) {
     return request(`/api/tasks/${taskId}`, { method: 'DELETE' });
 }
 
+// Starting a task is starting a sync job by another name, so it announces the
+// same thing.
 export function startTask(taskName) {
-    return postJson('/api/tasks/start', { task_name: taskName });
+    return postJson('/api/tasks/start', { task_name: taskName }).then(announceSyncStarted);
 }

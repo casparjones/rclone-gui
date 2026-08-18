@@ -163,3 +163,370 @@ function updateProgressDisplay(progress) {
         setProgressModalIcon('loading');
     }
 }
+
+// ---------------------------------------------------------------------------
+// Sync of the browser selection (toolbar button + confirmation dialog)
+// ---------------------------------------------------------------------------
+//
+// The button in the file-browser toolbar is the second, newer way into a sync:
+// it takes what is selected on the left and pushes it into the folder the
+// remote pane shows on the right. The old #sync-modal above stays as it is —
+// it syncs a single path and is opened from the file list.
+//
+// The dialog in between is not decoration. A sync is a background run that
+// copies a whole tree onto a foreign remote and cannot be undone, so what goes
+// where — sources, backend, target remote, target folder, how many entries —
+// is named before anything starts.
+//
+// Everything variable is written with textContent: file names come from the
+// file system and are attacker controlled.
+
+import { selectedEntries, selectionCount, clearSelection } from './selection.js';
+import { getSyncBackend, onSyncBackendChange } from './syncmode.js';
+import { onRemoteTargetChange } from './remotepane.js';
+import { showToast } from '../util/dom.js';
+
+// At most this many source paths are listed by name; the rest is counted.
+// A selection of a few thousand entries must not turn the dialog into a page.
+const MAX_LISTED_SOURCES = 20;
+
+// Last state reported by the remote pane. `listed` is the only trustworthy
+// sign that the folder on the right actually exists — a pane showing "choose a
+// target above" still reports a path.
+let remoteTarget = { path: '/', target: '', backend: '', listed: false };
+
+// True while jobs are being created, so a second click cannot start them twice.
+let startInFlight = false;
+
+export function initSelectionSync() {
+    const button = document.getElementById('fb-sync');
+    if (!button) {
+        return;
+    }
+
+    button.addEventListener('click', openSyncConfirm);
+
+    onSyncBackendChange(() => updateSyncButton());
+    onRemoteTargetChange(info => {
+        remoteTarget = info;
+        updateSyncButton();
+    });
+    watchSelection();
+
+    const start = document.getElementById('sync-confirm-start');
+    if (start) {
+        start.addEventListener('click', startSelectionSync);
+    }
+
+    const saveTask = document.getElementById('sync-confirm-save-task');
+    if (saveTask) {
+        saveTask.addEventListener('change', updateTaskRow);
+    }
+
+    updateSyncButton();
+}
+
+// The selection lives in selection.js and offers no subscription. Rather than
+// reach into that file (it belongs to another ticket) the selection bar is
+// observed: it is rewritten on every change of the selection, including
+// "clear" and "select all".
+function watchSelection() {
+    const bar = document.getElementById('fb-selection-bar');
+    if (!bar || typeof MutationObserver !== 'function') {
+        return;
+    }
+
+    const observer = new MutationObserver(() => updateSyncButton());
+    observer.observe(bar, {
+        attributes: true,
+        attributeFilter: ['class'],
+        childList: true,
+        characterData: true,
+        subtree: true
+    });
+}
+
+// Why the button may or may not be pressed. The title carries the reason: a
+// disabled button that does not say what is missing sends people looking.
+function syncReadiness() {
+    const count = selectionCount();
+    const backend = getSyncBackend();
+    const targetReady = backend.ready && remoteTarget.listed;
+
+    if (startInFlight) {
+        return { enabled: false, title: 'A sync is being started …' };
+    }
+    if (count === 0 && !targetReady) {
+        return { enabled: false, title: 'Select entries and a target folder first' };
+    }
+    if (count === 0) {
+        return { enabled: false, title: 'Select at least one file or folder' };
+    }
+    if (!backend.available) {
+        return { enabled: false, title: 'This sync backend is not available yet' };
+    }
+    if (!backend.configured) {
+        return { enabled: false, title: 'No sync target is configured for this backend' };
+    }
+    if (!backend.target) {
+        return { enabled: false, title: 'Choose a sync target in the right pane' };
+    }
+    if (!remoteTarget.listed) {
+        return { enabled: false, title: 'Open a folder in the right pane to sync into' };
+    }
+
+    return {
+        enabled: true,
+        title: count === 1
+            ? `Sync 1 entry to ${backend.target}:${remoteTarget.path}`
+            : `Sync ${count} entries to ${backend.target}:${remoteTarget.path}`
+    };
+}
+
+function updateSyncButton() {
+    const button = document.getElementById('fb-sync');
+    if (!button) {
+        return;
+    }
+
+    const readiness = syncReadiness();
+    button.disabled = !readiness.enabled;
+    button.title = readiness.title;
+}
+
+function setConfirmAlert(message, type) {
+    const box = document.getElementById('sync-confirm-alert');
+    if (!box) {
+        return;
+    }
+
+    if (!message) {
+        box.replaceChildren();
+        return;
+    }
+
+    // Built as elements, not as markup: the text regularly contains a path or
+    // an error string from the server.
+    const alert = document.createElement('div');
+    alert.className = 'alert ' + (type === 'error' ? 'alert-error' : 'alert-info');
+    alert.textContent = message;
+    box.replaceChildren(alert);
+}
+
+function updateTaskRow() {
+    const saveTask = document.getElementById('sync-confirm-save-task');
+    const row = document.getElementById('sync-confirm-task-row');
+    if (!saveTask || !row) {
+        return;
+    }
+    row.hidden = !saveTask.checked;
+}
+
+function openSyncConfirm() {
+    if (!syncReadiness().enabled) {
+        return;
+    }
+
+    const modal = document.getElementById('sync-confirm-modal');
+    if (!modal) {
+        return;
+    }
+
+    const entries = selectedEntries();
+    const backend = getSyncBackend();
+
+    const countLabel = document.getElementById('sync-confirm-count');
+    if (countLabel) {
+        countLabel.textContent = entries.length === 1
+            ? '1 entry selected'
+            : `${entries.length} entries selected`;
+    }
+
+    const list = document.getElementById('sync-confirm-sources');
+    if (list) {
+        const shown = entries.slice(0, MAX_LISTED_SOURCES).map(entry => {
+            const item = document.createElement('li');
+            item.className = 'font-mono truncate';
+            item.textContent = (entry.is_dir ? '📁 ' : '📄 ') + entry.path;
+            return item;
+        });
+        list.replaceChildren(...shown);
+    }
+
+    const more = document.getElementById('sync-confirm-more');
+    if (more) {
+        const rest = entries.length - MAX_LISTED_SOURCES;
+        more.hidden = rest <= 0;
+        more.textContent = rest > 0 ? `… and ${rest} more` : '';
+    }
+
+    setText('sync-confirm-backend', backend.label || backend.backend);
+    setText('sync-confirm-target', backend.target);
+    setText('sync-confirm-path', remoteTarget.path);
+
+    // Saving a task carries one name, so it is only offered for a single
+    // entry — naming N tasks automatically would invent names nobody asked for.
+    const saveTask = document.getElementById('sync-confirm-save-task');
+    if (saveTask) {
+        saveTask.disabled = entries.length !== 1;
+        if (saveTask.disabled) {
+            saveTask.checked = false;
+        }
+    }
+    updateTaskRow();
+
+    setConfirmAlert('', 'info');
+    modal.showModal();
+}
+
+function setText(id, value) {
+    const node = document.getElementById(id);
+    if (node) {
+        node.textContent = value == null ? '' : String(value);
+    }
+}
+
+// One job per selected entry: /api/sync takes a single source path, and
+// nothing in this ticket may change the server. They are started one after the
+// other so a failure can be named with its path instead of vanishing in a race.
+async function startSelectionSync() {
+    if (startInFlight) {
+        return;
+    }
+
+    const entries = selectedEntries();
+    const backend = getSyncBackend();
+
+    if (entries.length === 0 || !backend.ready || !remoteTarget.listed) {
+        setConfirmAlert('The selection or the target changed. Close the dialog and try again.', 'error');
+        return;
+    }
+
+    const useChunking = readChecked('sync-confirm-chunking');
+    const chunkSize = document.getElementById('sync-confirm-chunk-size');
+    const taskName = taskNameFromForm();
+    if (taskName === null) {
+        return;
+    }
+
+    startInFlight = true;
+    updateSyncButton();
+    const startButton = document.getElementById('sync-confirm-start');
+    if (startButton) {
+        startButton.disabled = true;
+    }
+    setConfirmAlert('Starting …', 'info');
+
+    const started = [];
+    const failed = [];
+
+    for (const entry of entries) {
+        try {
+            const result = await api.startSync({
+                source_path: entry.path,
+                remote_name: backend.target,
+                remote_path: remoteTarget.path,
+                use_chunking: useChunking,
+                chunk_size: useChunking && chunkSize ? chunkSize.value : null
+            });
+
+            if (result.ok) {
+                started.push(result.data);
+            } else {
+                failed.push(`${entry.name}: ${result.error}`);
+            }
+        } catch (error) {
+            failed.push(`${entry.name}: ${error.message}`);
+        }
+    }
+
+    if (taskName && started.length > 0) {
+        await saveAsTask(taskName, entries[0], backend, useChunking, chunkSize);
+    }
+
+    startInFlight = false;
+    if (startButton) {
+        startButton.disabled = false;
+    }
+
+    if (started.length === 0) {
+        setConfirmAlert('No job was started. ' + failed.join(' · '), 'error');
+        updateSyncButton();
+        return;
+    }
+
+    document.getElementById('sync-confirm-modal').close();
+    clearSelection();
+    updateSyncButton();
+
+    if (failed.length > 0) {
+        showToast(`${started.length} job(s) started, ${failed.length} failed: ${failed.join(' · ')}`, 'error');
+    } else {
+        showToast(started.length === 1 ? 'Sync job started' : `${started.length} sync jobs started`, 'success');
+    }
+
+    // The progress dialog follows one job; with several selected entries that
+    // is the first of them. The rest is in the Sync Jobs panel, which refreshes
+    // on its own.
+    state.currentSyncJobId = started[0];
+    openProgressModal();
+    monitorProgress();
+}
+
+function readChecked(id) {
+    const node = document.getElementById(id);
+    return !!(node && node.checked);
+}
+
+// Returns the task name, '' when none was asked for, or null when the input is
+// invalid — the caller then stops and the message is already on screen.
+function taskNameFromForm() {
+    const saveTask = document.getElementById('sync-confirm-save-task');
+    if (!saveTask || !saveTask.checked || saveTask.disabled) {
+        return '';
+    }
+
+    const input = document.getElementById('sync-confirm-task-name');
+    const name = input ? input.value.trim() : '';
+
+    if (!name) {
+        setConfirmAlert('Please enter a task name, or uncheck "Also save as task".', 'error');
+        return null;
+    }
+    if (!/^[a-zA-Z0-9_-]+$/.test(name)) {
+        setConfirmAlert('A task name may only contain letters, digits, underscore and hyphen.', 'error');
+        return null;
+    }
+
+    return name;
+}
+
+// A failing task must not undo jobs that already run, so it only reports.
+async function saveAsTask(name, entry, backend, useChunking, chunkSize) {
+    try {
+        const result = await api.createTask({
+            name: name,
+            source_path: entry.path,
+            remote_name: backend.target,
+            remote_path: remoteTarget.path,
+            chunk_size: useChunking && chunkSize ? chunkSize.value : null,
+            use_chunking: useChunking
+        });
+
+        if (result.ok) {
+            showToast(`Task '${name}' saved`, 'success');
+        } else {
+            showToast('Sync started, but the task was not saved: ' + result.error, 'error');
+        }
+    } catch (error) {
+        showToast('Sync started, but the task was not saved: ' + error.message, 'error');
+    }
+}
+
+// No entry in main.js: the module is imported there anyway, and wiring itself
+// keeps this ticket out of a file three other tickets are editing.
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initSelectionSync, { once: true });
+} else {
+    initSelectionSync();
+}

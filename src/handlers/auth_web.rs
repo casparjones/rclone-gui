@@ -31,6 +31,10 @@ use crate::models::ApiResponse;
 /// requests.
 pub const LOGIN_PATH: &str = "/login";
 
+/// Path of the password-reset page — `GET` shows the form, `POST` redeems the
+/// token. Public by necessity: whoever needs it cannot log in.
+pub const RESET_PATH: &str = "/reset";
+
 /// Everything the guard and the login routes need. Cloned per request by axum's
 /// state machinery, so both fields are cheap to clone (`Pool` is an `Arc`
 /// inside, the config sits behind one).
@@ -43,6 +47,9 @@ pub const LOGIN_PATH: &str = "/login";
 pub struct AuthState {
     pub pool: Pool<Sqlite>,
     pub config: Arc<SessionConfig>,
+    /// Shared across clones on purpose — one limiter for the whole process, or
+    /// it would reset on every request.
+    reset_limiter: Arc<ResetRateLimiter>,
 }
 
 impl AuthState {
@@ -50,6 +57,7 @@ impl AuthState {
         Self {
             pool,
             config: Arc::new(config),
+            reset_limiter: Arc::new(ResetRateLimiter::default()),
         }
     }
 }
@@ -89,10 +97,18 @@ pub struct CurrentUser {
 ///     *after* login; serving them only to sessions would be one more thing to
 ///     get wrong, and they contain no user data,
 ///   * `/favicon.ico` — requested by the browser on the login page itself; a
-///     401 there is noise, not protection.
+///     401 there is noise, not protection,
+///   * `/reset` — the password-reset page. It exists for exactly the situation
+///     in which no session can be obtained, so putting it behind the guard
+///     would make it useless. It is public on purpose and therefore carries its
+///     own defences: a 256-bit token that is only stored hashed, one-shot
+///     atomic redemption, a one-hour expiry and a rate limit (see
+///     [`ResetRateLimiter`]).
 fn is_public_path(path: &str) -> bool {
-    matches!(path, LOGIN_PATH | "/api/auth/login" | "/favicon.ico")
-        || path == "/static"
+    matches!(
+        path,
+        LOGIN_PATH | "/api/auth/login" | "/favicon.ico" | RESET_PATH
+    ) || path == "/static"
         || path.starts_with("/static/")
 }
 
@@ -265,6 +281,7 @@ fn page(title: &str, body: &str) -> String {
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="robots" content="noindex">
+  <meta name="referrer" content="no-referrer">
   <title>{title} · rclone GUI</title>
   <style>
     :root {{ color-scheme: light dark; }}
@@ -517,6 +534,269 @@ pub async fn me(Extension(current): Extension<CurrentUser>) -> Json<ApiResponse<
 // Small helpers
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Password reset
+//
+// A standalone, server-rendered page like the login: it has to work before any
+// session exists, so it depends on neither the application shell nor its JS
+// modules. `static/index.html` is also a bottleneck other tickets are editing —
+// one more reason this page is built here.
+//
+// Delivery of the token is not this module's business. Today `main.rs` prints
+// it on the terminal; an e-mail version later replaces that and nothing here.
+// ---------------------------------------------------------------------------
+
+/// Window over which redeem attempts are counted.
+const RESET_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Attempts per client within the window.
+///
+/// A person who has just read a token off a terminal needs a handful of tries
+/// at most — mistyped token, a password the policy turns down. Ten is generous
+/// for that and nothing at all for an attacker.
+const RESET_RATE_PER_CLIENT: usize = 10;
+
+/// Attempts across the whole process within the window, whatever the client
+/// claims to be.
+///
+/// This is the limit that actually bites, and the reason is not token guessing:
+/// a 256-bit token is not going to be guessed. It is CPU. Every rejected
+/// attempt deliberately burns one Argon2 hash (19 MiB, tens of milliseconds) so
+/// that timing does not separate a valid token from an invalid one — without a
+/// global cap, that defence would itself be a denial-of-service lever.
+///
+/// It is also the honest limit: this process is not told the peer address (the
+/// server is not built with `ConnectInfo`), so the per-client key comes from
+/// `X-Forwarded-For`, which an attacker who reaches the port directly can set
+/// to anything. The per-client bucket helps behind a trusted proxy; the global
+/// one holds regardless.
+const RESET_RATE_GLOBAL: usize = 60;
+
+/// Sliding-window rate limiter for the public redeem endpoint.
+///
+/// Deliberately in-process and in-memory: it protects one process's CPU, and a
+/// restart clearing it is not a security problem — the token it guards is
+/// unguessable either way.
+#[derive(Default)]
+pub struct ResetRateLimiter {
+    inner: std::sync::Mutex<RateState>,
+}
+
+#[derive(Default)]
+struct RateState {
+    /// Attempt times per client key.
+    per_client: std::collections::HashMap<String, Vec<std::time::Instant>>,
+    /// Attempt times across all clients.
+    global: Vec<std::time::Instant>,
+}
+
+impl ResetRateLimiter {
+    /// Record an attempt and say whether it may proceed.
+    ///
+    /// A refused attempt is *not* recorded a second time, so a client hammering
+    /// the endpoint cannot extend its own lockout indefinitely — it simply
+    /// stays refused until the window slides.
+    fn allow(&self, client_key: &str, now: std::time::Instant) -> bool {
+        let Ok(mut state) = self.inner.lock() else {
+            // A poisoned mutex means another thread panicked while holding it.
+            // Refusing is the safe direction for a public endpoint.
+            tracing::error!("reset rate limiter mutex is poisoned, refusing the attempt");
+            return false;
+        };
+
+        let cutoff = now.checked_sub(RESET_RATE_WINDOW).unwrap_or(now);
+        state.global.retain(|seen| *seen > cutoff);
+        state.per_client.retain(|_, seen| {
+            seen.retain(|when| *when > cutoff);
+            !seen.is_empty()
+        });
+
+        if state.global.len() >= RESET_RATE_GLOBAL {
+            return false;
+        }
+        let bucket = state.per_client.entry(client_key.to_string()).or_default();
+        if bucket.len() >= RESET_RATE_PER_CLIENT {
+            return false;
+        }
+
+        bucket.push(now);
+        state.global.push(now);
+        true
+    }
+}
+
+/// What a request claims to be, for the rate limiter only.
+///
+/// Never used for a security decision beyond throttling — see the note on
+/// [`RESET_RATE_GLOBAL`] for why it cannot be trusted on its own.
+fn client_key(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty() && value.len() <= 64)
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ResetPageQuery {
+    /// The token from the link. Never logged, never echoed anywhere but into
+    /// the hidden field of the form below.
+    pub token: Option<String>,
+}
+
+// No `Debug` on the form: it carries the token *and* the new password, and a
+// derived `Debug` is exactly how both would reach a log.
+#[derive(Deserialize)]
+pub struct ResetForm {
+    pub token: String,
+    pub password: String,
+    pub confirm: String,
+}
+
+/// `GET /reset?token=…` — the form that sets a new password.
+///
+/// The token travels in the query string because that is what a link can carry,
+/// and it is moved straight into a hidden field so the `POST` does not repeat
+/// it in a URL. The response is `no-store` and `no-referrer` so it stays out of
+/// caches and out of the `Referer` of anything the page might load.
+pub async fn reset_page(Query(query): Query<ResetPageQuery>) -> Response {
+    let token = query.token.unwrap_or_default();
+
+    if !auth::is_well_formed_reset_token(&token) {
+        // Says nothing about accounts: a malformed token is malformed whoever
+        // it was meant for.
+        return reset_response(
+            StatusCode::BAD_REQUEST,
+            &reset_notice(
+                "Reset link incomplete",
+                "This link carries no usable reset token. Ask whoever runs the server to issue a new one.",
+            ),
+        );
+    }
+
+    reset_response(StatusCode::OK, &reset_form_page(&token, None))
+}
+
+/// `POST /reset` — redeem the token and set the new password.
+pub async fn reset_submit(
+    State(state): State<AuthState>,
+    headers: HeaderMap,
+    Form(form): Form<ResetForm>,
+) -> Response {
+    if !state
+        .reset_limiter
+        .allow(&client_key(&headers), std::time::Instant::now())
+    {
+        tracing::warn!("password reset attempt refused by the rate limit");
+        return reset_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            &reset_notice(
+                "Too many attempts",
+                "Too many password reset attempts. Please wait a few minutes and try again.",
+            ),
+        );
+    }
+
+    if form.password != form.confirm {
+        return reset_response(
+            StatusCode::BAD_REQUEST,
+            &reset_form_page(&form.token, Some("The two passwords do not match.")),
+        );
+    }
+
+    match auth::redeem_password_reset(&state.pool, &form.token, &form.password).await {
+        Ok(auth::PasswordResetOutcome::Success { user_id, username }) => {
+            // Identity only — never the token, never the password.
+            tracing::info!(%user_id, %username, "password set through a reset token");
+            reset_response(
+                StatusCode::OK,
+                &reset_notice(
+                    "Password changed",
+                    &format!(
+                        "The password has been set and every existing session of the account was signed out. <a href=\"{LOGIN_PATH}\">Sign in</a>."
+                    ),
+                ),
+            )
+        }
+        Ok(auth::PasswordResetOutcome::WeakPassword(policy)) => reset_response(
+            StatusCode::BAD_REQUEST,
+            &reset_form_page(&form.token, Some(&policy.to_string())),
+        ),
+        Ok(auth::PasswordResetOutcome::Rejected) => reset_response(
+            StatusCode::BAD_REQUEST,
+            &reset_notice(
+                "Reset link not usable",
+                "This reset link is invalid, already used or expired. Ask whoever runs the server to issue a new one.",
+            ),
+        ),
+        Err(e) => {
+            // The cause is for the operator; the page says nothing about it.
+            tracing::error!("password reset failed internally: {e:#}");
+            reset_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &reset_notice(
+                    "Reset failed",
+                    "Something went wrong while setting the password. Please try again.",
+                ),
+            )
+        }
+    }
+}
+
+/// Every reset response carries the same two headers: out of caches, and no
+/// `Referer` that could carry the token to a third party.
+fn reset_response(status: StatusCode, body: &str) -> Response {
+    (
+        status,
+        [
+            (header::CACHE_CONTROL, "no-store"),
+            (header::REFERRER_POLICY, "no-referrer"),
+        ],
+        Html(body.to_string()),
+    )
+        .into_response()
+}
+
+fn reset_form_page(token: &str, error: Option<&str>) -> String {
+    let error_block = match error {
+        Some(text) => format!(
+            "<p class=\"error\" role=\"alert\">{}</p>",
+            escape_html(text)
+        ),
+        None => String::new(),
+    };
+
+    page(
+        "Set a new password",
+        &format!(
+            r#"<h1>Set a new password</h1>
+    {error_block}
+    <form method="post" action="{RESET_PATH}" autocomplete="off">
+      <input type="hidden" name="token" value="{token}">
+      <label for="password">New password</label>
+      <input id="password" name="password" type="password" autocomplete="new-password" autofocus required>
+      <label for="confirm">Repeat password</label>
+      <input id="confirm" name="confirm" type="password" autocomplete="new-password" required>
+      <button type="submit">Set password</button>
+    </form>"#,
+            token = escape_html(token),
+        ),
+    )
+}
+
+/// A page with a message and no form, for every outcome that has nothing left
+/// to submit. The body may contain a link, so it is passed through as HTML —
+/// all call sites are literals in this file.
+fn reset_notice(title: &str, body_html: &str) -> String {
+    page(
+        title,
+        &format!("<h1>{}</h1>\n    <p>{}</p>", escape_html(title), body_html),
+    )
+}
+
 fn error_code(error: &LoginError) -> &'static str {
     match error {
         LoginError::InvalidCredentials => "credentials",
@@ -606,6 +886,7 @@ mod tests {
             "/favicon.ico",
             "/static",
             "/static/js/main.js",
+            RESET_PATH,
         ] {
             assert!(is_public_path(path), "{path} should be public");
         }
@@ -652,6 +933,8 @@ mod tests {
         assert!(!is_public_path("/staticky"));
         assert!(!is_public_path("/api/static"));
         assert!(!is_public_path("/login/../api/tasks"));
+        assert!(!is_public_path("/resetting"));
+        assert!(!is_public_path("/reset/anything"));
     }
 
     #[test]
@@ -686,5 +969,142 @@ mod tests {
     fn percent_encoding_keeps_paths_readable_and_escapes_the_rest() {
         assert_eq!(percent_encode("/api/tasks"), "/api/tasks");
         assert_eq!(percent_encode("/a b?c=d&e"), "/a%20b%3Fc%3Dd%26e");
+    }
+
+    // -----------------------------------------------------------------------
+    // Password reset page
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_rate_limiter_stops_a_client_and_then_the_whole_process() {
+        let limiter = ResetRateLimiter::default();
+        let now = std::time::Instant::now();
+
+        // One client burns its own bucket and is refused after that.
+        for i in 0..RESET_RATE_PER_CLIENT {
+            assert!(limiter.allow("10.0.0.1", now), "attempt {i} must pass");
+        }
+        assert!(
+            !limiter.allow("10.0.0.1", now),
+            "the per-client limit did not bite"
+        );
+
+        // A different client is unaffected — until the global cap is reached.
+        let mut allowed = RESET_RATE_PER_CLIENT;
+        let mut client = 100;
+        while allowed < RESET_RATE_GLOBAL {
+            client += 1;
+            let key = format!("10.0.0.{client}");
+            for _ in 0..RESET_RATE_PER_CLIENT {
+                if allowed >= RESET_RATE_GLOBAL {
+                    break;
+                }
+                assert!(limiter.allow(&key, now), "global cap hit too early");
+                allowed += 1;
+            }
+        }
+        assert!(
+            !limiter.allow("192.0.2.99", now),
+            "a brand new client got through after the global cap"
+        );
+
+        // The window slides: everything recorded is older than the window now.
+        let later = now + RESET_RATE_WINDOW + std::time::Duration::from_secs(1);
+        assert!(
+            limiter.allow("10.0.0.1", later),
+            "the window never reopened"
+        );
+    }
+
+    #[test]
+    fn a_refused_attempt_is_not_counted_again() {
+        let limiter = ResetRateLimiter::default();
+        let now = std::time::Instant::now();
+
+        for _ in 0..RESET_RATE_PER_CLIENT {
+            assert!(limiter.allow("10.0.0.1", now));
+        }
+        for _ in 0..50 {
+            assert!(!limiter.allow("10.0.0.1", now));
+        }
+        // A second client must still get its full quota — the refusals above
+        // must not have eaten the global budget.
+        for _ in 0..RESET_RATE_PER_CLIENT {
+            assert!(limiter.allow("10.0.0.2", now));
+        }
+    }
+
+    #[test]
+    fn the_client_key_is_taken_from_the_first_forwarded_hop() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(client_key(&headers), "unknown");
+
+        headers.insert("x-forwarded-for", "203.0.113.7, 10.0.0.1".parse().unwrap());
+        assert_eq!(client_key(&headers), "203.0.113.7");
+
+        // An absurdly long value is a key of its own making — refuse to grow
+        // the map by it and fall back to the shared bucket.
+        headers.insert("x-forwarded-for", "a".repeat(200).parse().unwrap());
+        assert_eq!(client_key(&headers), "unknown");
+    }
+
+    #[test]
+    fn the_reset_form_escapes_the_token_it_echoes() {
+        let rendered = reset_form_page("\"><script>alert(1)</script>", None);
+        assert!(!rendered.contains("<script>alert(1)</script>"));
+        assert!(rendered.contains("&lt;script&gt;"));
+        assert!(rendered.contains(r#"name="token""#));
+        assert!(rendered.contains(r#"action="/reset""#));
+    }
+
+    #[test]
+    fn the_reset_form_shows_the_error_it_is_given() {
+        let rendered = reset_form_page("ab", Some("The two passwords do not match."));
+        assert!(rendered.contains("The two passwords do not match."));
+        assert!(rendered.contains(r#"class="error""#));
+    }
+
+    /// The notice pages must never hand back a form — every one of them is an
+    /// outcome with nothing left to submit.
+    #[test]
+    fn a_notice_page_carries_no_form() {
+        let rendered = reset_notice("Reset link not usable", "This reset link is invalid.");
+        assert!(!rendered.contains("<form"));
+        assert!(rendered.contains("Reset link not usable"));
+    }
+
+    #[tokio::test]
+    async fn a_reset_page_without_a_usable_token_shows_no_form() {
+        let response = reset_page(Query(ResetPageQuery { token: None })).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        assert_eq!(
+            response.headers().get(header::REFERRER_POLICY).unwrap(),
+            "no-referrer"
+        );
+
+        let response = reset_page(Query(ResetPageQuery {
+            token: Some("much-too-short".to_string()),
+        }))
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn a_reset_page_with_a_well_formed_token_shows_the_form() {
+        let token = auth::generate_reset_token().expect("RNG");
+        let response = reset_page(Query(ResetPageQuery {
+            token: Some(token.expose().to_string()),
+        }))
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
     }
 }

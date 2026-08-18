@@ -763,6 +763,14 @@
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                             </svg>
                         </button>
+                        <!-- Sync of the current selection to the folder shown in
+                             the right pane. Disabled until both halves exist; the
+                             title says which one is missing. Wired in
+                             static/js/ui/sync.js. -->
+                        <button id="fb-sync" type="button" class="btn btn-sm btn-primary" disabled
+                                title="Select entries and a target folder first">
+                            <span aria-hidden="true" class="mr-1">🔄</span>Sync
+                        </button>
                         <div class="fb-spacer"></div>
                         <span class="text-sm opacity-70">View:</span>
                         <button type="button" class="btn btn-sm" data-view="list" title="List view">☰</button>
@@ -1134,6 +1142,82 @@
                     </svg>
                     Start Upload
                 </button>
+            </div>
+        </div>
+    </dialog>
+
+    <!-- Sync confirmation: what goes where, before anything starts.
+         A sync is a background run that pushes a whole tree onto a foreign
+         remote and cannot be taken back, so source, target and the number of
+         entries are named explicitly. Everything variable is filled with
+         textContent from static/js/ui/sync.js — names come from the file system
+         and are attacker controlled. -->
+    <dialog id="sync-confirm-modal" class="modal">
+        <div class="modal-box w-11/12 max-w-2xl">
+            <form method="dialog">
+                <button class="btn btn-sm btn-circle btn-ghost absolute right-2 top-2" aria-label="Close">✕</button>
+            </form>
+            <h3 class="font-bold text-xl mb-4">Start sync</h3>
+
+            <div id="sync-confirm-alert" class="mb-4"></div>
+
+            <div class="space-y-4">
+                <div>
+                    <div class="label-text font-semibold mb-1">From (local)</div>
+                    <div id="sync-confirm-count" class="text-sm opacity-70"></div>
+                    <ul id="sync-confirm-sources" class="mt-1 max-h-40 overflow-y-auto bg-base-200 rounded-lg p-3 text-sm space-y-1"></ul>
+                    <div id="sync-confirm-more" class="text-sm opacity-70 mt-1" hidden></div>
+                </div>
+
+                <div>
+                    <div class="label-text font-semibold mb-1">To (remote)</div>
+                    <div class="bg-base-200 rounded-lg p-3 text-sm space-y-1">
+                        <div>Backend: <span id="sync-confirm-backend" class="font-mono"></span></div>
+                        <div>Target: <span id="sync-confirm-target" class="font-mono"></span></div>
+                        <div>Folder: <span id="sync-confirm-path" class="font-mono"></span></div>
+                    </div>
+                </div>
+
+                <div class="form-control">
+                    <label class="cursor-pointer label justify-start">
+                        <input type="checkbox" id="sync-confirm-chunking" class="checkbox checkbox-primary mr-3" checked>
+                        <span class="label-text font-semibold">Multi-threading for large files</span>
+                    </label>
+                </div>
+
+                <div class="form-control">
+                    <label class="label" for="sync-confirm-chunk-size">
+                        <span class="label-text font-semibold">Chunk size</span>
+                    </label>
+                    <select id="sync-confirm-chunk-size" class="select select-bordered w-full">
+                        <option value="8M">🐢 Conservative (WebDAV: 8M)</option>
+                        <option value="16M" selected>⚡ Standard (WebDAV: 16M)</option>
+                        <option value="32M">🚀 Aggressive (WebDAV: 32M)</option>
+                        <option value="64M">💨 Maximum (WebDAV: 64M)</option>
+                        <option value="128M">🔥 Ultra (WebDAV: 100M max)</option>
+                    </select>
+                </div>
+
+                <div class="form-control">
+                    <label class="cursor-pointer label justify-start">
+                        <input type="checkbox" id="sync-confirm-save-task" class="checkbox mr-3">
+                        <span class="label-text font-semibold">Also save as task</span>
+                    </label>
+                    <div id="sync-confirm-task-row" hidden>
+                        <input type="text" id="sync-confirm-task-name" class="input input-bordered w-full"
+                               placeholder="my-sync-task" maxlength="50" pattern="[a-zA-Z0-9_-]+">
+                        <div class="text-sm text-base-content/70 mt-1">
+                            Letters, digits, underscore and hyphen. Only available for a single selected entry.
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="modal-action">
+                <form method="dialog">
+                    <button class="btn btn-ghost">Cancel</button>
+                </form>
+                <button id="sync-confirm-start" type="button" class="btn btn-primary">Start sync</button>
             </div>
         </div>
     </dialog>

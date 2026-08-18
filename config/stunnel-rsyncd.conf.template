@@ -59,6 +59,51 @@ syslog = no
 # werden sollte.
 output = @LOG@
 
+# ---------------------------------------------------------------------------
+# Zeitzone: dieses Log wird gegen das Daemon-Log gejoint (Ticket 33697f91)
+# ---------------------------------------------------------------------------
+#
+# Die Zeilen hier tragen die LOKALE Zeit des Prozesses, ohne Zonenangabe. Das
+# Daemon-Log daneben ebenfalls — nur ist rsyncd ein Kindprozess der Anwendung
+# und hat damit deren Zeitzone, waehrend stunnel im Container haeufig auf
+# TZ=UTC laeuft und die Anwendung auf dem Host nicht.
+#
+# Genau diese Konstellation hat bei der Abnahme von 88b8c455 dazu gefuehrt,
+# dass JEDES Audit-Ereignis client_source=unavailable trug und es wie ein
+# Fehler der Anwendung aussah. Der Zeitpfad in StunnelIndex verglich zwei
+# Uhrzeiten, die zwei Stunden auseinander lagen.
+#
+# Seit 33697f91 ist das keine Voraussetzung mehr: StunnelIndex schaetzt den
+# Versatz aus der Differenz zwischen der Lesezeit einer frisch angehaengten
+# Zeile und deren Zeitstempel (kleinster beobachteter Wert, auf 15 Minuten
+# gerundet, weil jede echte Zonendifferenz ein Vielfaches davon ist) und
+# rechnet ihn heraus. Gleiche Uhr => Versatz exakt 0, unveraendertes Verhalten.
+#
+# Trotzdem gilt: gleiche Zeitzone in Container und Anwendung ist der einfachere
+# Fall und macht auch die Logs nebeneinander lesbar. Wer es geradeziehen will,
+# setzt TZ im Container auf dieselbe Zone wie auf dem Host.
+#
+# Der genauere Weg waere nicht die Zeit, sondern der Port: die Zeile
+# "connected remote server from 127.0.0.1:<port>" nennt den Quellport, den
+# stunnel zum Daemon benutzt, und die Anwendung liest denselben Port aus
+# /proc/<pid> des Verbindungskindes (peer_port_of_child). Er braucht `debug=5`
+# oben — bei `debug = 4` fehlt die Zeile.
+#
+# GEMESSEN (33697f91, alpine:3.22, rsync 3.4.3, als root): im Container greift
+# dieser Weg NICHT. Das Verbindungskind laeuft unter der uid/gid des Moduls
+# (65534), und /proc/<pid>/fd eines fremden Nutzers ist ohne CAP_SYS_PTRACE
+# nicht lesbar — die Capability fehlt im Docker-Standardsatz. Mit
+# --cap-add=SYS_PTRACE klappt derselbe Aufruf sofort. Beides zu aendern (uid
+# nicht mehr fallen lassen bzw. die Capability geben) waere ein echter
+# Sicherheitsverlust fuer ein Logfeld; deshalb bleibt es so.
+#
+# Folge: im Container traegt der ZEITPFAD die Zuordnung allein — genau deshalb
+# ist die Normalisierung oben kein Komfort, sondern Voraussetzung.
+#
+# Bleibt beides ohne Ergebnis, sagt die Anwendung das EINMAL im Log
+# ("cannot name the real client of an rsync connection", mit den beobachteten
+# Werten) statt es stumm in jedem Audit-Eintrag zu verschweigen.
+
 [rsyncd-tls]
 accept  = @ACCEPT@
 connect = @CONNECT@

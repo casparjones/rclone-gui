@@ -390,9 +390,13 @@ impl ConfigManager {
             }
         }
 
-        conf.write(config_path)
-            .map_err(|e| anyhow::anyhow!("Failed to write config: {}", e))?;
-        Ok(())
+        // Geschrieben wird ueber [`write_config_atomically`], nicht ueber
+        // `Ini::write`: letzteres schneidet die Zieldatei ab und schreibt dann
+        // neu. Waechst der Inhalt — ein neues Remote, laengere Zusatzfelder —,
+        // liegt zwischen Abschneiden und vollstaendigem Schreiben ein Fenster,
+        // in dem eine halbe `rclone.conf` auf Platte steht und dem Nutzer alle
+        // Remotes fehlen.
+        write_config_atomically(Path::new(config_path), &conf.writes())
     }
 
     /// Entfernt das gespeicherte Passwort eines Remotes.
@@ -403,11 +407,6 @@ impl ConfigManager {
     /// `pass` neu schreiben — und zwischen beiden Schritten lag ein Fenster, in
     /// dem ein IO-Fehler nicht das Passwort, sondern die **ganze Verbindung**
     /// verlor.
-    ///
-    /// `allow(dead_code)`: der Aufrufer ist `remove_password_and_save` in
-    /// `src/handlers/config.rs`. Dessen Umstellung ist ein eigener Eingriff und
-    /// gehört nicht zu diesem Ticket — bis dahin ruft nur der Test hier auf.
-    #[allow(dead_code)]
     pub async fn clear_password(&self, name: &str) -> anyhow::Result<()> {
         if self.use_memory_only {
             let mut configs = self.memory_configs.write().await;
@@ -1189,6 +1188,68 @@ region = eu-central
             }
         }
         // In beiden Fällen: keine Nebendatei übrig.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Der Fall, der bisher durchrutschte: die neue Fassung ist **groesser**
+    /// als die alte. Gemessen wird derselbe Weg, den `save_to_file` nimmt —
+    /// `Ini::writes()` erzeugt den Text, `write_config_atomically` schreibt ihn.
+    ///
+    /// Verglichen wird die **Zeilenmenge**, nicht der Bytestrom: `Ini` haelt die
+    /// Schluessel in einer HashMap, die Reihenfolge ist also nicht zugesichert.
+    ///
+    /// Auf einem winzigen Dateisystem (siehe `large_write_is_all_or_nothing`)
+    /// scheitert das `write_all` mit ENOSPC — dann muss die alte Datei
+    /// vollstaendig dastehen.
+    #[test]
+    fn a_growing_configuration_is_written_all_or_nothing() {
+        let dir = scratch_dir("grow");
+        let path = dir.join("rclone.conf");
+        std::fs::write(&path, SAMPLE_CONF).unwrap();
+
+        // Neuer Abschnitt mit langen Zusatzfeldern: der Inhalt waechst deutlich.
+        let mut conf = Ini::new();
+        conf.load(&path).unwrap();
+        conf.set("neu", "type", Some("webdav".to_string()));
+        conf.set("neu", "url", Some("https://example.org/dav".to_string()));
+        for index in 0..64 {
+            conf.set("neu", &format!("field_{index}"), Some("v".repeat(1024)));
+        }
+        let rendered = conf.writes();
+        assert!(
+            rendered.len() > SAMPLE_CONF.len(),
+            "der Testfall soll wachsenden Inhalt pruefen"
+        );
+
+        match write_config_atomically(&path, &rendered) {
+            Ok(()) => {
+                let on_disk = std::fs::read_to_string(&path).unwrap();
+                let written: std::collections::BTreeSet<&str> = on_disk
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                let expected: std::collections::BTreeSet<&str> = rendered
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                assert_eq!(written, expected, "vollstaendige neue Fassung erwartet");
+                // Der alte Abschnitt ist mitgewandert, nicht verloren gegangen.
+                assert!(written.contains("[mybox]") || written.contains("[MyBox]"));
+            }
+            Err(err) => {
+                assert!(err.to_string().contains("Failed to write config"));
+                assert_eq!(
+                    std::fs::read_to_string(&path).unwrap(),
+                    SAMPLE_CONF,
+                    "die alte Konfiguration muss vollstaendig zurueckbleiben"
+                );
+            }
+        }
+        // In beiden Faellen: keine Nebendatei uebrig.
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
 
         std::fs::remove_dir_all(&dir).ok();

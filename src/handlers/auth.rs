@@ -880,6 +880,101 @@ impl std::fmt::Debug for SessionToken {
     }
 }
 
+/// Length of a raw password-reset token in bytes. 32 bytes = 256 bits.
+///
+/// The reset link is redeemed on a **public** route — that is the whole point
+/// of it, since the person using it is locked out — so the token is the only
+/// thing between the world and an account takeover. It gets the same budget as
+/// a session cookie, never less.
+pub const RESET_TOKEN_BYTES: usize = 32;
+
+/// The 32-byte floor is a requirement, not a preference — enforced at compile
+/// time so nobody can shrink it in passing.
+const _: () = assert!(RESET_TOKEN_BYTES >= 32);
+
+/// Length of a reset token in the form that travels in the URL (lowercase hex).
+pub const RESET_TOKEN_HEX_LENGTH: usize = RESET_TOKEN_BYTES * 2;
+
+/// How long a reset token stays redeemable.
+///
+/// One hour: long enough for somebody who has just read it off a terminal —
+/// possibly through an SSH tunnel — to open a browser and type a password,
+/// short enough that a token forgotten in a scrollback buffer is worthless by
+/// the time anyone finds it.
+pub const RESET_TOKEN_TTL_MINUTES: i64 = 60;
+
+/// How long a *spent* grant is kept before the cleanup removes it. It cannot be
+/// redeemed again either way; keeping it briefly is what lets a second attempt
+/// be recognised as "already used" rather than as a token that never existed.
+const RESET_SPENT_GRACE_HOURS: i64 = 24;
+
+/// A raw password-reset token.
+///
+/// Wrapped in a newtype on purpose, mirroring [`SessionToken`] and
+/// `shares::ShareToken`:
+///   * no `Display`, no `Serialize` and a redacting `Debug`, so it cannot reach
+///     a `tracing` line, a log backup or a JSON response by accident;
+///   * reading the secret takes the explicit [`ResetToken::expose`], which is
+///     greppable in review — and there is exactly one legitimate caller: the
+///     `println!` in `main.rs` that shows it to the operator once.
+///
+/// A derived `Debug` has already written a live token into a log once in this
+/// project. That is what this type exists to prevent, and
+/// `reset_token_debug_is_redacted` keeps it that way.
+#[derive(Clone)]
+pub struct ResetToken(String);
+
+impl ResetToken {
+    /// The token in its link form (lowercase hex). Only call this where the
+    /// value is genuinely needed — the one terminal line that hands it over.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// The digest that is stored in `password_resets.token_hash`.
+    pub fn hash(&self) -> String {
+        hash_reset_token(&self.0)
+    }
+}
+
+impl std::fmt::Debug for ResetToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never the value, not even a prefix of it.
+        f.write_str("ResetToken(<redacted>)")
+    }
+}
+
+/// Draw a fresh reset token from the operating system CSPRNG.
+///
+/// Same failure mode as [`generate_session_token`]: no entropy is an error,
+/// never a guessable fallback.
+pub fn generate_reset_token() -> Result<ResetToken> {
+    let mut bytes = [0u8; RESET_TOKEN_BYTES];
+    OsRng
+        .try_fill_bytes(&mut bytes)
+        .map_err(|e| anyhow!("failed to draw a reset token from the system RNG: {e}"))?;
+
+    Ok(ResetToken(to_hex(&bytes)))
+}
+
+/// SHA-256 of a reset token, lowercase hex. This is what
+/// `password_resets.token_hash` holds — the plaintext is never stored.
+pub fn hash_reset_token(token: &str) -> String {
+    let digest = Sha256::digest(token.as_bytes());
+    to_hex(&digest)
+}
+
+/// Whether `candidate` has the shape of a reset token this server issued.
+///
+/// Lets the public route reject junk out of a URL before it costs a database
+/// round trip. It says nothing about validity.
+pub fn is_well_formed_reset_token(candidate: &str) -> bool {
+    candidate.len() == RESET_TOKEN_HEX_LENGTH
+        && candidate
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
 /// Draw a fresh session token from the operating system CSPRNG.
 ///
 /// Fails instead of panicking when the OS entropy source is unavailable: that
@@ -1354,13 +1449,233 @@ pub async fn logout(pool: &Pool<Sqlite>, token: &str) -> Result<bool> {
 /// Invalidate every session of a user — "log out everywhere", and what a
 /// password change or a deactivation has to call.
 ///
-/// No caller yet: the screens that change a password or disable an account
-/// belong to the user-management ticket. Kept because it is the counterpart of
-/// `logout` and it is tested.
-#[allow(dead_code)]
+/// Called by [`redeem_password_reset`]; the screens that change a password from
+/// inside the application belong to the user-management ticket and will call it
+/// too.
 pub async fn logout_all_sessions(pool: &Pool<Sqlite>, user_id: &str) -> Result<u64> {
     let removed = database::delete_sessions_for_user(pool, user_id).await?;
     tracing::info!(user_id = %user_id, removed, "all sessions dropped");
+    Ok(removed)
+}
+
+// ---------------------------------------------------------------------------
+// Password reset
+//
+// The way back into an installation whose password was lost. `ensure_bootstrap_
+// user` only fires on an *empty* `users` table, so without this there is no
+// second chance: user management sits behind exactly the login that cannot be
+// passed.
+//
+// The flow is cut so that a later e-mail version replaces the **delivery**
+// only. Issuing, storage and redemption below know nothing about how the token
+// reaches its owner — today `main.rs` prints it on the terminal.
+// ---------------------------------------------------------------------------
+
+/// Why `--reset-password` could not issue a token.
+///
+/// These distinctions are for the **CLI**, where somebody with server access is
+/// already standing, and a clear message is worth more than hiding which
+/// accounts exist. The web side never sees this type: it is handed a token, not
+/// a user name, and therefore has nothing to disclose in the first place.
+#[derive(Debug)]
+pub enum ResetIssueError {
+    NoSuchAccount,
+    AccountDisabled,
+    Internal(anyhow::Error),
+}
+
+impl std::fmt::Display for ResetIssueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoSuchAccount => f.write_str("no account with that user name"),
+            Self::AccountDisabled => {
+                f.write_str("the account is disabled; enable it before resetting its password")
+            }
+            Self::Internal(_) => f.write_str("could not issue a reset token"),
+        }
+    }
+}
+
+impl std::error::Error for ResetIssueError {}
+
+/// A freshly issued grant, on its way to the operator's terminal.
+///
+/// `Debug` is hand-written even though [`ResetToken`] already redacts: this
+/// struct is the one place the live token and the account it opens sit
+/// together, and the next field somebody adds must not change that.
+pub struct IssuedReset {
+    pub token: ResetToken,
+    pub username: String,
+    pub expires_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for IssuedReset {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IssuedReset")
+            .field("token", &"<redacted>")
+            .field("username", &self.username)
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+/// Issue a one-shot reset grant for `username`.
+///
+/// The caller gets the raw token exactly once, in memory; only its SHA-256 goes
+/// into the database. There is no way to read the token back afterwards — a
+/// lost one is re-issued, not recovered.
+pub async fn issue_password_reset(
+    pool: &Pool<Sqlite>,
+    username: &str,
+) -> std::result::Result<IssuedReset, ResetIssueError> {
+    let user = database::get_user_by_username(pool, username.trim())
+        .await
+        .map_err(ResetIssueError::Internal)?
+        .ok_or(ResetIssueError::NoSuchAccount)?;
+
+    if !user.is_active {
+        // A disabled account must not be reachable through a reset either —
+        // otherwise disabling somebody would be undone by one terminal command.
+        return Err(ResetIssueError::AccountDisabled);
+    }
+
+    let token = generate_reset_token().map_err(ResetIssueError::Internal)?;
+    let now = Utc::now();
+    let expires_at = now + ChronoDuration::minutes(RESET_TOKEN_TTL_MINUTES);
+
+    let reset = database::PasswordReset {
+        id: uuid::Uuid::new_v4().to_string(),
+        token_hash: token.hash(),
+        user_id: user.id.clone(),
+        created_at: now,
+        expires_at,
+        used_at: None,
+    };
+    database::create_password_reset(pool, &reset)
+        .await
+        .map_err(ResetIssueError::Internal)?;
+
+    // Identity and expiry only. The token itself is never logged, at any level.
+    tracing::info!(user_id = %user.id, %expires_at, "password reset token issued");
+
+    Ok(IssuedReset {
+        token,
+        username: user.username,
+        expires_at,
+    })
+}
+
+/// What redeeming a token did.
+///
+/// `Rejected` deliberately merges "malformed", "unknown", "already used" and
+/// "expired": the public page must not help anyone tell those apart.
+#[derive(Debug)]
+pub enum PasswordResetOutcome {
+    Success { user_id: String, username: String },
+    Rejected,
+    WeakPassword(PasswordPolicyError),
+}
+
+/// Redeem a reset token and set a new password.
+///
+/// The order of the steps is the security-relevant part:
+///
+///  1. the password policy runs **first**, so a rejected password does not burn
+///     a token the user then no longer has;
+///  2. the shape check keeps junk out of the database round trip;
+///  3. [`database::consume_password_reset`] claims the grant in a single atomic
+///     `UPDATE ... WHERE used_at IS NULL ... RETURNING`. Two concurrent
+///     redemptions of the same token therefore have exactly one winner — the
+///     loser is indistinguishable from an unknown token, which is correct;
+///  4. only then is the password written, and
+///  5. **every session of the account is dropped**. Without that step a
+///     password change leaves an attacker who already holds a session logged
+///     in, which is the classic way this feature fails. Any other outstanding
+///     grant for the account is closed too.
+///
+/// A failure between (3) and (4) burns the token without changing the password.
+/// That is the safe direction: the operator issues a new one.
+pub async fn redeem_password_reset(
+    pool: &Pool<Sqlite>,
+    token: &str,
+    new_password: &str,
+) -> Result<PasswordResetOutcome> {
+    if let Err(policy) = validate_password(new_password) {
+        return Ok(PasswordResetOutcome::WeakPassword(policy));
+    }
+
+    if !is_well_formed_reset_token(token) {
+        spend_hash_time().await;
+        return Ok(PasswordResetOutcome::Rejected);
+    }
+
+    let token_hash = hash_reset_token(token);
+    let now = Utc::now();
+
+    let Some(reset) = database::consume_password_reset(pool, &token_hash, now).await? else {
+        // Spend roughly the Argon2 time a successful redemption would have
+        // cost, so the response time does not separate "no such token" from
+        // "token accepted". Same trick, and the same reason, as the login.
+        spend_hash_time().await;
+        return Ok(PasswordResetOutcome::Rejected);
+    };
+
+    let Some(user) = database::get_user_by_id(pool, &reset.user_id).await? else {
+        // The claim already checked that the account exists and is enabled, so
+        // this means it disappeared in between. The grant is spent either way.
+        tracing::warn!(user_id = %reset.user_id, "reset token pointed at a missing account");
+        return Ok(PasswordResetOutcome::Rejected);
+    };
+
+    let hash = hash_password_off_thread(new_password.to_string()).await?;
+    if !database::update_user_password(pool, &user.id, &hash).await? {
+        return Err(anyhow!("password update affected no row"));
+    }
+
+    // Everything that was open under the old password dies with it.
+    let dropped = logout_all_sessions(pool, &user.id).await?;
+    let closed = database::invalidate_password_resets_for_user(pool, &user.id, now).await?;
+
+    tracing::info!(
+        user_id = %user.id,
+        username = %user.username,
+        sessions_dropped = dropped,
+        other_grants_closed = closed,
+        "password reset redeemed"
+    );
+
+    Ok(PasswordResetOutcome::Success {
+        user_id: user.id,
+        username: user.username,
+    })
+}
+
+/// Run Argon2 hashing off the async runtime. It is CPU- and memory-bound by
+/// design; doing it inline would stall every other request on the worker.
+async fn hash_password_off_thread(password: String) -> Result<String> {
+    tokio::task::spawn_blocking(move || hash_password(&password))
+        .await
+        .context("password hashing task failed")?
+}
+
+/// Burn the time a real hash would have taken, when there was nothing to hash.
+/// Verifies an unknowable password against the dummy hash, which never matches.
+async fn spend_hash_time() {
+    let dummy = dummy_password_hash().to_string();
+    let _ = tokio::task::spawn_blocking(move || verify_password("not-the-password", &dummy)).await;
+}
+
+/// Delete expired reset grants, and spent ones past their grace period.
+pub async fn cleanup_expired_password_resets(pool: &Pool<Sqlite>) -> Result<u64> {
+    let removed = database::delete_expired_password_resets(
+        pool,
+        Utc::now(),
+        ChronoDuration::hours(RESET_SPENT_GRACE_HOURS),
+    )
+    .await?;
+    if removed > 0 {
+        tracing::info!("🧹 Auto-cleanup: removed {removed} finished password reset token(s)");
+    }
     Ok(removed)
 }
 
@@ -1386,6 +1701,11 @@ pub fn spawn_session_cleanup(pool: Pool<Sqlite>) -> tokio::task::JoinHandle<()> 
             ticker.tick().await;
             if let Err(e) = cleanup_expired_sessions(&pool).await {
                 tracing::warn!("periodic session cleanup failed: {e}");
+            }
+            // Same timer, same reason: an expired reset token must disappear
+            // even when nobody logs in.
+            if let Err(e) = cleanup_expired_password_resets(&pool).await {
+                tracing::warn!("periodic password-reset cleanup failed: {e}");
             }
         }
     })
@@ -2608,5 +2928,381 @@ mod tests {
         let stored = outcome.session.user_agent.expect("user agent stored");
         assert!(stored.len() <= MAX_USER_AGENT_LENGTH);
         assert!(long_agent.starts_with(&stored));
+    }
+
+    // -----------------------------------------------------------------------
+    // Password reset
+    // -----------------------------------------------------------------------
+
+    /// The reason this type exists. A derived `Debug` has already written a
+    /// live token into a log in this project; this test is what keeps somebody
+    /// from re-deriving it.
+    #[test]
+    fn reset_token_debug_is_redacted() {
+        let token = generate_reset_token().expect("RNG must work");
+        let raw = token.expose().to_string();
+
+        let rendered = format!("{token:?}");
+        assert_eq!(rendered, "ResetToken(<redacted>)");
+        assert!(
+            !rendered.contains(&raw),
+            "the Debug output must not contain the token"
+        );
+        // Not even a prefix of it — a truncated token is still a token.
+        assert!(!rendered.contains(&raw[..8]));
+
+        // The same must hold one level up, where the token sits next to the
+        // account it opens.
+        let issued = IssuedReset {
+            token: token.clone(),
+            username: "alice".to_string(),
+            expires_at: Utc::now(),
+        };
+        let rendered = format!("{issued:?}");
+        assert!(!rendered.contains(&raw), "IssuedReset leaked the token");
+        assert!(!rendered.contains(&raw[..8]));
+    }
+
+    /// `ResetToken` must have neither `Display` nor `Serialize`: both are ways
+    /// the value reaches a log line or a JSON response without anybody
+    /// deciding to expose it, and only [`ResetToken::expose`] may do that.
+    ///
+    /// Absence of a trait cannot be asserted at runtime, so it is asserted at
+    /// **compile time**: the blanket implementations below cover every type
+    /// that is `Display` (resp. `Serialize`), so the explicit implementation
+    /// for `ResetToken` compiles only while it is neither. Derive either one on
+    /// the type and this stops building with a coherence error — which is the
+    /// whole point, since the pattern has been broken in this project before.
+    #[allow(dead_code)]
+    mod reset_token_is_not_printable {
+        use super::ResetToken;
+
+        trait NotDisplay {}
+        impl<T: std::fmt::Display> NotDisplay for T {}
+        impl NotDisplay for ResetToken {}
+
+        trait NotSerialize {}
+        impl<T: serde::Serialize> NotSerialize for T {}
+        impl NotSerialize for ResetToken {}
+
+        // The same guard for the struct that carries it around.
+        use super::IssuedReset;
+        trait NotSerializable {}
+        impl<T: serde::Serialize> NotSerializable for T {}
+        impl NotSerializable for IssuedReset {}
+    }
+
+    #[test]
+    fn reset_tokens_are_long_unique_and_hex() {
+        let mut seen = std::collections::HashSet::new();
+
+        for _ in 0..256 {
+            let token = generate_reset_token().expect("RNG must work");
+            let raw = token.expose();
+
+            assert_eq!(raw.len(), RESET_TOKEN_HEX_LENGTH);
+            assert!(is_well_formed_reset_token(raw), "bad shape: {raw}");
+            assert!(seen.insert(raw.to_string()), "a token repeated: {raw}");
+
+            // What is stored must not be what is handed out.
+            assert_ne!(token.hash(), raw);
+            assert_eq!(token.hash(), hash_reset_token(raw));
+        }
+    }
+
+    #[test]
+    fn malformed_reset_tokens_are_rejected_by_shape() {
+        assert!(!is_well_formed_reset_token(""));
+        assert!(!is_well_formed_reset_token(&"a".repeat(63)));
+        assert!(!is_well_formed_reset_token(&"a".repeat(65)));
+        assert!(!is_well_formed_reset_token(&"A".repeat(64)));
+        assert!(!is_well_formed_reset_token(&"z".repeat(64)));
+    }
+
+    #[tokio::test]
+    async fn issuing_stores_only_the_hash() {
+        let (pool, _dir) = temp_pool().await;
+        seed_user(&pool, "u1", "alice", GOOD_PASSWORD).await;
+
+        let issued = issue_password_reset(&pool, "alice")
+            .await
+            .expect("issuing must succeed");
+        let raw = issued.token.expose().to_string();
+
+        let stored = database::get_password_reset_by_hash(&pool, &issued.token.hash())
+            .await
+            .unwrap()
+            .expect("the grant must be stored");
+        assert_eq!(stored.user_id, "u1");
+        assert!(stored.used_at.is_none());
+        assert_ne!(stored.token_hash, raw, "the plaintext token was stored");
+
+        // And nowhere else in the row either.
+        let row: (String,) =
+            sqlx::query_as("SELECT id || '|' || token_hash || '|' || user_id FROM password_resets")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(
+            !row.0.contains(&raw),
+            "a plaintext token is in the database"
+        );
+    }
+
+    #[tokio::test]
+    async fn issuing_refuses_unknown_and_disabled_accounts() {
+        let (pool, _dir) = temp_pool().await;
+        seed_user(&pool, "u1", "alice", GOOD_PASSWORD).await;
+        database::set_user_active(&pool, "u1", false).await.unwrap();
+
+        assert!(matches!(
+            issue_password_reset(&pool, "nobody").await,
+            Err(ResetIssueError::NoSuchAccount)
+        ));
+        assert!(matches!(
+            issue_password_reset(&pool, "alice").await,
+            Err(ResetIssueError::AccountDisabled)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_reset_changes_the_password_and_drops_every_session() {
+        let (pool, _dir) = temp_pool().await;
+        seed_user(&pool, "u1", "alice", GOOD_PASSWORD).await;
+        let config = SessionConfig::default();
+
+        // Two live sessions, as an attacker who was already inside would have.
+        for _ in 0..2 {
+            login(&pool, &config, "alice", GOOD_PASSWORD, None, None)
+                .await
+                .expect("login must succeed");
+        }
+        assert_eq!(
+            database::get_sessions_for_user(&pool, "u1")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let issued = issue_password_reset(&pool, "alice").await.expect("issue");
+        const NEW_PASSWORD: &str = "ganz-anderes-langes-geheimnis";
+
+        let outcome = redeem_password_reset(&pool, issued.token.expose(), NEW_PASSWORD)
+            .await
+            .expect("redeeming must not fail");
+        assert!(matches!(outcome, PasswordResetOutcome::Success { .. }));
+
+        // The old password is gone ...
+        assert!(matches!(
+            login(&pool, &config, "alice", GOOD_PASSWORD, None, None).await,
+            Err(LoginError::InvalidCredentials)
+        ));
+        // ... the new one works ...
+        login(&pool, &config, "alice", NEW_PASSWORD, None, None)
+            .await
+            .expect("the new password must work");
+        // ... and the sessions that existed before the reset are gone. (The
+        // login just above added one, so exactly one remains.)
+        assert_eq!(
+            database::get_sessions_for_user(&pool, "u1")
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "sessions from before the reset survived"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_works_exactly_once() {
+        let (pool, _dir) = temp_pool().await;
+        seed_user(&pool, "u1", "alice", GOOD_PASSWORD).await;
+        let issued = issue_password_reset(&pool, "alice").await.expect("issue");
+
+        assert!(matches!(
+            redeem_password_reset(
+                &pool,
+                issued.token.expose(),
+                "erstes-neues-langes-geheimnis"
+            )
+            .await
+            .unwrap(),
+            PasswordResetOutcome::Success { .. }
+        ));
+        assert!(matches!(
+            redeem_password_reset(
+                &pool,
+                issued.token.expose(),
+                "zweites-neues-langes-geheimnis"
+            )
+            .await
+            .unwrap(),
+            PasswordResetOutcome::Rejected
+        ));
+
+        // The second attempt must not have changed anything.
+        let config = SessionConfig::default();
+        login(
+            &pool,
+            &config,
+            "alice",
+            "erstes-neues-langes-geheimnis",
+            None,
+            None,
+        )
+        .await
+        .expect("the first new password must still be the current one");
+    }
+
+    #[tokio::test]
+    async fn an_expired_token_is_refused() {
+        let (pool, _dir) = temp_pool().await;
+        seed_user(&pool, "u1", "alice", GOOD_PASSWORD).await;
+
+        // Written directly, because issuing always dates the expiry into the
+        // future — the point here is the check, not the clock.
+        let token = generate_reset_token().expect("RNG");
+        let reset = database::PasswordReset {
+            id: "r1".to_string(),
+            token_hash: token.hash(),
+            user_id: "u1".to_string(),
+            created_at: Utc::now() - ChronoDuration::hours(3),
+            expires_at: Utc::now() - ChronoDuration::minutes(1),
+            used_at: None,
+        };
+        database::create_password_reset(&pool, &reset)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            redeem_password_reset(&pool, token.expose(), "ein-neues-langes-geheimnis")
+                .await
+                .unwrap(),
+            PasswordResetOutcome::Rejected
+        ));
+        // The old password still stands.
+        login(
+            &pool,
+            &SessionConfig::default(),
+            "alice",
+            GOOD_PASSWORD,
+            None,
+            None,
+        )
+        .await
+        .expect("the password must be unchanged");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_token_is_refused_without_saying_why() {
+        let (pool, _dir) = temp_pool().await;
+        seed_user(&pool, "u1", "alice", GOOD_PASSWORD).await;
+
+        let stranger = generate_reset_token().expect("RNG");
+        assert!(matches!(
+            redeem_password_reset(&pool, stranger.expose(), "ein-neues-langes-geheimnis")
+                .await
+                .unwrap(),
+            PasswordResetOutcome::Rejected
+        ));
+        assert!(matches!(
+            redeem_password_reset(&pool, "not-a-token", "ein-neues-langes-geheimnis")
+                .await
+                .unwrap(),
+            PasswordResetOutcome::Rejected
+        ));
+    }
+
+    /// A password the policy turns down must leave the grant open — otherwise
+    /// one typo costs the locked-out user their only way in.
+    #[tokio::test]
+    async fn a_weak_password_does_not_burn_the_token() {
+        let (pool, _dir) = temp_pool().await;
+        seed_user(&pool, "u1", "alice", GOOD_PASSWORD).await;
+        let issued = issue_password_reset(&pool, "alice").await.expect("issue");
+
+        assert!(matches!(
+            redeem_password_reset(&pool, issued.token.expose(), "password123")
+                .await
+                .unwrap(),
+            PasswordResetOutcome::WeakPassword(_)
+        ));
+
+        let stored = database::get_password_reset_by_hash(&pool, &issued.token.hash())
+            .await
+            .unwrap()
+            .expect("still there");
+        assert!(
+            stored.used_at.is_none(),
+            "a rejected password spent the token"
+        );
+
+        // And it still works afterwards.
+        assert!(matches!(
+            redeem_password_reset(&pool, issued.token.expose(), "ein-neues-langes-geheimnis")
+                .await
+                .unwrap(),
+            PasswordResetOutcome::Success { .. }
+        ));
+    }
+
+    /// Issuing twice and redeeming one must close the other: after the password
+    /// has changed, a second outstanding grant is a live back door.
+    #[tokio::test]
+    async fn redeeming_closes_the_other_outstanding_grants() {
+        let (pool, _dir) = temp_pool().await;
+        seed_user(&pool, "u1", "alice", GOOD_PASSWORD).await;
+
+        let first = issue_password_reset(&pool, "alice").await.expect("issue");
+        let second = issue_password_reset(&pool, "alice").await.expect("issue");
+
+        assert!(matches!(
+            redeem_password_reset(&pool, second.token.expose(), "ein-neues-langes-geheimnis")
+                .await
+                .unwrap(),
+            PasswordResetOutcome::Success { .. }
+        ));
+        assert!(matches!(
+            redeem_password_reset(&pool, first.token.expose(), "noch-ein-langes-geheimnis")
+                .await
+                .unwrap(),
+            PasswordResetOutcome::Rejected,
+        ));
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_expired_and_spent_grants() {
+        let (pool, _dir) = temp_pool().await;
+        seed_user(&pool, "u1", "alice", GOOD_PASSWORD).await;
+
+        let live = issue_password_reset(&pool, "alice").await.expect("issue");
+
+        let stale = generate_reset_token().expect("RNG");
+        database::create_password_reset(
+            &pool,
+            &database::PasswordReset {
+                id: "r-old".to_string(),
+                token_hash: stale.hash(),
+                user_id: "u1".to_string(),
+                created_at: Utc::now() - ChronoDuration::hours(5),
+                expires_at: Utc::now() - ChronoDuration::hours(4),
+                used_at: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(cleanup_expired_password_resets(&pool).await.unwrap(), 1);
+        assert!(database::get_password_reset_by_hash(&pool, &stale.hash())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            database::get_password_reset_by_hash(&pool, &live.token.hash())
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }

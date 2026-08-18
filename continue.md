@@ -1,6 +1,6 @@
 # continue.md — Wiederaufnahme
 
-Stand: 16.08.2026, Lauf am Token-Limit beendet. Alle Agenten **geordnet gestoppt**,
+Stand: 18.08.2026. Vorheriger Lauf endete am Token-Limit, Alle Agenten **geordnet gestoppt**,
 nicht abgestürzt.
 Arbeitsanweisung: `AGENTS.md`. Board: https://plankton.tiny-dev.de/p/rclone-gui
 
@@ -19,10 +19,15 @@ clippy           18 Findings, alle vorbestehend
                  (main.rs 13, sync.rs 5) — Ticket e81f29bb
 ```
 
-**Nichts ist committet.** Die gesamte Arbeit liegt im Arbeitsbaum. Neue, noch untrackte
-Dateien: `src/handlers/shares.rs`, `src/handlers/urlguard.rs`,
-`static/js/ui/selection.js`, `static/js/ui/preview-video.js`,
-`config/logrotate-rclone-gui.conf`.
+**Alles ist committet** — Branch `feat/epic1-ui-rework-und-sicherheitshaertung`,
+Commit `1672d62`, gepusht nach `origin`. Von dort aus weiterarbeiten und später nach
+`main` mergen.
+
+**`.env` ist bewusst NICHT im Commit**: dort steht ein echtes Admin-Passwort im
+Klartext, und die Datei wird getrackt. Ein Push hätte es nach GitHub getragen, wo es
+auch nach dem Löschen in der Historie bliebe. Wer `git add -A` benutzt, muss das
+mitdenken — oder `git rm --cached .env` + Eintrag in `.gitignore` + ein `.env.example`
+ohne Werte. Das ist eine Entscheidung des Nutzers, weil es alle Klonenden betrifft.
 
 `.gitignore` wurde um `/data/rsyncd/` ergänzt — dort liegt `secrets/rsyncd.secrets` im
 Klartext, das wäre sonst mitcommittet worden.
@@ -48,8 +53,15 @@ Klartext, das wäre sonst mitcommittet worden.
 | `e2d122fb` | 401-Behandlung in `api.js` |
 
 ### Zurück in `Todo`, weil der Agent mittendrin gestoppt wurde
-**Teilarbeit kann im Arbeitsbaum liegen — erst `git status --short` und `git diff`
-ansehen, nicht neu anfangen.**
+
+**Korrektur (nachträglich, wichtig):** Die Annahme „Teilarbeit liegt uncommittet im
+Arbeitsbaum" war **falsch**. Der Commit `1672d62` wurde gemacht, *während* diese Agenten
+liefen, und hat ihre Arbeit **mit eingesammelt** — genau der Fall, vor dem `AGENTS.md`
+warnt. Zwei der vier Tickets waren dadurch bereits vollständig umgesetzt; ein Nachfolger
+hätte sie beinahe neu geschrieben.
+
+**Also: erst `git log -p` und den Ist-Zustand der Datei ansehen, nicht nur
+`git status`.** Ein sauberer Arbeitsbaum heisst hier *nicht*, dass nichts getan wurde.
 
 | Ticket | Stand beim Abbruch |
 |---|---|

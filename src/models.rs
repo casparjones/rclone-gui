@@ -85,6 +85,40 @@ pub struct SyncRequest {
     pub remote_path: String,
     pub chunk_size: Option<String>, // z.B. "8M", "16M", "32M"
     pub use_chunking: Option<bool>,
+
+    // -----------------------------------------------------------------------
+    // „Im Ziel löschen" (Spiegeln)
+    //
+    // Alle vier Felder sind `Option<_>` **ohne** `Default`-Ableitung, die
+    // `true` ergeben könnte: fehlt das Feld, wird nicht gelöscht. Das ist der
+    // Fehler, den man an dieser Stelle macht — ein Feld, das bei fehlendem
+    // Wert löschen lässt — und deshalb steht die Auswertung an genau einer
+    // Stelle: `handlers::sync::transfer_mode()`.
+    // -----------------------------------------------------------------------
+    /// Dateien, die es in der Quelle nicht mehr gibt, im Ziel entfernen
+    /// (`rclone sync` statt `rclone copy`). **Vorgabe: aus.**
+    #[serde(default)]
+    pub delete_target: Option<bool>,
+
+    /// Ausdrückliche Bestätigung des Löschlaufs. Ein Request mit
+    /// `delete_target: true` und ohne `delete_confirmed: true` wird
+    /// **abgewiesen**, bevor ein Job entsteht. Die Bestätigung im Dialog ist
+    /// damit nicht nur Anzeige, sondern serverseitig erzwungen — ein
+    /// abgesetzter API-Aufruf kann sie nicht überspringen.
+    #[serde(default)]
+    pub delete_confirmed: Option<bool>,
+
+    /// Trockenlauf: rclone meldet, was es täte, und verändert nichts
+    /// (`--dry-run`). Braucht **keine** Bestätigung, weil er nichts anfasst.
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+
+    /// Sicherungsnetz: statt zu löschen, verschiebt rclone die betroffenen
+    /// Dateien in diesen Ordner (`--backup-dir`). Der Pfad liegt immer auf
+    /// **demselben** Remote wie das Ziel; ein `remote:`-Präfix ist deshalb
+    /// nicht erlaubt (siehe `handlers::sync::backup_dir_target`).
+    #[serde(default)]
+    pub backup_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +134,12 @@ pub struct SyncProgress {
     pub source_name: String,
     pub start_time: i64,
     pub end_time: Option<i64>,
+    /// `"copy"` oder `"mirror"` — ob dieser Job im Ziel löscht. Steht in der
+    /// Job-Liste, damit ein Spiegellauf dort erkennbar ist und nicht erst im
+    /// Log auffällt.
+    pub mode: String,
+    /// Trockenlauf: der Job hat nichts verändert.
+    pub dry_run: bool,
 }
 
 /// Was der Client beim Anlegen oder Bearbeiten einer Verbindung schickt.

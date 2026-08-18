@@ -107,6 +107,53 @@ export function getRemoteTargetPath() {
     return view.path;
 }
 
+// Consumers that need to know *when* the shown folder changes. The sync button
+// in the left toolbar hangs on this: it may only be live while the pane really
+// shows a listed folder, and nothing else tells it apart from a pane that is
+// stuck on "choose a target above".
+//
+// The listener is called immediately with the current state and after every
+// load, successful or not:
+//
+//   { path, target, backend, listed }
+//
+// `listed` is false while the pane shows a message instead of a listing — a
+// path is then still reported, but nothing may be synced into it.
+const targetListeners = new Set();
+
+export function onRemoteTargetChange(listener) {
+    if (typeof listener !== 'function') {
+        return () => {};
+    }
+
+    targetListeners.add(listener);
+    listener(remoteTargetState());
+
+    return () => targetListeners.delete(listener);
+}
+
+function remoteTargetState() {
+    const selection = currentSelection();
+    return {
+        path: view.path,
+        target: selection.target,
+        backend: selection.backend,
+        listed: selection.ready && view.listed
+    };
+}
+
+function notifyRemoteTarget() {
+    const info = remoteTargetState();
+    targetListeners.forEach(listener => {
+        try {
+            listener(info);
+        } catch (error) {
+            // One broken subscriber must not keep the others from being told.
+            console.error('remote target listener failed:', error);
+        }
+    });
+}
+
 // --- rclone source ----------------------------------------------------------
 //
 // Backed by GET /api/files/remote, which runs `rclone lsjson <remote>:<path>`
@@ -122,23 +169,16 @@ export function getRemoteTargetPath() {
 //
 // --- Creating folders -------------------------------------------------------
 //
-// `POST /api/files/remote/mkdir` does **not exist**. There is no route today
-// that creates anything on a remote, and `src/**` belongs to another ticket, so
-// it could not be added here. `POST /api/peer/mkdir` from the peer-API ticket
-// (`9e83c167`) is a different endpoint for a different backend and does not
-// cover rclone either.
+// `POST /api/files/remote/mkdir` exists on the server and is called through
+// `createRemoteFolder()` in api.js. Button, form, validation and the four error
+// kinds all run against it.
 //
-// Rather than fire requests at a 404 and dress the resulting error up as a
-// feature, the call is switched off at a single named place. The client side is
-// complete: api.js carries `createRemoteFolder()` with the full contract, and
-// everything in this file — button, form, validation, the four error kinds —
-// runs today against any source that provides `mkdir()`.
-//
-// When the endpoint lands, flip `available` to true. Nothing else changes.
-const REMOTE_MKDIR = {
-    available: true,
-    reason: 'Creating folders needs POST /api/files/remote/mkdir on the server; that endpoint does not exist yet.'
-};
+// There is deliberately no kill switch here any more. A source that cannot
+// create folders simply omits `mkdir` and sets `mkdirUnavailable` (see the
+// source contract at the top of this file); that path stays in place for
+// alternative sources. To take the rclone mkdir out of service, drop the
+// `mkdir` entry from `rcloneSource` below and give `mkdirUnavailable` the
+// reason — the pane then shows the button disabled with that text.
 
 async function rcloneMkdir(request) {
     const remote = configuredRemoteName(request.backend, request.target);
@@ -154,8 +194,7 @@ async function rcloneMkdir(request) {
 const rcloneSource = {
     requiresTarget: true,
 
-    mkdir: REMOTE_MKDIR.available ? rcloneMkdir : null,
-    mkdirUnavailable: REMOTE_MKDIR.available ? null : REMOTE_MKDIR.reason,
+    mkdir: rcloneMkdir,
 
     async list(request) {
         const remote = configuredRemoteName(request.backend, request.target);
@@ -273,7 +312,10 @@ const view = {
     // A folder creation is in flight. Used to keep the form from being fired
     // twice, never to lock the rest of the pane: navigating away while a
     // creation runs is allowed, the answer then only updates the form.
-    creating: false
+    creating: false,
+    // True while the pane really shows a listing (state 'ok' or 'empty').
+    // A message — "choose a target", an error — leaves it false.
+    listed: false
 };
 
 // ---------------------------------------------------------------------------
@@ -693,7 +735,7 @@ function watchBackendControls() {
     // Fires immediately with the current selection; the initial call is
     // swallowed here because mountRemotePane() loads the root anyway.
     onSyncBackendChange(selection => {
-        const key = selection.backend + ' ' + selection.target + ' ' + selection.reason;
+        const key = selection.backend + '\u001f' + selection.target + '\u001f' + selection.reason;
         const first = previous === null;
         const changed = previous !== key;
         previous = key;
@@ -724,11 +766,13 @@ export async function loadRemotePath(path) {
         view.token++;
         view.path = normalisePath(path);
         view.parent = null;
+        view.listed = false;
         renderTarget(null);
         renderBreadcrumb([]);
         setListMessage(notReady.message, notReady.state);
         updateUpButton();
         updateMkdirAvailability();
+        notifyRemoteTarget();
         return;
     }
 
@@ -772,12 +816,14 @@ export async function loadRemotePath(path) {
 
     view.path = normalisePath(listing.path != null ? listing.path : path);
     view.parent = listing.parent != null ? listing.parent : parentPath(view.path);
+    view.listed = true;
 
     renderTarget(target);
     renderBreadcrumb(Array.isArray(listing.segments) ? listing.segments : segmentsFor(view.path));
     renderEntries(listing.entries);
     updateUpButton();
     updateMkdirAvailability();
+    notifyRemoteTarget();
 }
 
 function updateUpButton() {
@@ -1006,6 +1052,7 @@ function setListFailure(failure) {
     const described = describeFailure(kind, 'list');
 
     view.cursor = { entries: [], index: 0 };
+    view.listed = false;
     elements.list.dataset.state = 'error';
     elements.list.dataset.errorKind = kind;
 
@@ -1026,6 +1073,7 @@ function setListFailure(failure) {
 
     elements.list.replaceChildren(box);
     updateMkdirAvailability();
+    notifyRemoteTarget();
 }
 
 // Runs `run(signal)` and stops waiting after REMOTE_TIMEOUT_MS.

@@ -1804,6 +1804,12 @@ struct StunnelIndex {
     dropped: usize,
     /// Set once the missing log has been reported, so it is said once.
     complained: bool,
+    /// Smallest observed `own local time - stunnel line time`, i.e. an upper
+    /// bound estimate of how far the stunnel clock is behind ours. See
+    /// [`StunnelIndex::clock_shift`] for what it is used for.
+    skew: Option<chrono::TimeDelta>,
+    /// Set once a non-zero clock shift has been reported, so it is said once.
+    skew_reported: bool,
 }
 
 impl StunnelIndex {
@@ -1816,6 +1822,8 @@ impl StunnelIndex {
             connections: std::collections::VecDeque::new(),
             dropped: 0,
             complained: false,
+            skew: None,
+            skew_reported: false,
         }
     }
 
@@ -1825,9 +1833,12 @@ impl StunnelIndex {
             Ok((chunk, new_offset)) => {
                 self.offset = new_offset;
                 self.pending.push_str(&chunk);
+                let seen_at = chrono::Local::now().naive_local();
                 while let Some(index) = self.pending.find('\n') {
                     let line: String = self.pending.drain(..=index).collect();
-                    self.ingest(line.trim_end());
+                    let line = line.trim_end();
+                    self.observe_clock(parse_stunnel_time(line), seen_at);
+                    self.ingest(line);
                 }
             }
             Err(e) => {
@@ -1843,6 +1854,77 @@ impl StunnelIndex {
                 }
             }
         }
+    }
+
+    /// Learn how far the stunnel clock is behind ours (ticket 33697f91).
+    ///
+    /// # Why this is needed at all
+    ///
+    /// Both logs carry *naive local* timestamps and neither names a zone. The
+    /// daemon is this process' own child and therefore writes in this process'
+    /// zone, but stunnel is started by `start.sh` and regularly lives in a
+    /// container on `TZ=UTC` while the application runs on a host that is not.
+    /// Comparing the two as written then misses by whole hours, every time
+    /// match fails, and every audit event silently reads
+    /// `client_source=unavailable` — it looks like a bug in this module. That
+    /// is exactly what happened during the review of `88b8c455`.
+    ///
+    /// # How the offset is found without asking anybody
+    ///
+    /// A line cannot have been written after it was read, so
+    /// `read time - line time` is never below the true offset; it is only ever
+    /// *too large*, by however long the line sat in the file before we got to
+    /// it. The smallest value ever seen is therefore the best estimate, and it
+    /// improves on its own as fresh lines arrive (the log is polled every
+    /// 100 ms, so a line seen in a chunk that just appeared is that fresh).
+    /// The initial bulk read of an existing file contributes only old,
+    /// too-large values and cannot corrupt the minimum.
+    ///
+    /// Rounding in [`StunnelIndex::clock_shift`] turns the estimate into an
+    /// actual zone offset.
+    fn observe_clock(
+        &mut self,
+        line_at: Option<chrono::NaiveDateTime>,
+        seen_at: chrono::NaiveDateTime,
+    ) {
+        let Some(line_at) = line_at else {
+            return;
+        };
+        let delta = seen_at - line_at;
+        if self.skew.is_none_or(|current| delta < current) {
+            self.skew = Some(delta);
+        }
+    }
+
+    /// How many connections are known and how many of them carry the backend
+    /// port the exact join needs. Only used to make a failed lookup explain
+    /// itself; see [`AuditContext::resolve_client`].
+    fn known(&self) -> (usize, usize) {
+        (
+            self.connections.len(),
+            self.connections
+                .iter()
+                .filter(|c| c.backend_port.is_some())
+                .count(),
+        )
+    }
+
+    /// The estimate from [`StunnelIndex::observe_clock`] as a zone offset.
+    ///
+    /// Every real zone offset is a whole multiple of 15 minutes, so rounding
+    /// there both removes the reading lag and refuses to invent a correction
+    /// out of a few seconds of ordinary delay: two processes on the same clock
+    /// keep a shift of exactly zero, and the behaviour is unchanged for them.
+    /// The rounding also forgives up to 7.5 minutes of staleness in the
+    /// smallest observation, which is what makes a single fresh line enough.
+    fn clock_shift(&self) -> chrono::TimeDelta {
+        let Some(skew) = self.skew else {
+            return chrono::TimeDelta::zero();
+        };
+        let seconds = skew.num_seconds();
+        let sign = if seconds < 0 { -1 } else { 1 };
+        let rounded = (seconds.abs() + 450) / 900 * 900 * sign;
+        chrono::TimeDelta::try_seconds(rounded).unwrap_or_else(chrono::TimeDelta::zero)
     }
 
     /// Parse one stunnel line, keeping only what a join needs.
@@ -1903,17 +1985,32 @@ impl StunnelIndex {
         }
         let at = at?;
         let window = chrono::Duration::from_std(STUNNEL_MATCH_WINDOW).ok()?;
+        // Both sides are brought onto this process' clock first; without that
+        // the whole time path is a zone-offset lottery (ticket 33697f91).
+        let shift = self.clock_shift();
+        if !shift.is_zero() && !self.skew_reported {
+            self.skew_reported = true;
+            tracing::info!(
+                stunnel_log = %self.path.display(),
+                shift_seconds = shift.num_seconds(),
+                "the stunnel log is written on a clock that differs from this process by \
+                 {} seconds (a different TZ, typically a container on UTC beside an \
+                 application that is not); its timestamps are normalised before they are \
+                 matched against the daemon log",
+                shift.num_seconds()
+            );
+        }
         let entry = self
             .connections
             .iter_mut()
             .rev()
             .filter(|c| !c.claimed)
             .find(|c| match c.at {
-                // stunnel accepts before the daemon logs the connection, but
-                // the two clocks are the same clock and rsync's resolution is
-                // whole seconds, so a line one second "after" is still the
-                // same connection.
+                // stunnel accepts before the daemon logs the connection, and
+                // rsync's log resolution is whole seconds, so a line one second
+                // "after" is still the same connection.
                 Some(stunnel_at) => {
+                    let stunnel_at = stunnel_at + shift;
                     stunnel_at <= at + chrono::Duration::seconds(1) && at - stunnel_at <= window
                 }
                 None => false,
@@ -1985,6 +2082,19 @@ fn parse_rsync_time(line: &str) -> Option<chrono::NaiveDateTime> {
 /// `None` for a connection that has already ended, for a `/proc` this process
 /// may not read, and on anything without `/proc`. Every one of those is a
 /// fallback to the time match, not an error.
+///
+/// # In a container this path does not fire at all (measured, ticket 33697f91)
+///
+/// The connection child runs under the module's uid/gid. After that uid change
+/// the process is no longer dumpable, and reading `/proc/<pid>/fd` of another
+/// user needs `CAP_SYS_PTRACE`, which is not in Docker's default capability
+/// set — the same run reads the link immediately with `--cap-add=SYS_PTRACE`.
+/// Neither keeping the uid nor handing out that capability is worth a log
+/// field, so both stay as they are (alpine:3.22, rsync 3.4.3).
+///
+/// So in the container the port path is structurally unavailable and the time
+/// normalisation in [`StunnelIndex::observe_clock`] is load-bearing rather
+/// than a convenience: it carries the whole join on its own.
 fn peer_port_of_child(pid: u32, local_port: u16) -> Option<u16> {
     let mut inodes = HashSet::new();
     for entry in fs::read_dir(format!("/proc/{pid}/fd")).ok()?.flatten() {
@@ -3082,6 +3192,9 @@ struct AuditContext {
     stunnel: Option<StunnelIndex>,
     /// The port the daemon listens on, to pick the right socket out of `/proc`.
     daemon_port: u16,
+    /// Set once a failed correlation has been explained, so it is said once
+    /// instead of on every connection (ticket 33697f91).
+    warned_unresolved: bool,
 }
 
 impl AuditContext {
@@ -3090,6 +3203,7 @@ impl AuditContext {
             sink,
             stunnel,
             daemon_port,
+            warned_unresolved: false,
         }
     }
 
@@ -3116,7 +3230,32 @@ impl AuditContext {
         };
         match index.lookup(backend_port, at) {
             Some((peer, port, source)) => (Some(peer), Some(port), source),
-            None => (None, None, ClientAddressSource::Unavailable),
+            None => {
+                // Without this the failure is completely silent: the audit log
+                // is written, looks complete, and simply has no peer anywhere.
+                // Said once, with what was actually observed, so the reader can
+                // tell the three causes apart instead of guessing.
+                if !self.warned_unresolved {
+                    self.warned_unresolved = true;
+                    let (known, with_port) = index.known();
+                    tracing::warn!(
+                        stunnel_log = %index.path.display(),
+                        backend_port = ?backend_port,
+                        stunnel_connections = known,
+                        with_backend_port = with_port,
+                        clock_shift_seconds = index.clock_shift().num_seconds(),
+                        "cannot name the real client of an rsync connection; every audit event \
+                         will read client_source=unavailable until this is fixed. Likely causes, \
+                         in order: the stunnel log is empty or unreadable (`output = <path>` \
+                         and `debug = 5` in config/stunnel-rsyncd.conf.template), no stunnel \
+                         line falls into the match window for this connection, or stunnel does \
+                         not front this daemon at all. The exact join over /proc is expected to \
+                         be unavailable in a container (see peer_port_of_child), so the time \
+                         match carries this on its own"
+                    );
+                }
+                (None, None, ClientAddressSource::Unavailable)
+            }
         }
     }
 }
@@ -4870,6 +5009,62 @@ mod tests {
         let much_later =
             parse_rsync_time("2026/08/16 06:44:45 [21] connect from localhost (127.0.0.1)");
         assert_eq!(index.lookup(None, much_later), None);
+    }
+
+    #[test]
+    fn a_stunnel_log_on_another_timezone_is_still_matched() {
+        // The constellation that made a reviewer reject 88b8c455 by mistake:
+        // stunnel in a container on TZ=UTC, the application (and therefore the
+        // daemon, its child) two hours ahead on CEST. The stunnel lines then
+        // read 03:44:45 for a connection the daemon logs at 05:44:45.
+        let mut index = StunnelIndex::new(PathBuf::from("/nonexistent"));
+        let lines = [
+            "2026.08.16 03:44:45 LOG5[0]: Service [rsyncd-tls] accepted connection from 192.168.224.3:51840",
+        ];
+        // What refresh() does with a chunk that has just appeared: the line was
+        // read at 05:44:45 local, half a second after it was written.
+        let seen_at = parse_rsync_time("2026/08/16 05:44:45 x").expect("a time");
+        for line in lines {
+            index.observe_clock(parse_stunnel_time(line), seen_at);
+            index.ingest(line);
+        }
+        assert_eq!(index.clock_shift().num_seconds(), 7200);
+
+        let at = parse_rsync_time("2026/08/16 05:44:45 [21] connect from localhost (127.0.0.1)");
+        let (peer, port, source) = index
+            .lookup(None, at)
+            .expect("the peer must be found across the zone difference");
+        assert_eq!(peer, "192.168.224.3");
+        assert_eq!(port, 51840);
+        assert_eq!(source, ClientAddressSource::StunnelTime);
+    }
+
+    #[test]
+    fn the_clock_estimate_ignores_old_lines_and_ordinary_delay() {
+        let mut index = StunnelIndex::new(PathBuf::from("/nonexistent"));
+        let fresh = parse_stunnel_time("2026.08.16 05:44:45 LOG5[0]: x");
+        let stale = parse_stunnel_time("2026.08.16 04:10:00 LOG5[0]: x");
+        let seen_at = parse_rsync_time("2026/08/16 05:44:47 x").expect("a time");
+        // The bulk read of an existing file delivers old lines first. They only
+        // ever produce a too-large delta and must not become the estimate.
+        index.observe_clock(stale, seen_at);
+        index.observe_clock(fresh, seen_at);
+        // Two seconds of reading lag on the same clock stay a shift of zero,
+        // so nothing changes for the ordinary single-host case.
+        assert_eq!(index.clock_shift().num_seconds(), 0);
+        assert_eq!(index.skew.map(|d| d.num_seconds()), Some(2));
+
+        // A clock that is ahead of ours is corrected the other way.
+        let mut ahead = StunnelIndex::new(PathBuf::from("/nonexistent"));
+        ahead.observe_clock(
+            parse_stunnel_time("2026.08.16 06:44:45 LOG5[0]: x"),
+            seen_at,
+        );
+        assert_eq!(ahead.clock_shift().num_seconds(), -3600);
+
+        // No line seen at all: no correction, and no panic.
+        let untouched = StunnelIndex::new(PathBuf::from("/nonexistent"));
+        assert!(untouched.clock_shift().is_zero());
     }
 
     #[test]

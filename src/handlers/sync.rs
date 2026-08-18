@@ -46,6 +46,15 @@ pub enum JobStatus {
     Running,
     /// Sauber durchgelaufen.
     Completed,
+    /// Endzustand zwischen Erfolg und Fehlschlag: der Lauf ist durch, ein Teil
+    /// der Daten ist übertragen, ein Teil nicht (rsync-Exit 23 und 24).
+    ///
+    /// Bewusst ein eigener Zustand und **kein** `Failed`: „ein paar Dateien
+    /// waren nicht lesbar" oder „eine Datei war beim Zugriff schon weg" ist
+    /// bei einem lebenden Verzeichnis Alltag, und als roter Fehlschlag gemeldet
+    /// wären das Fehlalarme. Ihn zu `Completed` zu machen wäre die andere
+    /// Falle — dann verschwände echter Datenverlust lautlos.
+    Partial { reason: String },
     /// Endzustand mit Begründung. Der Text ist reine Anzeige — **keine** Stelle
     /// im Code leitet daraus noch eine Entscheidung ab.
     Failed { reason: String },
@@ -64,14 +73,29 @@ impl JobStatus {
         }
     }
 
+    /// Teilerfolg mit Begründung.
+    pub fn partial(reason: impl Into<String>) -> Self {
+        JobStatus::Partial {
+            reason: reason.into(),
+        }
+    }
+
     /// Der Job ist fertig — egal ob erfolgreich oder nicht. Ein Job in diesem
     /// Zustand ist löschbar, hat `end_time` gesetzt und beendet die
     /// CLI-Monitor-Schleife.
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            JobStatus::Completed | JobStatus::Failed { .. } | JobStatus::Cancelled
+            JobStatus::Completed
+                | JobStatus::Partial { .. }
+                | JobStatus::Failed { .. }
+                | JobStatus::Cancelled
         )
+    }
+
+    /// Der Lauf ist durch, aber nicht vollständig.
+    pub fn is_partial(&self) -> bool {
+        matches!(self, JobStatus::Partial { .. })
     }
 
     /// Terminal *und* erfolgreich.
@@ -86,6 +110,7 @@ impl JobStatus {
             JobStatus::Starting => "starting",
             JobStatus::Running => "running",
             JobStatus::Completed => "completed",
+            JobStatus::Partial { .. } => "partial",
             JobStatus::Failed { .. } => "failed",
             JobStatus::Cancelled => "cancelled",
         }
@@ -98,6 +123,7 @@ impl JobStatus {
             Some("starting") => JobStatus::Starting,
             Some("running") => JobStatus::Running,
             Some("completed") => JobStatus::Completed,
+            Some("partial") => JobStatus::partial(text),
             Some("cancelled") => JobStatus::Cancelled,
             Some("failed") => JobStatus::failed(text),
             _ => match text.as_str() {
@@ -119,6 +145,7 @@ impl fmt::Display for JobStatus {
             JobStatus::Starting => f.write_str("Starting"),
             JobStatus::Running => f.write_str("Running"),
             JobStatus::Completed => f.write_str("Completed"),
+            JobStatus::Partial { reason } => f.write_str(reason),
             JobStatus::Failed { reason } => f.write_str(reason),
             JobStatus::Cancelled => f.write_str("Cancelled"),
         }
@@ -170,12 +197,127 @@ impl<'de> Deserialize<'de> for JobStatus {
 /// What happens to files that exist only in the target.
 ///
 /// `Copy` never deletes (`rclone copy`, `rsync -a`), `Mirror` does
-/// (`rclone sync`, `rsync -a --delete`). Only `Copy` is used today.
+/// (`rclone sync`, `rsync -a --delete`).
+///
+/// **`Copy` ist die Vorgabe und bleibt es.** Es gibt bewusst keine
+/// `Default`-Ableitung und keinen `From<bool>`: der Modus entsteht an genau
+/// einer Stelle, [`transfer_mode`], und dort ist „Feld fehlt" gleichbedeutend
+/// mit „nicht löschen".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferMode {
     Copy,
-    #[allow(dead_code)] // wired up by the "Im Ziel löschen" ticket
     Mirror,
+}
+
+impl TransferMode {
+    /// Bezeichner für API (`mode`-Feld), Log und Job-Liste.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TransferMode::Copy => "copy",
+            TransferMode::Mirror => "mirror",
+        }
+    }
+
+    /// Löscht dieser Modus im Ziel?
+    pub fn deletes(self) -> bool {
+        matches!(self, TransferMode::Mirror)
+    }
+}
+
+/// Modus eines Requests. **Die einzige Stelle, die aus dem Request einen
+/// Löschlauf machen kann.**
+///
+/// Alles, was nicht ausdrücklich `delete_target: true` ist — fehlendes Feld,
+/// `null`, `false` — ergibt [`TransferMode::Copy`].
+pub fn transfer_mode(sync_request: &SyncRequest) -> TransferMode {
+    match sync_request.delete_target {
+        Some(true) => TransferMode::Mirror,
+        _ => TransferMode::Copy,
+    }
+}
+
+/// Trockenlauf? Fehlendes Feld heisst „nein" — ein Trockenlauf verändert
+/// nichts, ein echter Lauf schon, also ist der harmlose Wert hier *nicht* die
+/// Vorgabe.
+fn is_dry_run(sync_request: &SyncRequest) -> bool {
+    sync_request.dry_run == Some(true)
+}
+
+/// Baut aus `backup_dir` den rclone-Zielausdruck `<remote>:<pfad>`.
+///
+/// `Ok(None)` heisst „kein Sicherungsordner" — fehlendes Feld und leere
+/// Eingabe sind dasselbe.
+///
+/// Geprüft wird gegen genau die Zeichen, mit denen man aus dem Zielremote
+/// ausbrechen oder rclone eine Option unterschieben könnte:
+///
+/// * `:` — würde ein **anderes** Remote adressieren (`fremd:/`) oder rclones
+///   Connection-String-Syntax öffnen. Der Sicherungsordner liegt immer auf
+///   demselben Remote wie das Ziel; mehr braucht dieser Ticket-Umfang nicht,
+///   und weniger Syntax heisst weniger Ausbruchsfläche.
+/// * führendes `-` — landete als eigene **Option** in der Kommandozeile.
+/// * `..` als Pfadbestandteil — auf einem Remote nicht auflösbar und ein
+///   klarer Hinweis, dass jemand etwas anderes vorhat.
+/// * NUL und Zeilenumbrüche — verstümmeln argv bzw. das Log.
+fn backup_dir_target(sync_request: &SyncRequest) -> anyhow::Result<Option<String>> {
+    let raw = match sync_request.backup_dir.as_deref() {
+        Some(value) => value.trim(),
+        None => return Ok(None),
+    };
+
+    if raw.is_empty() {
+        return Ok(None);
+    }
+
+    if raw.contains(':') {
+        anyhow::bail!(
+            "Der Sicherungsordner muss auf demselben Ziel liegen und darf keinen Doppelpunkt \
+             enthalten"
+        );
+    }
+    if raw.starts_with('-') {
+        anyhow::bail!("Der Sicherungsordner darf nicht mit '-' beginnen");
+    }
+    if raw.contains('\0') || raw.contains('\n') || raw.contains('\r') {
+        anyhow::bail!("Der Sicherungsordner enthält ungültige Zeichen");
+    }
+    if raw.split('/').any(|part| part == "..") {
+        anyhow::bail!("Der Sicherungsordner darf kein '..' enthalten");
+    }
+
+    // Überschneidung mit dem Ziel. rclone weist das selbst ab („destination and
+    // parameter to --backup-dir mustn't overlap"), aber erst als **fatalen
+    // Fehler mitten im Lauf**: der Job steht dann rot in der Liste, und wer
+    // das Log nicht öffnet, weiss nicht warum. Gemessen an rclone 1.75.0.
+    //
+    // Hier abgefangen heisst: der Request wird abgelehnt, bevor ein Job
+    // entsteht — und die Meldung sagt, was zu tun ist.
+    let dest = raw_path(&sync_request.remote_path);
+    let backup = raw_path(raw);
+    let overlaps = dest.is_empty()
+        || backup == dest
+        || backup.starts_with(&format!("{}/", dest))
+        || dest.starts_with(&format!("{}/", backup));
+    if overlaps {
+        if dest.is_empty() {
+            anyhow::bail!(
+                "Der Sicherungsordner kann nicht angelegt werden, solange das Ziel das gesamte \
+                 Remote ist. Als Ziel einen Unterordner wählen."
+            );
+        }
+        anyhow::bail!(
+            "Der Sicherungsordner darf nicht im Zielordner liegen (und umgekehrt) — sonst würde \
+             er beim nächsten Lauf selbst wieder abgeglichen. Einen Ordner neben dem Ziel wählen."
+        );
+    }
+
+    Ok(Some(format!("{}:{}", sync_request.remote_name, raw)))
+}
+
+/// Vergleichsform eines Remote-Pfads: ohne führende und abschliessende `/`.
+/// `"/"`, `""` und `"//"` sind damit alle das Remote-Wurzelverzeichnis.
+fn raw_path(path: &str) -> &str {
+    path.trim().trim_matches('/')
 }
 
 /// Everything an engine needs to build the command line for one job.
@@ -255,6 +397,20 @@ pub trait SyncEngine: Send + Sync {
     /// Where progress comes from for this engine.
     fn progress_source(&self) -> ProgressSource;
 
+    /// Darf diese Engine im Ziel löschen?
+    ///
+    /// Vorgabe ist `false` — **opt-in, nicht opt-out**. Eine neue Engine, deren
+    /// Autor diese Methode übersieht, lehnt Löschläufe ab statt sie
+    /// stillschweigend zuzulassen.
+    ///
+    /// Für die rsync-Seite ist das keine Formalie: der Daemon in `rsyncd.rs`
+    /// verweigert `--delete` serverseitig (`REFUSED_OPTIONS`), und ein
+    /// Peer-Ziel darf die Option nur mit dem Scope `rsync:delete` bekommen.
+    /// Wer die rsync-Engine baut, entscheidet das dort — nicht hier.
+    fn supports_mirror(&self) -> bool {
+        false
+    }
+
     /// Parse progress out of the engine's progress stream.
     ///
     /// `chunk` is the complete log file content for [`ProgressSource::JobLog`]
@@ -265,6 +421,113 @@ pub trait SyncEngine: Send + Sync {
     /// semantics, rsync has, so the translation belongs into the engine.
     fn describe_exit(&self, _code: Option<i32>) -> String {
         "Failed".to_string()
+    }
+
+    /// Endzustand für einen Exit-Code ungleich 0.
+    ///
+    /// Trennt sich von [`SyncEngine::describe_exit`], weil ein Exit-Code nicht
+    /// nur einen *Text* bestimmt, sondern auch, **ob** der Lauf ein Fehlschlag
+    /// ist: rsync kennt Codes (23/24), nach denen ein Teil der Daten sehr wohl
+    /// angekommen ist. Voreinstellung bleibt der harte Fehlschlag mit dem Text
+    /// aus `describe_exit()`, damit rclone sich nicht ändert.
+    fn classify_exit(&self, code: Option<i32>) -> JobStatus {
+        JobStatus::failed(self.describe_exit(code))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// rsync-Exit-Codes
+//
+// rsync meldet praktisch alles über den Exit-Code; „exit status: 23" steht
+// sonst nackt in der Oberfläche und sagt einem Betreiber nichts. Übersetzt
+// werden deshalb die Codes, die im Betrieb dieser Anwendung tatsächlich
+// vorkommen — nicht die vollständige Liste aus der Handbuchseite.
+//
+// **Kein Wort aus rsyncs stderr geht in diese Meldungen.** Dort stehen
+// Modulnamen und Zielpfade; das Passwort selbst kommt nie über `argv`, sondern
+// über `--password-file`. Die Meldungen sind ausschließlich aus dem Code
+// gebaut, damit weder Oberfläche noch Log etwas ausplaudern können. Details zu
+// einzelnen Dateien stehen im Job-Log, das nur der Besitzer des Jobs sieht.
+// ---------------------------------------------------------------------------
+
+/// Übersetzt einen rsync-Exit-Code in einen Endzustand mit deutschem Klartext.
+///
+/// Der Text sagt, **was zu tun ist**, nicht nur was kaputt ist; die rohe Zahl
+/// steht in Klammern dahinter, damit man sie noch nachschlagen kann.
+///
+/// `code == None` bedeutet: durch ein Signal beendet, es gibt keinen Code.
+#[allow(dead_code)] // verdrahtet der rsync-Client (`classify_exit` des RsyncEngine)
+pub fn classify_rsync_exit(code: Option<i32>) -> JobStatus {
+    let code = match code {
+        Some(code) => code,
+        None => {
+            return JobStatus::failed(
+                "Die Übertragung wurde durch ein Signal beendet und hat keinen Exit-Code \
+                 hinterlassen. Meist ein Abbruch von außen oder ein Eingriff des \
+                 Betriebssystems (z. B. Speichermangel). Bitte erneut starten und, wenn es \
+                 sich wiederholt, den Speicherverbrauch des Servers prüfen.",
+            )
+        }
+    };
+
+    match code {
+        // Kein Fehlschlag, sondern „nicht alles" — siehe JobStatus::Partial.
+        23 => JobStatus::partial(
+            "Teilweise übertragen: einige Dateien konnten nicht übertragen werden (rsync-Code \
+             23). Der Rest ist angekommen. Fast immer fehlen Leserechte an der Quelle oder \
+             Schreibrechte im Ziel. Das Job-Log nennt die betroffenen Dateien; nach dem \
+             Korrigieren der Rechte den Job einfach erneut starten — bereits übertragene \
+             Dateien werden übersprungen.",
+        ),
+        24 => JobStatus::partial(
+            "Teilweise übertragen: einige Quelldateien sind während des Laufs verschwunden \
+             (rsync-Code 24). Bei einem Verzeichnis, in dem gleichzeitig gearbeitet wird, ist \
+             das normal und kein Grund zur Sorge. Sollte dort nichts gelöscht werden, zeigt \
+             das Job-Log die betroffenen Dateien; sonst genügt ein erneuter Lauf.",
+        ),
+
+        1 => JobStatus::failed(
+            "Der Aufruf von rsync war fehlerhaft (rsync-Code 1: Syntax- oder \
+             Verwendungsfehler). Das ist ein Fehler dieser Anwendung, nicht der Gegenstelle — \
+             bitte das Job-Log mit der Meldung an die Entwicklung geben.",
+        ),
+        5 => JobStatus::failed(
+            "Die Verbindung zur Gegenstelle konnte nicht ausgehandelt werden (rsync-Code 5). \
+             Häufigste Ursache ist eine fehlgeschlagene TLS-Prüfung: das Zertifikat der \
+             Gegenstelle ist abgelaufen, lautet auf einen anderen Namen oder ist hier nicht \
+             als vertrauenswürdig hinterlegt. Zertifikat und Hostnamen der Gegenstelle prüfen.",
+        ),
+        10 => JobStatus::failed(
+            "Die Netzwerkverbindung zur Gegenstelle ist fehlgeschlagen (rsync-Code 10). Prüfen, \
+             ob der Gegenstellen-Dienst läuft und ob Host und Port von hier aus erreichbar sind \
+             (Firewall, Portfreigabe).",
+        ),
+        11 => JobStatus::failed(
+            "Dateien konnten nicht gelesen oder geschrieben werden (rsync-Code 11). Prüfen, ob \
+             das Zielverzeichnis existiert, beschreibbar ist und genug freier Speicherplatz zur \
+             Verfügung steht.",
+        ),
+        12 => JobStatus::failed(
+            "Die Gegenstelle hat die Verbindung abgewiesen (rsync-Code 12: Protokollfehler). In \
+             der Regel stimmen die Zugangsdaten oder der Modulname nicht, oder die Kopplung mit \
+             der Gegenstelle ist abgelaufen. Die Verbindung zu diesem Ziel neu einrichten.",
+        ),
+        30 => JobStatus::failed(
+            "Zeitüberschreitung bei der Übertragung (rsync-Code 30): die Gegenstelle hat zu \
+             lange nicht geantwortet. Netzwerkverbindung prüfen und den Job erneut starten; bei \
+             sehr langsamen Leitungen kann auch eine große Einzeldatei die Ursache sein.",
+        ),
+
+        // Sammelfall. Bewusst *kein* Zuschlagen zu einem der bekannten Fälle:
+        // ein unbekannter Code als „Authentifizierung fehlgeschlagen" zu
+        // melden schickt den Betreiber in die falsche Richtung. Die rohe Zahl
+        // bleibt deshalb sichtbar.
+        other => JobStatus::failed(format!(
+            "Die Übertragung wurde mit rsync-Code {} abgebrochen. Diese Anwendung kennt den \
+             Code nicht; seine Bedeutung steht in der rsync-Dokumentation. Das Job-Log zeigt, \
+             wie weit der Lauf gekommen ist.",
+            other
+        )),
     }
 }
 
@@ -304,6 +567,11 @@ impl SyncEngine for RcloneEngine {
         // `start_sync` vorbei baut, bekommt trotzdem kein `:local:` durch.
         crate::config_manager::validate_remote_name(&sync_request.remote_name)?;
         let remote_target = format!("{}:{}", sync_request.remote_name, sync_request.remote_path);
+        // Der einzige Unterschied zwischen „kopieren" und „spiegeln" auf der
+        // rclone-Seite: `copy` lässt das Ziel in Ruhe, `sync` gleicht es an
+        // und löscht dabei. Der Modus kommt aus dem `JobSpec` und nicht aus
+        // dem Request, damit der Aufrufer ihn nicht an `transfer_mode()`
+        // vorbei setzen kann.
         let subcommand = match spec.mode {
             TransferMode::Copy => "copy",
             TransferMode::Mirror => "sync",
@@ -386,6 +654,22 @@ impl SyncEngine for RcloneEngine {
             info!("🔧 Using default settings (streams: 4, cutoff: 250M, webdav-chunk: 50M)");
         }
 
+        // Trockenlauf. Steht bewusst *nach* allem anderen und wird nie durch
+        // eine spätere Option überschrieben: `--dry-run` ist das, was einen
+        // Spiegellauf ungefährlich macht, und es ist der einzige Schalter,
+        // dessen Fehlen schlimmer ist als sein Vorhandensein.
+        if is_dry_run(sync_request) {
+            args.push("--dry-run".to_string());
+        }
+
+        // Sicherungsnetz: statt zu löschen/überschreiben verschiebt rclone die
+        // betroffenen Dateien dorthin. Der Zielpfad ist auf dasselbe Remote
+        // festgenagelt (siehe `backup_dir_target`).
+        if let Some(target) = backup_dir_target(sync_request)? {
+            args.push("--backup-dir".to_string());
+            args.push(target);
+        }
+
         Ok(EngineCommand::new("rclone", args))
     }
 
@@ -393,21 +677,42 @@ impl SyncEngine for RcloneEngine {
         ProgressSource::JobLog
     }
 
+    /// rclone kann spiegeln (`rclone sync`). Die Frage, *ob* gespiegelt werden
+    /// darf, ist damit nicht beantwortet — die entscheidet der Nutzer über
+    /// `delete_target` plus Bestätigung.
+    fn supports_mirror(&self) -> bool {
+        true
+    }
+
     fn parse_progress(&self, chunk: &str) -> Option<ProgressSnapshot> {
         parse_rclone_log_progress(chunk).map(ProgressSnapshot::from)
     }
 }
 
-/// Ensure the log directory exists and create a new log file with an initial entry
-async fn create_initial_log(job_id: &str, sync_request: &SyncRequest) -> tokio::io::Result<()> {
-    fs::create_dir_all("data/log").await?;
-
+/// Kopfzeilen des Job-Logs.
+///
+/// Der Modus steht hier **in Klartext**, nicht nur als Flag in der
+/// Argumentliste: wer hinterher wissen muss, ob ein Lauf im Ziel gelöscht hat,
+/// findet es in der ersten Handvoll Zeilen des Logs, ohne den rclone-Aufruf
+/// rekonstruieren zu müssen.
+fn initial_log_text(
+    job_id: &str,
+    sync_request: &SyncRequest,
+    mode: TransferMode,
+    dry_run: bool,
+) -> String {
     let remote_target = format!("{}:{}", sync_request.remote_name, sync_request.remote_path);
-    let log_file_path = format!("data/log/{}.log", job_id);
     let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
 
-    let initial_log = format!(
-        "[{}] Job {} started\n[{}] Source: {}\n[{}] Remote: {}\n[{}] Target: {}\n[{}] Starting rclone operation...\n\n",
+    let mode_line = match mode {
+        TransferMode::Copy => "Mode: copy (Kopieren — im Ziel wird nichts geloescht)".to_string(),
+        TransferMode::Mirror => {
+            "Mode: mirror (Spiegeln — im Ziel werden Dateien GELOESCHT)".to_string()
+        }
+    };
+
+    let mut text = format!(
+        "[{}] Job {} started\n[{}] Source: {}\n[{}] Remote: {}\n[{}] Target: {}\n[{}] {}\n",
         timestamp,
         job_id,
         timestamp,
@@ -416,8 +721,40 @@ async fn create_initial_log(job_id: &str, sync_request: &SyncRequest) -> tokio::
         sync_request.remote_name,
         timestamp,
         remote_target,
-        timestamp
+        timestamp,
+        mode_line
     );
+
+    if dry_run {
+        text.push_str(&format!(
+            "[{}] Dry run: es wird NICHTS veraendert, nur aufgelistet\n",
+            timestamp
+        ));
+    }
+    if let Some(dir) = sync_request.backup_dir.as_deref().map(str::trim) {
+        if !dir.is_empty() {
+            text.push_str(&format!(
+                "[{}] Backup dir: {}:{} (statt loeschen wird dorthin verschoben)\n",
+                timestamp, sync_request.remote_name, dir
+            ));
+        }
+    }
+
+    text.push_str(&format!("[{}] Starting rclone operation...\n\n", timestamp));
+    text
+}
+
+/// Ensure the log directory exists and create a new log file with an initial entry
+async fn create_initial_log(
+    job_id: &str,
+    sync_request: &SyncRequest,
+    mode: TransferMode,
+    dry_run: bool,
+) -> tokio::io::Result<()> {
+    fs::create_dir_all("data/log").await?;
+
+    let log_file_path = format!("data/log/{}.log", job_id);
+    let initial_log = initial_log_text(job_id, sync_request, mode, dry_run);
 
     fs::write(&log_file_path, initial_log).await
 }
@@ -526,6 +863,56 @@ pub async fn start_sync_for(
         Err(message) => return ResponseJson(ApiResponse::error(message)),
     }
 
+    // ---------------------------------------------------------------------
+    // Löschschalter. Steht bewusst **vor** der Job-Anlage, in derselben Reihe
+    // wie Remote- und Pfadprüfung: ein abgelehnter Löschlauf hinterlässt
+    // keinen Job, keine Logdatei und keinen Prozess.
+    //
+    // Zwei Bedingungen, beide notwendig:
+    //   1. Die Engine muss spiegeln können (`supports_mirror`, opt-in).
+    //   2. Der Nutzer muss ausdrücklich bestätigt haben.
+    //
+    // Punkt 2 ist die serverseitige Hälfte der Warnung im Dialog. Ohne sie
+    // wäre die Bestätigung reine Anzeige und ein direkter API-Aufruf käme
+    // ohne sie durch — genau der Weg, auf dem hier Daten verschwinden.
+    // Ein Trockenlauf ist davon **nicht** ausgenommen: er ändert zwar nichts,
+    // aber wer die Bestätigung dort weglassen dürfte, hätte einen Request, der
+    // sich durch Umlegen eines einzigen Flags in einen echten Löschlauf
+    // verwandelt.
+    // ---------------------------------------------------------------------
+    let mode = transfer_mode(&sync_request);
+    let dry_run = is_dry_run(&sync_request);
+    let engine = select_engine(&sync_request);
+
+    if mode.deletes() {
+        if !engine.supports_mirror() {
+            warn!(
+                "Sync abgelehnt: Engine '{}' darf im Ziel nicht löschen",
+                engine.name()
+            );
+            return ResponseJson(ApiResponse::error(
+                "Für dieses Ziel ist „Im Ziel löschen\" nicht zulässig",
+            ));
+        }
+        if sync_request.delete_confirmed != Some(true) {
+            warn!(
+                "Sync abgelehnt: „Im Ziel löschen\" ohne Bestätigung (Nutzer '{}')",
+                current.user.username
+            );
+            return ResponseJson(ApiResponse::error(
+                "„Im Ziel löschen\" muss ausdrücklich bestätigt werden",
+            ));
+        }
+    }
+
+    // Der Sicherungsordner wird ebenfalls vor der Job-Anlage geprüft, damit
+    // eine unbrauchbare Angabe nicht erst beim Prozessstart auffällt — dann
+    // stünde bereits ein fehlgeschlagener Job in der Liste.
+    if let Err(e) = backup_dir_target(&sync_request) {
+        warn!("Sync abgelehnt: {}", e);
+        return ResponseJson(ApiResponse::error(&e.to_string()));
+    }
+
     let job_id = Uuid::new_v4().to_string();
 
     info!("🚀 Starting new sync job: {}", job_id);
@@ -534,6 +921,13 @@ pub async fn start_sync_for(
         "   Remote: {}:{}",
         sync_request.remote_name, sync_request.remote_path
     );
+    info!("   Mode: {} (dry_run: {})", mode.as_str(), dry_run);
+    if mode.deletes() && !dry_run {
+        warn!(
+            "🔥 Job {} spiegelt: im Ziel {}:{} werden Dateien gelöscht",
+            job_id, sync_request.remote_name, sync_request.remote_path
+        );
+    }
 
     let source_name = sync_request
         .source_path
@@ -552,6 +946,8 @@ pub async fn start_sync_for(
         source_name,
         start_time,
         end_time: None,
+        mode: mode.as_str().to_string(),
+        dry_run,
     };
 
     {
@@ -560,13 +956,12 @@ pub async fn start_sync_for(
     }
 
     // Immediately create the log file so it is visible in the UI
-    if let Err(e) = create_initial_log(&job_id, &sync_request).await {
+    if let Err(e) = create_initial_log(&job_id, &sync_request, mode, dry_run).await {
         error!("Failed to create initial log for {}: {}", job_id, e);
     } else {
         debug!("📝 Initial log file created for job {}", job_id);
     }
 
-    let engine = select_engine(&sync_request);
     {
         let mut engines = JOB_ENGINES.lock().await;
         engines.insert(job_id.clone(), engine.clone());
@@ -720,8 +1115,15 @@ async fn execute_sync(
 ) {
     let log_file_path = format!("data/log/{}.log", job_id);
 
+    // Der Modus wird hier **erneut** aus dem Request abgeleitet und nicht von
+    // `start_sync_for` durchgereicht. Beide Wege benutzen dieselbe Funktion,
+    // und ein zusätzlicher Parameter wäre eine zweite Stelle, an der jemand
+    // versehentlich `Mirror` einsetzen könnte.
+    let mode = transfer_mode(&sync_request);
+    let dry_run = is_dry_run(&sync_request);
+
     // Ensure log directory and initial log exist in case start_sync didn't manage to create them (e.g. on crash)
-    if let Err(e) = create_initial_log(&job_id, &sync_request).await {
+    if let Err(e) = create_initial_log(&job_id, &sync_request, mode, dry_run).await {
         eprintln!("Failed to ensure initial log: {}", e);
     }
 
@@ -737,7 +1139,7 @@ async fn execute_sync(
     let spec = JobSpec {
         job_id: &job_id,
         request: &sync_request,
-        mode: TransferMode::Copy,
+        mode,
         log_file: &log_file_path,
     };
 
@@ -816,8 +1218,19 @@ async fn execute_sync(
             JobStatus::Completed
         }
         Ok(es) => {
-            warn!("❌ Job {} failed with exit code: {:?}", job_id, es.code());
-            JobStatus::failed(engine.describe_exit(es.code()))
+            // Der Exit-Code entscheidet über Text *und* Zustand: manche Codes
+            // (rsync 23/24) sind Teilerfolge und keine Fehlschläge.
+            let status = engine.classify_exit(es.code());
+            if status.is_partial() {
+                warn!(
+                    "⚠️ Job {} nur teilweise übertragen (exit code {:?})",
+                    job_id,
+                    es.code()
+                );
+            } else {
+                warn!("❌ Job {} failed with exit code: {:?}", job_id, es.code());
+            }
+            status
         }
         Err(e) => {
             error!("💥 Job {} error: {}", job_id, e);
@@ -1165,6 +1578,164 @@ fn parse_byte_value(s: &str) -> u64 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Trockenlauf: was würde verschwinden?
+//
+// Ein Trockenlauf, der nur „ok" meldet, ist wertlos — die Frage vor einem
+// Spiegellauf lautet nicht „läuft es durch", sondern **„welche Dateien sind
+// danach weg"**. rclone beantwortet sie im JSON-Log, und zwar
+// maschinenlesbar; die Meldungen unterscheiden sich zwischen Trockenlauf und
+// echtem Lauf, deshalb liest der Parser beide Formen (geprüft gegen rclone
+// 1.75.0 auf dem Host):
+//
+//   Trockenlauf  {"level":"notice","skipped":"delete",              "object":"a.txt","size":4}
+//                {"level":"notice","skipped":"remove directory",    "object":"sub"}
+//                {"level":"notice","skipped":"move into backup dir","object":"a.txt","size":4}
+//   echter Lauf  {"level":"info","msg":"Deleted",             "object":"a.txt"}
+//                {"level":"info","msg":"Removing directory",  "object":"sub"}
+//                {"level":"info","msg":"Moved into backup dir","object":"a.txt"}
+//
+// Ausgewertet wird das **strukturierte** Feld (`skipped` bzw. `msg`) und nicht
+// der freie Meldungstext: `msg` enthält im Trockenlauf die Grösse ("… (size 4)")
+// und ist damit kein stabiler Vergleichswert.
+// ---------------------------------------------------------------------------
+
+/// Ein Eintrag der Löschvorschau.
+///
+/// `dead_code` nur, weil die Route noch fehlt: `get_sync_deletions` ist in
+/// `src/main.rs` nicht registriert, und diese Datei darf das Routing nicht
+/// anfassen. Sobald `GET /api/sync/deletions/:job_id` steht, fällt das Attribut
+/// hier und an den drei folgenden Stellen weg.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PlannedDeletion {
+    /// Pfad relativ zum Ziel, so wie rclone ihn meldet.
+    pub path: String,
+    /// Grösse in Bytes, sofern rclone sie mitgeliefert hat (Verzeichnisse
+    /// haben keine).
+    pub size: Option<u64>,
+    /// Ein Verzeichnis, das leer zurückbliebe und entfernt würde.
+    pub is_dir: bool,
+    /// `false` = die Datei wird **statt gelöscht** in den Sicherungsordner
+    /// verschoben. Der Unterschied zwischen „weg" und „umgezogen" ist genau
+    /// der Punkt des Sicherungsnetzes und darf in der Vorschau nicht
+    /// verschwinden.
+    pub deleted: bool,
+}
+
+/// Ergebnis der Löschvorschau für einen Job.
+#[allow(dead_code)] // siehe `PlannedDeletion`: Route fehlt noch
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DeletionReport {
+    /// Stammt der Bericht aus einem Trockenlauf (nichts verändert) oder aus
+    /// einem echten Lauf (bereits geschehen)?
+    pub dry_run: bool,
+    /// Anzahl der gefundenen Einträge — auch wenn `entries` gekürzt ist.
+    pub total: usize,
+    /// Die Einträge, höchstens [`DELETION_REPORT_LIMIT`] Stück.
+    pub entries: Vec<PlannedDeletion>,
+    /// `true`, wenn `entries` gekürzt wurde.
+    pub truncated: bool,
+}
+
+/// Obergrenze der ausgelieferten Einträge. Ein Spiegellauf über ein grosses
+/// Verzeichnis kann sechsstellig viele Löschungen melden; die vollständige
+/// Liste steht weiterhin im Job-Log.
+#[allow(dead_code)] // siehe `PlannedDeletion`: Route fehlt noch
+const DELETION_REPORT_LIMIT: usize = 1000;
+
+/// Zieht aus einem rclone-JSON-Log alles heraus, was im Ziel verschwindet.
+///
+/// Reine Funktion über den Logtext, damit sie ohne rclone-Lauf prüfbar ist.
+/// Zeilen, die kein JSON sind (die Kopfzeilen von `initial_log_text`), werden
+/// übersprungen.
+#[allow(dead_code)] // von `get_sync_deletions` benutzt, das noch keine Route hat
+pub fn parse_planned_deletions(content: &str) -> Vec<PlannedDeletion> {
+    let mut entries = Vec::new();
+
+    for line in content.lines() {
+        let json: serde_json::Value = match serde_json::from_str(line) {
+            Ok(json) => json,
+            Err(_) => continue,
+        };
+
+        let object = match json.get("object").and_then(|v| v.as_str()) {
+            Some(object) if !object.is_empty() => object,
+            _ => continue,
+        };
+        let size = json.get("size").and_then(|v| v.as_u64());
+
+        // Trockenlauf meldet über `skipped`, der echte Lauf über `msg`.
+        let kind = json
+            .get("skipped")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| {
+                json.get("msg")
+                    .and_then(|v| v.as_str())
+                    .map(|msg| msg.to_lowercase())
+            });
+
+        let (is_dir, deleted) = match kind.as_deref() {
+            Some("delete") | Some("deleted") => (false, true),
+            Some("remove directory") | Some("removing directory") => (true, true),
+            Some("move into backup dir") | Some("moved into backup dir") => (false, false),
+            _ => continue,
+        };
+
+        entries.push(PlannedDeletion {
+            path: object.to_string(),
+            size,
+            is_dir,
+            deleted,
+        });
+    }
+
+    entries
+}
+
+/// Löschvorschau eines Jobs: welche Dateien würde dieser Lauf entfernen?
+///
+/// Liest dieselbe Logdatei, die auch `get_sync_log` ausliefert — es entsteht
+/// kein zweiter rclone-Aufruf und damit auch keine zweite Gelegenheit, etwas
+/// zu verändern. Ob der Bericht aus einem Trockenlauf stammt, steht im
+/// Ergebnis (`dry_run`) und wird aus der Kopfzeile des Logs gelesen, damit ein
+/// abgeräumter Job (Neustart) den Bericht nicht als „echt" ausgibt.
+#[allow(dead_code)] // siehe `PlannedDeletion`: Route fehlt noch
+pub async fn get_sync_deletions(job_id: String) -> ResponseJson<ApiResponse<DeletionReport>> {
+    let log_file_path = format!("data/log/{}.log", job_id);
+
+    let content = match fs::read_to_string(&log_file_path).await {
+        Ok(content) => content,
+        Err(e) => {
+            warn!("📖 Löschvorschau für {} nicht lesbar: {}", job_id, e);
+            return ResponseJson(ApiResponse::error("Log file not found"));
+        }
+    };
+
+    let dry_run = content
+        .lines()
+        .take(20)
+        .any(|line| line.contains("] Dry run:"));
+
+    let mut entries = parse_planned_deletions(&content);
+    let total = entries.len();
+    let truncated = total > DELETION_REPORT_LIMIT;
+    entries.truncate(DELETION_REPORT_LIMIT);
+
+    debug!(
+        "🧾 Löschvorschau für Job {}: {} Einträge (dry_run={})",
+        job_id, total, dry_run
+    );
+
+    ResponseJson(ApiResponse::success(DeletionReport {
+        dry_run,
+        total,
+        entries,
+        truncated,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1176,7 +1747,26 @@ mod tests {
             remote_path: "/dest".to_string(),
             chunk_size: chunk_size.map(String::from),
             use_chunking: chunk_size.map(|_| true),
+            delete_target: None,
+            delete_confirmed: None,
+            dry_run: None,
+            backup_dir: None,
         }
+    }
+
+    /// Baut die rclone-Argumentliste für einen Request — der Weg, den auch
+    /// `execute_sync` nimmt (Modus aus `transfer_mode()`, nicht von Hand).
+    fn args_for(request: &SyncRequest) -> Vec<String> {
+        let spec = JobSpec {
+            job_id: "job-test",
+            request,
+            mode: transfer_mode(request),
+            log_file: "data/log/job-test.log",
+        };
+        RcloneEngine
+            .build_command(&spec)
+            .expect("Kommandozeile baubar")
+            .args
     }
 
     /// Eindeutiges Testverzeichnis, wie in `download.rs`.
@@ -1540,6 +2130,250 @@ mod tests {
         assert_eq!(JobStatus::failed(SPAWN_FAILURE).to_string(), SPAWN_FAILURE);
     }
 
+    // -----------------------------------------------------------------
+    // rsync-Exit-Codes
+    // -----------------------------------------------------------------
+
+    /// Jeder übersetzte Code ergibt deutschen Klartext — keine nackte Zahl,
+    /// kein englisches "exit status".
+    #[test]
+    fn known_rsync_exit_codes_are_translated_into_plain_german() {
+        for code in [1, 5, 10, 11, 12, 23, 24, 30] {
+            let text = classify_rsync_exit(Some(code)).to_string();
+            assert!(
+                text.len() > 40,
+                "Code {} hat keine erklärende Meldung: {:?}",
+                code,
+                text
+            );
+            assert!(
+                !text.to_lowercase().contains("exit status"),
+                "Code {} meldet noch roh: {:?}",
+                code,
+                text
+            );
+            // Die Zahl bleibt nachschlagbar, steht aber nicht allein.
+            assert!(
+                text.contains(&format!("rsync-Code {}", code)),
+                "Code {} nicht nachvollziehbar: {:?}",
+                code,
+                text
+            );
+        }
+    }
+
+    /// Ein Auth-/Protokollfehler darf nicht wie ein Netzwerkausfall aussehen
+    /// und umgekehrt — sonst sucht der Betreiber an der falschen Stelle.
+    #[test]
+    fn auth_and_network_failures_are_distinguishable() {
+        let auth = classify_rsync_exit(Some(12)).to_string();
+        let tls = classify_rsync_exit(Some(5)).to_string();
+        let network = classify_rsync_exit(Some(10)).to_string();
+
+        assert!(auth.contains("Zugangsdaten"), "{}", auth);
+        assert!(!auth.contains("Firewall"), "{}", auth);
+
+        assert!(tls.contains("Zertifikat"), "{}", tls);
+
+        assert!(network.contains("erreichbar"), "{}", network);
+        assert!(!network.contains("Zugangsdaten"), "{}", network);
+
+        for status in [
+            classify_rsync_exit(Some(12)),
+            classify_rsync_exit(Some(5)),
+            classify_rsync_exit(Some(10)),
+        ] {
+            assert_eq!(status.state(), "failed");
+        }
+    }
+
+    /// 23 und 24 sind Teilerfolge: terminal, nicht erfolgreich, aber auch kein
+    /// harter Fehlschlag.
+    #[test]
+    fn partial_transfers_are_neither_success_nor_failure() {
+        for code in [23, 24] {
+            let status = classify_rsync_exit(Some(code));
+            assert!(status.is_partial(), "Code {} nicht als Teilerfolg", code);
+            assert!(status.is_terminal());
+            assert!(!status.is_success());
+            assert_eq!(status.state(), "partial");
+            assert!(
+                status.to_string().starts_with("Teilweise übertragen"),
+                "Code {} nicht als Teilerfolg formuliert: {}",
+                code,
+                status
+            );
+        }
+
+        // 24 sagt ausdrücklich, dass verschwundene Quelldateien normal sind —
+        // sonst erzeugt ein lebendes Verzeichnis Dauer-Fehlalarm.
+        assert!(classify_rsync_exit(Some(24))
+            .to_string()
+            .contains("verschwunden"));
+    }
+
+    /// Der Sammelfall darf nicht in einen bekannten Fall kippen. Genau daran
+    /// ist an anderer Stelle in diesem Projekt schon eine Fehlerunterscheidung
+    /// gescheitert.
+    #[test]
+    fn unknown_exit_codes_get_their_own_honest_case() {
+        for code in [2, 3, 6, 13, 14, 19, 20, 21, 22, 25, 31, 35, 99, 137, -1] {
+            let status = classify_rsync_exit(Some(code));
+            assert!(!status.is_partial(), "Code {} fälschlich Teilerfolg", code);
+            let text = status.to_string();
+            assert!(
+                text.contains(&format!("rsync-Code {}", code)),
+                "Code {} verliert die rohe Zahl: {}",
+                code,
+                text
+            );
+            assert!(
+                text.contains("kennt den Code nicht"),
+                "Code {} wird einem bekannten Fall zugeschlagen: {}",
+                code,
+                text
+            );
+        }
+
+        // Durch Signal beendet: kein Code, trotzdem eine ehrliche Aussage.
+        let signalled = classify_rsync_exit(None);
+        assert!(!signalled.is_partial());
+        assert!(signalled.to_string().contains("Signal"));
+    }
+
+    /// Keine Meldung darf etwas enthalten, das aus rsyncs stderr stammt
+    /// (Modulnamen, Pfade) oder gar ein Geheimnis. Die Texte werden
+    /// ausschließlich aus dem Code gebaut.
+    #[test]
+    fn messages_never_carry_secrets_or_remote_details() {
+        let codes = [
+            None,
+            Some(1),
+            Some(5),
+            Some(10),
+            Some(11),
+            Some(12),
+            Some(23),
+            Some(24),
+            Some(30),
+            Some(42),
+        ];
+        for code in codes {
+            let text = classify_rsync_exit(code).to_string();
+            for forbidden in [
+                "password",
+                "Passwort",
+                "--password-file",
+                "@",
+                "://",
+                "rsync://",
+            ] {
+                assert!(
+                    !text.contains(forbidden),
+                    "{:?} enthält {:?}: {}",
+                    code,
+                    forbidden,
+                    text
+                );
+            }
+        }
+    }
+
+    /// Der Teilerfolg überlebt den Weg durch die API-Darstellung.
+    #[test]
+    fn partial_state_survives_serialisation() {
+        let status = classify_rsync_exit(Some(23));
+        let json = serde_json::to_value(&status).expect("serialize");
+        assert_eq!(json["state"], "partial");
+        assert_eq!(json["terminal"], true);
+        assert_eq!(json["status"], status.to_string());
+
+        let back = JobStatus::from_parts(Some("partial"), status.to_string());
+        assert_eq!(back, status);
+    }
+
+    /// Ein Engine, der `classify_exit` nicht überschreibt, verhält sich wie
+    /// bisher: harter Fehlschlag mit dem Text aus `describe_exit`.
+    #[test]
+    fn engines_without_own_classification_keep_hard_failure() {
+        let status = RcloneEngine.classify_exit(Some(23));
+        assert_eq!(status, JobStatus::failed("Failed"));
+        assert!(!status.is_partial());
+    }
+
+    /// Ein Engine, der rsync-Codes benutzt, bekommt den Teilerfolg bis in den
+    /// Endzustand durch — das ist der Weg, den `execute_sync` geht.
+    #[test]
+    fn rsync_classification_reaches_the_final_status() {
+        struct RsyncLike;
+        impl SyncEngine for RsyncLike {
+            fn name(&self) -> &'static str {
+                "rsync"
+            }
+            fn build_command(&self, _spec: &JobSpec<'_>) -> anyhow::Result<EngineCommand> {
+                unreachable!()
+            }
+            fn progress_source(&self) -> ProgressSource {
+                ProgressSource::Stdout
+            }
+            fn parse_progress(&self, _chunk: &str) -> Option<ProgressSnapshot> {
+                None
+            }
+            fn classify_exit(&self, code: Option<i32>) -> JobStatus {
+                classify_rsync_exit(code)
+            }
+        }
+
+        assert!(RsyncLike.classify_exit(Some(24)).is_partial());
+        assert_eq!(RsyncLike.classify_exit(Some(12)).state(), "failed");
+        assert!(RsyncLike.classify_exit(Some(30)).is_terminal());
+    }
+
+    /// Gegenprobe mit echten Prozessen: der `ExitStatus`, den `execute_sync`
+    /// auswertet, kommt aus dem Betriebssystem — nicht aus einer Konstanten.
+    #[tokio::test]
+    async fn real_exit_statuses_are_classified_the_same_way() {
+        for (code, expect_partial) in [(23, true), (24, true), (12, false), (77, false)] {
+            let status = Command::new("/bin/sh")
+                .arg("-c")
+                .arg(format!("exit {}", code))
+                .status()
+                .await
+                .expect("stub process");
+            assert!(!status.success());
+            let job = classify_rsync_exit(status.code());
+            assert_eq!(
+                job.is_partial(),
+                expect_partial,
+                "Code {} falsch eingeordnet: {}",
+                code,
+                job
+            );
+            assert!(job.is_terminal());
+        }
+    }
+
+    /// Ein Teilerfolg ist löschbar und wird vom Cleanup erfasst — er darf
+    /// nicht als „läuft noch" hängenbleiben.
+    #[tokio::test]
+    async fn partial_jobs_are_finished_like_any_other_terminal_state() {
+        let jobs: SyncJobs = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut map = jobs.lock().await;
+            map.insert("p1".to_string(), job("p1", JobStatus::Running));
+        }
+
+        finish_job(&jobs, "p1", classify_rsync_exit(Some(23))).await;
+
+        let map = jobs.lock().await;
+        let stored = map.get("p1").expect("job");
+        assert!(stored.status.is_partial());
+        assert!(stored.status.is_terminal());
+        assert!(stored.end_time.is_some());
+        // Kein Aufrunden auf 100 % — der Lauf war eben nicht vollständig.
+        assert!(stored.progress < 100.0);
+    }
+
     fn job(id: &str, status: JobStatus) -> SyncProgress {
         SyncProgress {
             id: id.to_string(),
@@ -1550,6 +2384,8 @@ mod tests {
             source_name: "src".to_string(),
             start_time: 1_000,
             end_time: None,
+            mode: TransferMode::Copy.as_str().to_string(),
+            dry_run: false,
         }
     }
 
@@ -1715,5 +2551,316 @@ mod tests {
         assert!(RcloneEngine
             .parse_progress(r#"{"level":"debug"}"#)
             .is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // „Im Ziel löschen"
+    //
+    // Die Prüfungen hier drehen sich alle um denselben Satz: **ohne
+    // ausdrückliches `delete_target: true` landet niemals `sync` in der
+    // Argumentliste.** Deshalb wird nicht nur der gesetzte Fall geprüft,
+    // sondern jede Form von „nicht gesetzt".
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ohne_schalter_wird_kopiert() {
+        let mut req = request(None);
+
+        // Feld fehlt
+        assert_eq!(transfer_mode(&req), TransferMode::Copy);
+        let args = args_for(&req);
+        assert_eq!(args[0], "copy");
+        assert!(!args.iter().any(|a| a == "sync"));
+
+        // ausdrücklich aus
+        req.delete_target = Some(false);
+        assert_eq!(transfer_mode(&req), TransferMode::Copy);
+        assert_eq!(args_for(&req)[0], "copy");
+
+        // Bestätigung allein macht noch keinen Löschlauf
+        req.delete_target = None;
+        req.delete_confirmed = Some(true);
+        assert_eq!(transfer_mode(&req), TransferMode::Copy);
+        assert_eq!(args_for(&req)[0], "copy");
+    }
+
+    /// Ein Request-JSON ohne die neuen Felder — der Ist-Zustand jedes alten
+    /// Clients — darf nicht löschen. Das ist die Zeile, die verhindert, dass
+    /// ein `#[serde(default)]` irgendwann auf die falsche Seite kippt.
+    #[test]
+    fn fehlende_felder_im_json_loeschen_nicht() {
+        let req: SyncRequest = serde_json::from_str(
+            r#"{"source_path":"/data/src","remote_name":"myremote","remote_path":"/dest"}"#,
+        )
+        .expect("alter Client bleibt lesbar");
+
+        assert_eq!(req.delete_target, None);
+        assert_eq!(req.delete_confirmed, None);
+        assert_eq!(req.dry_run, None);
+        assert_eq!(transfer_mode(&req), TransferMode::Copy);
+        assert!(!is_dry_run(&req));
+        assert_eq!(args_for(&req)[0], "copy");
+    }
+
+    /// `null` ist kein `true`.
+    #[test]
+    fn null_im_json_loescht_nicht() {
+        let req: SyncRequest = serde_json::from_str(
+            r#"{"source_path":"/s","remote_name":"myremote","remote_path":"/d",
+                "delete_target":null,"dry_run":null}"#,
+        )
+        .expect("null ist lesbar");
+        assert_eq!(transfer_mode(&req), TransferMode::Copy);
+        assert_eq!(args_for(&req)[0], "copy");
+    }
+
+    #[test]
+    fn mit_schalter_wird_gespiegelt() {
+        let mut req = request(None);
+        req.delete_target = Some(true);
+        req.delete_confirmed = Some(true);
+
+        assert_eq!(transfer_mode(&req), TransferMode::Mirror);
+        assert!(transfer_mode(&req).deletes());
+
+        let args = args_for(&req);
+        assert_eq!(args[0], "sync");
+        assert!(!args.iter().any(|a| a == "copy"));
+    }
+
+    #[test]
+    fn dry_run_landet_in_der_argumentliste() {
+        let mut req = request(None);
+        assert!(!args_for(&req).iter().any(|a| a == "--dry-run"));
+
+        req.dry_run = Some(true);
+        req.delete_target = Some(true);
+        req.delete_confirmed = Some(true);
+        let args = args_for(&req);
+        assert_eq!(args[0], "sync");
+        assert!(args.iter().any(|a| a == "--dry-run"));
+    }
+
+    #[test]
+    fn backup_dir_bleibt_auf_dem_zielremote() {
+        let mut req = request(None);
+
+        // Nicht gesetzt und leer sind dasselbe: kein Argument.
+        assert_eq!(backup_dir_target(&req).expect("ohne Angabe"), None);
+        req.backup_dir = Some("   ".to_string());
+        assert_eq!(backup_dir_target(&req).expect("leere Angabe"), None);
+        assert!(!args_for(&req).iter().any(|a| a == "--backup-dir"));
+
+        req.backup_dir = Some("archiv/2026".to_string());
+        assert_eq!(
+            backup_dir_target(&req).expect("gültig"),
+            Some("myremote:archiv/2026".to_string())
+        );
+        let args = args_for(&req);
+        let idx = args
+            .iter()
+            .position(|a| a == "--backup-dir")
+            .expect("--backup-dir gesetzt");
+        assert_eq!(args[idx + 1], "myremote:archiv/2026");
+
+        // Fremdes Remote, Options-Schmuggel, Ausbruch, Steuerzeichen.
+        for bad in [
+            "fremd:/",
+            ":local:/etc",
+            "--config=/tmp/x",
+            "../../etc",
+            "archiv/../../etc",
+            "archiv\ndrop",
+            "archiv\0",
+        ] {
+            req.backup_dir = Some(bad.to_string());
+            assert!(
+                backup_dir_target(&req).is_err(),
+                "'{}' haette abgelehnt werden muessen",
+                bad
+            );
+        }
+    }
+
+    /// rclone bricht einen überlappenden Sicherungsordner mit einem fatalen
+    /// Fehler *im Lauf* ab (gemessen mit 1.75.0: „destination and parameter to
+    /// --backup-dir mustn't overlap"). Abgelehnt wird deshalb vorher.
+    #[test]
+    fn backup_dir_darf_sich_nicht_mit_dem_ziel_ueberschneiden() {
+        let mut req = request(None);
+        req.remote_path = "/backup/fotos".to_string();
+
+        // Daneben: in Ordnung.
+        req.backup_dir = Some("backup/archiv".to_string());
+        assert_eq!(
+            backup_dir_target(&req).expect("neben dem Ziel"),
+            Some("myremote:backup/archiv".to_string())
+        );
+
+        // Im Ziel, gleich dem Ziel, oberhalb des Ziels: alles Überschneidung.
+        for bad in [
+            "backup/fotos",
+            "backup/fotos/alt",
+            "/backup/fotos/",
+            "backup",
+        ] {
+            req.backup_dir = Some(bad.to_string());
+            assert!(
+                backup_dir_target(&req).is_err(),
+                "'{}' ueberschneidet sich mit dem Ziel",
+                bad
+            );
+        }
+
+        // Ziel ist das ganze Remote — dann gibt es keinen Platz daneben.
+        for root in ["/", "", "//"] {
+            req.remote_path = root.to_string();
+            req.backup_dir = Some("archiv".to_string());
+            assert!(backup_dir_target(&req).is_err(), "Wurzel als Ziel");
+        }
+    }
+
+    /// Der Modus steht im Log-Kopf, in Klartext und ohne Zweideutigkeit.
+    #[test]
+    fn log_kopf_nennt_den_modus() {
+        let req = request(None);
+
+        let kopie = initial_log_text("job-1", &req, TransferMode::Copy, false);
+        assert!(kopie.contains("Mode: copy"));
+        assert!(!kopie.contains("GELOESCHT"));
+        assert!(!kopie.contains("Dry run:"));
+
+        let spiegel = initial_log_text("job-1", &req, TransferMode::Mirror, true);
+        assert!(spiegel.contains("Mode: mirror"));
+        assert!(spiegel.contains("GELOESCHT"));
+        assert!(spiegel.contains("Dry run:"));
+
+        let mut mit_backup = request(None);
+        mit_backup.backup_dir = Some("archiv".to_string());
+        let text = initial_log_text("job-1", &mit_backup, TransferMode::Mirror, false);
+        assert!(text.contains("Backup dir: myremote:archiv"));
+    }
+
+    /// Engines müssen das Spiegeln ausdrücklich erlauben. Die Vorgabe des
+    /// Traits ist `false` — eine neue Engine löscht nicht aus Versehen.
+    #[test]
+    fn spiegeln_ist_opt_in_der_engine() {
+        struct StummeEngine;
+        impl SyncEngine for StummeEngine {
+            fn name(&self) -> &'static str {
+                "stumm"
+            }
+            fn build_command(&self, _spec: &JobSpec<'_>) -> anyhow::Result<EngineCommand> {
+                Ok(EngineCommand::new("true", Vec::new()))
+            }
+            fn progress_source(&self) -> ProgressSource {
+                ProgressSource::JobLog
+            }
+            fn parse_progress(&self, _chunk: &str) -> Option<ProgressSnapshot> {
+                None
+            }
+        }
+
+        assert!(!StummeEngine.supports_mirror());
+        assert!(RcloneEngine.supports_mirror());
+    }
+
+    // -----------------------------------------------------------------------
+    // Löschvorschau
+    //
+    // Die Zeilen stammen aus einem echten rclone-Lauf (1.75.0), nicht aus dem
+    // Kopf: ein Parser gegen selbst ausgedachte Meldungen prüft nur die
+    // eigene Fantasie.
+    // -----------------------------------------------------------------------
+
+    const DRY_RUN_LOG: &str = concat!(
+        "[2026-08-18 21:00:00 UTC] Job job-1 started\n",
+        "[2026-08-18 21:00:00 UTC] Mode: mirror (Spiegeln)\n",
+        "[2026-08-18 21:00:00 UTC] Dry run: es wird NICHTS veraendert, nur aufgelistet\n",
+        r#"{"level":"notice","msg":"Skipped copy as --dry-run is set (size 6)","skipped":"copy","size":6,"object":"keep.txt"}"#,
+        "\n",
+        r#"{"level":"notice","msg":"Skipped delete as --dry-run is set (size 4)","skipped":"delete","size":4,"object":"obsolete.txt"}"#,
+        "\n",
+        r#"{"level":"notice","msg":"Skipped delete as --dry-run is set (size 2)","skipped":"delete","size":2,"object":"sub/tief.txt"}"#,
+        "\n",
+        r#"{"level":"notice","msg":"Skipped remove directory as --dry-run is set","skipped":"remove directory","object":"sub"}"#,
+        "\n",
+        r#"{"level":"notice","msg":"Skipped move into backup dir as --dry-run is set (size 9)","skipped":"move into backup dir","size":9,"object":"alt.txt"}"#,
+        "\n",
+    );
+
+    const ECHTER_LAUF_LOG: &str = concat!(
+        r#"{"level":"info","msg":"Copied (new)","size":6,"object":"keep.txt"}"#,
+        "\n",
+        r#"{"level":"info","msg":"Deleted","object":"obsolete.txt"}"#,
+        "\n",
+        r#"{"level":"info","msg":"Removing directory","object":"sub"}"#,
+        "\n",
+        r#"{"level":"info","msg":"Moved into backup dir","object":"alt.txt"}"#,
+        "\n",
+    );
+
+    #[test]
+    fn trockenlauf_listet_was_geloescht_wuerde() {
+        let entries = parse_planned_deletions(DRY_RUN_LOG);
+
+        assert_eq!(
+            entries,
+            vec![
+                PlannedDeletion {
+                    path: "obsolete.txt".to_string(),
+                    size: Some(4),
+                    is_dir: false,
+                    deleted: true,
+                },
+                PlannedDeletion {
+                    path: "sub/tief.txt".to_string(),
+                    size: Some(2),
+                    is_dir: false,
+                    deleted: true,
+                },
+                PlannedDeletion {
+                    path: "sub".to_string(),
+                    size: None,
+                    is_dir: true,
+                    deleted: true,
+                },
+                PlannedDeletion {
+                    path: "alt.txt".to_string(),
+                    size: Some(9),
+                    is_dir: false,
+                    deleted: false,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn echter_lauf_wird_ebenso_gelesen() {
+        let entries = parse_planned_deletions(ECHTER_LAUF_LOG);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].path, "obsolete.txt");
+        assert!(entries[0].deleted);
+        assert!(entries[1].is_dir);
+        assert!(
+            !entries[2].deleted,
+            "Backup-Verschiebung ist keine Loeschung"
+        );
+    }
+
+    /// Ein reiner Kopierlauf hat nichts zu melden — und die Kopfzeilen des
+    /// Logs (kein JSON) dürfen den Parser nicht stören.
+    #[test]
+    fn kopierlauf_meldet_keine_loeschungen() {
+        let log = concat!(
+            "[2026-08-18 21:00:00 UTC] Job job-2 started\n",
+            "[2026-08-18 21:00:00 UTC] Mode: copy (Kopieren)\n",
+            r#"{"level":"info","msg":"Copied (new)","size":6,"object":"keep.txt"}"#,
+            "\n",
+            "kein json\n",
+            r#"{"level":"notice","msg":"\nTransferred: 6 B / 6 B, 100%","stats":{"bytes":6}}"#,
+            "\n",
+        );
+        assert!(parse_planned_deletions(log).is_empty());
     }
 }

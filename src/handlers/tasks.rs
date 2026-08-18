@@ -196,12 +196,21 @@ pub async fn start_task(
     };
 
     // Convert task to sync request
+    // Ein Task trägt die Löschoption heute **nicht** mit: die Spalte fehlt in
+    // `tasks` (`src/database.rs`), und diese Datei darf sie nicht anlegen.
+    // Die Umsetzung ist bewusst die sichere Seite der Lücke — ein gestarteter
+    // Task kopiert, er spiegelt nicht. Sobald `Task` die Felder hat, gehören
+    // hier `delete_target`/`delete_confirmed`/`backup_dir` aus dem Task hin.
     let sync_request = SyncRequest {
         source_path: task.source_path,
         remote_name: task.remote_name,
         remote_path: task.remote_path,
         chunk_size: task.chunk_size,
         use_chunking: Some(task.use_chunking),
+        delete_target: None,
+        delete_confirmed: None,
+        dry_run: None,
+        backup_dir: None,
     };
 
     // Start the sync job using existing sync handler. Der Quellpfad des Tasks

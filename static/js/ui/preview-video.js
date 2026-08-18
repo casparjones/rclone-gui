@@ -26,8 +26,35 @@
 //      which is the documented way to abort the pending fetch.
 //   4. File names are attacker controlled and go into the DOM through
 //      `textContent` / DOM properties only — never innerHTML.
+//   5. **What this module can and cannot do about an expired session.**
+//      There are two requests to /api/preview/video here, and only one of them
+//      is ours:
+//
+//        * the one the <video> element makes itself, from `src`. It is issued
+//          by the browser's media stack, range request by range request. No
+//          script sees its status code — `error` on the element says "it
+//          failed" and nothing else — so a 401 on *that* path cannot be
+//          recognised where it happens. Turning it into a fetch is not an
+//          option (point 1 above).
+//        * the one in `handleError()`, which asks the very same URL for its
+//          JSON reason after the element gave up. This one is ours, and it is
+//          where the session check lives.
+//
+//      That is why the second request is worth more than its error message:
+//      when the session expires mid-playback, the element fails, we ask, the
+//      answer is 401, and `sessionHasExpired()` — the same probe every other
+//      caller uses, imported from api.js so there is no second copy of the
+//      rule — decides between "signed out" and "this endpoint said no". So the
+//      expired session *is* caught, just one step later than elsewhere: after
+//      the element has failed, not while it is still loading.
+//
+//      What stays out of reach: a session that expires while the video plays
+//      on from an already buffered part raises nothing until the element needs
+//      more data. Until then the user sees no sign of it. That is a property
+//      of loading media through `src`, not something left undone here.
 
 import { previewRenderers } from './preview.js';
+import { isRedirectingToLogin, redirectToLogin, sessionHasExpired } from '../api.js';
 
 // URL of the raw video bytes. Deliberately local instead of a fetch helper in
 // api.js: this address is never fetched as JSON in the normal case, it is what
@@ -203,14 +230,40 @@ async function handleError(token) {
     // browser cannot decode — worth one extra request to tell the two apart.
     const path = view.info.path;
     const mime = view.info.mime || '';
+
+    // Already on the way to the login page: another request got there first,
+    // and one more question to a server that has stopped answering us would
+    // only paint over a page that is being torn down.
+    if (isRedirectingToLogin()) {
+        return;
+    }
+
     let reason = '';
     try {
         const response = await fetch(previewVideoUrl(path), {
             headers: { Accept: 'application/json' },
             credentials: 'same-origin'
         });
+
+        // A 401 is a question, not a verdict — exactly as in api.js, and asked
+        // with the same function so the two cannot drift apart. Only if the
+        // probe confirms that the session itself is gone do we leave; a 401
+        // that belongs to the endpoint stays a reason to show.
+        if (response.status === 401 && (await sessionHasExpired())) {
+            redirectToLogin();
+            return;
+        }
+
         if (!response.ok) {
-            const body = await response.json();
+            // The body is JSON in the normal case; a 401 from something that
+            // is not one of our handlers (a proxy in front of the app) may not
+            // be, and then the status alone has to carry the message.
+            let body = null;
+            try {
+                body = await response.json();
+            } catch (error) {
+                body = null;
+            }
             reason = body && body.error ? body.error : `HTTP ${response.status}`;
         }
     } catch (error) {

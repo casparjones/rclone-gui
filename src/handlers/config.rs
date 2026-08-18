@@ -134,38 +134,38 @@ pub async fn save_config(
 /// Das kostet einen Umweg: `ConfigManager::save_config` schreibt nur die
 /// Schlüssel, die es bekommt, in den bestehenden Abschnitt – ein `pass`, das
 /// schon in `rclone.conf` steht, überlebt ein leeres Feld also unbeschadet. Um
-/// es wirklich loszuwerden, wird der Abschnitt gelöscht und aus der Anfrage neu
-/// geschrieben.
+/// es wirklich loszuwerden, braucht es einen zweiten, gezielten Schritt.
+///
+/// Früher stand hier `delete_config()` + `save_config()`: der Abschnitt wurde
+/// gelöscht und aus der Anfrage neu geschrieben. Zwischen beiden Schritten lag
+/// ein Fenster, in dem ein IO-Fehler nicht das Passwort, sondern die **ganze
+/// Verbindung** verlor. Stattdessen wird jetzt zuerst normal gespeichert (die
+/// Verbindung bleibt dabei durchgehend vollständig) und danach mit
+/// `ConfigManager::clear_password` **nur** der Schlüssel `pass` aus der Datei
+/// genommen – zeilenweise und über eine Nebendatei mit `rename`, also atomar.
+///
+/// Die Reihenfolge ist Absicht: bricht der zweite Schritt ab, steht die
+/// Verbindung samt altem Passwort unverändert da und der Nutzer kann es
+/// wiederholen. Umgekehrt wäre das Passwort weg und die restliche Änderung
+/// verloren.
 ///
 /// Damit dabei nichts verloren geht, werden die Zusatzfelder des gespeicherten
 /// Abschnitts übernommen, sofern die Anfrage keine eigenen mitbringt – `type`,
-/// `url`, `user` und `vendor` stehen ohnehin in der Anfrage.
-///
-/// Bringt die Verbindung gar kein Passwort mit (oder gibt es sie noch nicht),
-/// bleibt es beim gewöhnlichen Speichern: der löschende Weg wird nur gegangen,
-/// wenn es etwas zu löschen gibt.
+/// `url`, `user` und `vendor` stehen ohnehin in der Anfrage. Das ist im
+/// Speicherbetrieb nötig, wo `save_config` den Eintrag als Ganzes ersetzt.
 async fn remove_password_and_save(
     config_manager: &ConfigManager,
     mut config_request: ConfigRequest,
 ) -> anyhow::Result<()> {
     config_request.password = None;
 
-    let stored = config_manager
-        .load_configs()
-        .await?
-        .into_iter()
-        .find(|config| config.name == config_request.name);
-
-    let has_password = stored
-        .as_ref()
-        .and_then(|config| config.password.as_deref())
-        .is_some_and(|password| !password.is_empty());
-
-    if !has_password {
-        return config_manager.save_config(&config_request).await;
-    }
-
     if config_request.additional_fields.is_none() {
+        let stored = config_manager
+            .load_configs()
+            .await?
+            .into_iter()
+            .find(|config| config.name == config_request.name);
+
         if let Some(stored) = stored {
             if !stored.additional_fields.is_empty() {
                 config_request.additional_fields = Some(stored.additional_fields);
@@ -173,8 +173,8 @@ async fn remove_password_and_save(
         }
     }
 
-    config_manager.delete_config(&config_request.name).await?;
-    config_manager.save_config(&config_request).await
+    config_manager.save_config(&config_request).await?;
+    config_manager.clear_password(&config_request.name).await
 }
 
 pub async fn delete_config(
@@ -424,6 +424,119 @@ mod tests {
             config.additional_fields.get("bearer_token_command"),
             Some(&"true".to_string())
         );
+    }
+
+    /// Der Fehlerfall auf der **Datei**, nicht im Speicher: läuft ein Schreiben
+    /// mitten im Entfernen des Passworts auf ENOSPC, muss die alte
+    /// Konfiguration vollständig zurückbleiben – die Verbindung darf unter
+    /// keinen Umständen verschwinden.
+    ///
+    /// `#[ignore]`, weil der Test das **Arbeitsverzeichnis des Prozesses**
+    /// wechseln muss (`RCLONE_CONFIG_PATH` ist relativ) und dabei kein zweiter
+    /// Test daneben laufen darf. Er läuft nur, wenn `RCLONE_GUI_ENOSPC_DIR` auf
+    /// ein Verzeichnis auf einem **winzigen** Dateisystem zeigt:
+    ///
+    /// ```text
+    /// unshare -Urm --propagation private sh -c '
+    ///   mkdir -p /tmp/tiny-50f6e2f2
+    ///   mount -t tmpfs -o size=64k tmpfs /tmp/tiny-50f6e2f2
+    ///   RCLONE_GUI_ENOSPC_DIR=/tmp/tiny-50f6e2f2 \
+    ///     cargo test --quiet removing_the_password_survives -- --ignored --test-threads=1'
+    /// ```
+    ///
+    /// Wichtig: ein grüner Lauf auf einem gewöhnlichen `/tmp` beweist nichts –
+    /// dort greift der Erfolgszweig. Dass auf dem 64k-tmpfs wirklich ENOSPC
+    /// eintritt, ist getrennt nachzuweisen (`dd bs=1k count=256` bricht dort
+    /// nach 64 KiB ab).
+    #[tokio::test]
+    #[ignore]
+    async fn removing_the_password_survives_a_failing_write() {
+        let Ok(base) = std::env::var("RCLONE_GUI_ENOSPC_DIR") else {
+            eprintln!("übersprungen: RCLONE_GUI_ENOSPC_DIR nicht gesetzt");
+            return;
+        };
+        if rclone_missing() {
+            return;
+        }
+
+        let base = std::path::PathBuf::from(base);
+        std::fs::create_dir_all(base.join("data/cfg")).expect("Testverzeichnis");
+        std::env::set_current_dir(&base).expect("chdir");
+
+        // Dateibetrieb: dieser Test prüft genau das, was auf Platte passiert.
+        let config_manager = Arc::new(ConfigManager::new(false));
+        let mut with_fields = request("box", Some(SECRET));
+        let mut fields = HashMap::new();
+        fields.insert("region".to_string(), "eu-central".to_string());
+        with_fields.additional_fields = Some(fields);
+        let response = save_config(Extension(config_manager.clone()), Json(with_fields)).await;
+        assert!(response.0.success, "{:?}", response.0.error);
+
+        let conf_path = base.join("data/cfg/rclone.conf");
+        let before = std::fs::read_to_string(&conf_path).expect("conf");
+        assert!(before.contains("\npass="), "{before}");
+
+        // Dateisystem vollschreiben, damit jeder weitere Schreibversuch
+        // scheitert. Höchstens 1 MiB: zeigt `RCLONE_GUI_ENOSPC_DIR`
+        // versehentlich auf ein gewöhnliches `/tmp`, würde die Schleife sonst
+        // das Dateisystem **aller** parallel laufenden Agenten füllen. Ist nach
+        // 1 MiB noch Platz, ist das Verzeichnis für diesen Test ungeeignet.
+        let filler = base.join("filler");
+        let filled = {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&filler).expect("filler");
+            (0..256).any(|_| file.write_all(&[0u8; 4096]).is_err())
+        };
+        if !filled {
+            std::fs::remove_file(&filler).ok();
+            eprintln!(
+                "übersprungen: {} liegt nicht auf einem winzigen Dateisystem \
+                 (nach 1 MiB immer noch Platz) – ohne ENOSPC beweist der Lauf nichts",
+                base.display()
+            );
+            return;
+        }
+
+        let result = remove_password_and_save(&config_manager, request("box", Some(""))).await;
+
+        std::fs::remove_file(&filler).ok();
+        let after = std::fs::read_to_string(&conf_path).expect("conf danach");
+
+        // Verglichen wird die **Menge** der Zeilen, nicht der Bytestrom:
+        // `save_config` schreibt über `Ini`, und dessen Schlüsselreihenfolge
+        // hängt an einer HashMap. Byte-Gleichheit ist auf diesem Weg nicht zu
+        // haben; „vollständig" heisst hier also: kein Schlüssel fehlt und
+        // keiner ist hinzugekommen.
+        let lines = |text: &str| {
+            let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+            lines.sort();
+            lines
+        };
+
+        eprintln!("Zweig: {result:?}");
+
+        match result {
+            Err(_) => assert_eq!(
+                lines(&after),
+                lines(&before),
+                "die alte Konfiguration muss vollständig zurückbleiben"
+            ),
+            Ok(()) => {
+                assert!(!after.contains("\npass="), "{after}");
+                assert!(after.contains("[box]"), "{after}");
+                assert!(after.contains("eu-central"), "{after}");
+                assert!(after.contains("alice"), "{after}");
+            }
+        }
+
+        // Keine Nebendatei darf liegenbleiben.
+        let leftovers: Vec<_> = std::fs::read_dir(base.join("data/cfg"))
+            .expect("readdir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .filter(|name| name != "rclone.conf")
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     /// Eine neue Verbindung ohne Passwort ist der häufigste Fall des Formulars
