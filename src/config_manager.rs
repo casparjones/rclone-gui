@@ -8,11 +8,196 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::sync::RwLock;
 
-/// Die rclone-Konfiguration, die jedem rclone-Aufruf per `--config` mitgegeben
-/// wird. Alles, was gegen "ist dieses Remote konfiguriert?" geprüft wird, muss
-/// gegen genau diese Datei geprüft werden – sonst prüft man etwas anderes, als
-/// rclone später liest.
+/// Die **gemeinsame** rclone-Konfiguration, die heute jedem rclone-Aufruf per
+/// `--config` mitgegeben wird. Alles, was gegen "ist dieses Remote
+/// konfiguriert?" geprüft wird, muss gegen genau die Datei geprüft werden, die
+/// rclone anschliessend liest – sonst prüft man etwas anderes.
+///
+/// Der Wert ist die **Zeichenkettenform** von [`shared_config_path`]; er bleibt
+/// als `const` erhalten, weil er an mehreren Stellen direkt als
+/// `--config`-Argument in eine rclone-Kommandozeile geht. Dass beide Formen
+/// nicht auseinanderlaufen, sichert `shared_path_matches_the_constant` ab.
+///
+/// Sobald Remotes einem Nutzer gehören, ist nicht mehr diese Datei der
+/// Bezugspunkt, sondern [`config_path_for`]. Siehe die Erläuterung dort.
 pub const RCLONE_CONFIG_PATH: &str = "data/cfg/rclone.conf";
+
+/// Verzeichnis aller rclone-Konfigurationen, relativ zum Arbeitsverzeichnis des
+/// Prozesses – wie alles unter `data/`.
+const CONFIG_DIR: &str = "data/cfg";
+
+/// Unterverzeichnis, unter dem je Nutzer ein eigenes Verzeichnis liegt.
+const USER_CONFIG_SUBDIR: &str = "users";
+
+/// Dateiname der Konfiguration, in jedem Geltungsbereich derselbe.
+const CONFIG_FILE_NAME: &str = "rclone.conf";
+
+/// Rechte des Verzeichnisses einer Nutzer-Konfiguration. Es enthält
+/// Zugangsdaten und listet ausserdem auf, welche Nutzer es überhaupt gibt.
+const USER_CONFIG_DIR_MODE: u32 = 0o700;
+
+/// Rechte einer frisch angelegten Konfigurationsdatei. Denselben Wert benutzt
+/// [`write_config_atomically`] für seine Nebendatei.
+const CONFIG_FILE_MODE: u32 = 0o600;
+
+/// Der gemeinsame, nicht nutzergebundene Konfigurationspfad.
+///
+/// Das ist die Datei, die es heute gibt und in der die bestehenden Remotes
+/// stehen. Sie wird durch die Umstellung auf nutzereigene Konfigurationen
+/// **nicht** angetastet: nichts verschiebt, kopiert oder löscht sie hier. Ob
+/// und wie ihr Inhalt einem Nutzer zugeschlagen wird, entscheidet das Ticket
+/// `771319ce` (Migration/Admin-Remotes) – bis dahin bleibt sie unverändert
+/// lesbar.
+pub fn shared_config_path() -> std::path::PathBuf {
+    Path::new(CONFIG_DIR).join(CONFIG_FILE_NAME)
+}
+
+// Die Bausteine der nutzergebundenen Auflösung. Sie sind hier vollständig
+// umgesetzt und geprüft, aber noch von keinem Aufrufer benutzt: die Umstellung
+// der Aufrufer liegt in `src/handlers/{files,sync,config}.rs`, `src/main.rs`
+// (CLI `--start-task`) und `src/database.rs` (Anlegen/Löschen eines Nutzers) —
+// Dateien, die dieses Ticket nicht besitzt. Deshalb `allow(dead_code)`: das
+// Attribut markiert die Lücke, statt sie zu verstecken, und fällt beim Einbau
+// (Ticket `ce385143` bzw. `0541474c`) wieder weg.
+/// **Die** Stelle, an der aus einem Nutzer ein Konfigurationspfad wird –
+/// das Gegenstück zu `user_root()` für den Dateibaum.
+///
+/// Kein Aufrufer setzt den Pfad selbst zusammen. Sonst entstehen zwei
+/// Wahrheiten: eine, gegen die geprüft wird („ist dieses Remote
+/// konfiguriert?"), und eine, die rclone per `--config` tatsächlich liest. Genau
+/// diese Lücke war `5d31b2f7`, nur an einer anderen Stelle.
+///
+/// **Die Nutzerkennung wird zu einem Verzeichnisnamen.** Sie kommt heute aus
+/// `uuid::Uuid::new_v4()` und ist damit unbedenklich – aber sie kommt über die
+/// Datenbank, und eine von Hand bearbeitete `users`-Tabelle ist ein Pfad, den
+/// niemand prüft. Ein Wert wie `../../..` oder `/etc` würde die Konfiguration
+/// samt Zugangsdaten aus `data/` heraustragen. Deshalb wird die Kennung hier als
+/// **ein** Pfadsegment validiert, statt sie zu vertrauen; `..`, `/`, `\`, `.`
+/// und alles ausserhalb von `[A-Za-z0-9-]` sind abgelehnt. Das ist eine
+/// Positivliste aus demselben Grund wie bei den Remote-Namen.
+#[allow(dead_code)]
+pub fn config_path_for(user_id: &str) -> anyhow::Result<std::path::PathBuf> {
+    config_path_in(Path::new(CONFIG_DIR), user_id)
+}
+
+/// Legt das Konfigurationsverzeichnis eines Nutzers an und darin eine leere
+/// `rclone.conf`. Gibt den Pfad der Datei zurück.
+///
+/// Gehört an das **Anlegen** eines Nutzers. Ohne die leere Datei liefe jede
+/// Prüfung „ist dieses Remote konfiguriert?" gegen eine nicht lesbare Datei –
+/// technisch dasselbe Ergebnis (abgelehnt), aber mit einer Fehlermeldung über
+/// eine fehlende Datei statt über ein unbekanntes Remote.
+///
+/// Idempotent: ein zweiter Aufruf ändert nichts. Insbesondere werden die Rechte
+/// einer **bestehenden** Datei nicht überschrieben – wer bewusst `0640` gesetzt
+/// hat, behält es, genau wie bei [`write_config_atomically`].
+#[allow(dead_code)]
+pub fn ensure_user_config(user_id: &str) -> anyhow::Result<std::path::PathBuf> {
+    ensure_user_config_in(Path::new(CONFIG_DIR), user_id)
+}
+
+/// Entfernt die Konfiguration eines Nutzers samt Verzeichnis.
+///
+/// Gehört an das **Löschen** eines Nutzers: bleibt die Datei liegen, erbt der
+/// nächste Nutzer mit derselben Kennung fremde Remotes samt Zugangsdaten. Dass
+/// eine UUID sich nicht wiederholt, ist dafür kein Verlass – eine
+/// wiederhergestellte Datenbank genügt.
+///
+/// Ein nicht vorhandenes Verzeichnis ist kein Fehler.
+#[allow(dead_code)]
+pub fn remove_user_config(user_id: &str) -> anyhow::Result<()> {
+    remove_user_config_in(Path::new(CONFIG_DIR), user_id)
+}
+
+// ---------------------------------------------------------------------------
+// Derselbe Kern, aber mit ausdrücklichem Wurzelverzeichnis.
+//
+// `CONFIG_DIR` ist **relativ** zum Arbeitsverzeichnis des Prozesses. Ein Test,
+// der die Dateiwirkung prüfen will, müsste also `chdir` aufrufen — das ist
+// prozessweit und bricht die parallel laufenden Tests. Deshalb dieselbe
+// Auslagerung, die es hier für `delete_section_atomically` und
+// `render_configs_ini` schon gibt: der Kern nimmt die Wurzel als Argument, die
+// öffentliche Fassung setzt `CONFIG_DIR` ein.
+// ---------------------------------------------------------------------------
+
+fn config_path_in(base: &Path, user_id: &str) -> anyhow::Result<std::path::PathBuf> {
+    Ok(user_config_dir_in(base, user_id)?.join(CONFIG_FILE_NAME))
+}
+
+fn user_config_dir_in(base: &Path, user_id: &str) -> anyhow::Result<std::path::PathBuf> {
+    validate_user_id(user_id)?;
+    Ok(base.join(USER_CONFIG_SUBDIR).join(user_id))
+}
+
+fn ensure_user_config_in(base: &Path, user_id: &str) -> anyhow::Result<std::path::PathBuf> {
+    let dir = user_config_dir_in(base, user_id)?;
+
+    // `DirBuilder` mit `mode` setzt die Rechte **beim Anlegen**, nicht danach –
+    // es gibt also kein Fenster, in dem das Verzeichnis weltlesbar ist. Auf ein
+    // bereits bestehendes Verzeichnis wirkt der Modus nicht, das ist gewollt.
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(USER_CONFIG_DIR_MODE);
+    }
+    builder
+        .create(&dir)
+        .map_err(|e| anyhow::anyhow!("Failed to create config directory: {}", e))?;
+
+    let path = dir.join(CONFIG_FILE_NAME);
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(CONFIG_FILE_MODE);
+    }
+    match options.open(&path) {
+        Ok(_) => Ok(path),
+        // Schon da – dann ist nichts zu tun, insbesondere werden die Rechte
+        // einer bestehenden Datei nicht angetastet.
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(path),
+        Err(e) => Err(anyhow::anyhow!("Failed to create config: {}", e)),
+    }
+}
+
+fn remove_user_config_in(base: &Path, user_id: &str) -> anyhow::Result<()> {
+    let dir = user_config_dir_in(base, user_id)?;
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(anyhow::anyhow!("Failed to remove config: {}", e)),
+    }
+}
+
+/// Obergrenze für eine Nutzerkennung als Verzeichnisname. Eine UUID hat 36
+/// Zeichen; alles jenseits dieser Grösse ist keine Kennung mehr.
+const MAX_USER_ID_LEN: usize = 64;
+
+/// Eine Nutzerkennung, die als **ein** Pfadsegment taugt. Siehe die Begründung
+/// an [`config_path_for`].
+fn validate_user_id(user_id: &str) -> anyhow::Result<()> {
+    if user_id.is_empty() {
+        anyhow::bail!("User id must not be empty");
+    }
+    if user_id.len() > MAX_USER_ID_LEN {
+        anyhow::bail!(
+            "User id must not be longer than {} characters",
+            MAX_USER_ID_LEN
+        );
+    }
+    if !user_id
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        // Die Kennung wird bewusst nicht wiederholt: sie kann alles enthalten.
+        anyhow::bail!("User id is not usable as a directory name");
+    }
+    Ok(())
+}
 
 /// Längenobergrenze für einen Remote-Namen. rclone selbst kennt keine, aber ein
 /// Name dieser Grösse ist bereits jenseits jeder legitimen Verwendung.
@@ -89,14 +274,36 @@ fn is_allowed_remote_name_char(c: char) -> bool {
 /// Wird sie abgelehnt, darf kein rclone-Prozess starten – die Aufrufer rufen
 /// sie deshalb vor dem Bau der Kommandozeile auf, nicht danach.
 ///
-/// TODO(Ticket `65fe551e` – eigene rclone-Remotes pro Nutzer): sobald Remotes
-/// einem Nutzer gehören, muss hier gegen die Remotes **des angemeldeten
-/// Nutzers** geprüft werden, nicht gegen alle konfigurierten. Bis dahin ist die
-/// Prüfung bewusst global.
+/// Diese Fassung prüft gegen die **gemeinsame** Konfiguration. Sie ist ein
+/// Aufruf von [`ensure_configured_remote_at`] mit [`shared_config_path`] – es
+/// gibt nur **eine** Umsetzung der Prüfung, damit die nutzergebundene und die
+/// gemeinsame Variante nicht auseinanderlaufen können.
+///
+/// TODO(Ticket `ce385143` – Remote-Isolation): die Aufrufer in
+/// `src/handlers/files.rs`, `src/handlers/sync.rs` und `src/handlers/config.rs`
+/// haben den angemeldeten Nutzer bereits zur Hand bzw. können ihn sich aus den
+/// Request-Extensions geben lassen. Sie rufen dann
+/// `ensure_configured_remote_at(&config_path_for(&user.id)?, name)` und geben
+/// **denselben** Pfad als `--config` an rclone weiter. Solange das nicht
+/// geschehen ist, ist die Prüfung bewusst global.
 pub async fn ensure_configured_remote(name: &str) -> anyhow::Result<()> {
+    ensure_configured_remote_at(&shared_config_path(), name).await
+}
+
+/// Dieselbe Prüfung gegen eine **benannte** Konfiguration.
+///
+/// Der Pfad kommt aus [`config_path_for`] und ist genau der, der anschliessend
+/// als `--config` an rclone geht. Wer hier gegen eine andere Datei prüft als
+/// rclone später liest, prüft nichts: das war `5d31b2f7`.
+///
+/// Ein Remote, das nur in der Konfiguration eines **anderen** Nutzers steht, ist
+/// damit „unknown" – ununterscheidbar von einem frei erfundenen Namen. Das ist
+/// Absicht: die Fehlermeldung darf nicht verraten, dass es den Namen woanders
+/// gibt.
+pub async fn ensure_configured_remote_at(config_path: &Path, name: &str) -> anyhow::Result<()> {
     validate_remote_name(name)?;
 
-    let contents = tokio::fs::read_to_string(RCLONE_CONFIG_PATH)
+    let contents = tokio::fs::read_to_string(config_path)
         .await
         .map_err(|e| anyhow::anyhow!("rclone configuration is not readable: {}", e))?;
 
@@ -138,6 +345,18 @@ impl ConfigManager {
             memory_configs: Arc::new(RwLock::new(HashMap::new())),
             use_memory_only,
         }
+    }
+
+    /// Die Konfigurationsdatei, gegen die dieser Manager arbeitet.
+    ///
+    /// Bis hierher stand der Pfad an fünf Stellen im Dateibetrieb wörtlich im
+    /// Code (`load_from_file`, `save_to_file`, `remove_key`,
+    /// `delete_from_file`, `persist_to_file`). Jetzt gibt es **eine** Stelle –
+    /// und damit auch nur eine, an der die nutzergebundene Auflösung
+    /// ([`config_path_for`]) eingehängt wird, sobald der `ConfigManager` weiss,
+    /// für welchen Nutzer er arbeitet (Ticket `ce385143`).
+    fn config_path(&self) -> std::path::PathBuf {
+        shared_config_path()
     }
 
     pub async fn load_configs(&self) -> anyhow::Result<Vec<RcloneConfig>> {
@@ -210,57 +429,18 @@ impl ConfigManager {
         }
 
         let configs = self.memory_configs.read().await;
-        let config_path = RCLONE_CONFIG_PATH;
+        let config_path = self.config_path();
 
         // Ensure directory exists
-        if let Some(parent) = Path::new(config_path).parent() {
+        if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
-        let mut conf = Ini::new();
-
-        for (_, config) in configs.iter() {
-            // Handle WebDAV subtypes and set appropriate type and vendor
-            let (actual_type, vendor) = match config.config_type.as_str() {
-                "webdav-nextcloud" => ("webdav", Some("nextcloud")),
-                "webdav-owncloud" => ("webdav", Some("owncloud")),
-                "webdav-sharepoint" => ("webdav", Some("sharepoint")),
-                "webdav-fastmail" => ("webdav", Some("fastmail")),
-                "webdav-other" => ("webdav", Some("other")),
-                _ => (config.config_type.as_str(), None),
-            };
-
-            conf.set(&config.name, "type", Some(actual_type.to_string()));
-
-            if let Some(url) = &config.url {
-                conf.set(&config.name, "url", Some(url.clone()));
-            }
-
-            if let Some(username) = &config.username {
-                conf.set(&config.name, "user", Some(username.clone()));
-            }
-
-            if let Some(password) = &config.password {
-                if !password.is_empty() {
-                    // Note: Passwords in memory configs should already be obscured
-                    // when they were saved initially
-                    conf.set(&config.name, "pass", Some(password.clone()));
-                }
-            }
-
-            // Set vendor for WebDAV configurations
-            if let Some(vendor_value) = vendor {
-                conf.set(&config.name, "vendor", Some(vendor_value.to_string()));
-            }
-
-            for (key, value) in &config.additional_fields {
-                conf.set(&config.name, key, Some(value.clone()));
-            }
-        }
-
-        conf.write(config_path)
-            .map_err(|e| anyhow::anyhow!("Failed to write config: {}", e))?;
-        Ok(())
+        // Geschrieben wird ueber [`write_config_atomically`], nicht ueber
+        // `Ini::write` — aus demselben Grund wie in `save_to_file`: `Ini::write`
+        // schneidet die Zieldatei ab und schreibt dann neu, und dazwischen liegt
+        // ein Fenster, in dem eine halbe `rclone.conf` auf Platte steht.
+        write_config_atomically(&config_path, &render_configs_ini(&configs))
     }
 
     pub async fn load_from_file_to_memory(&self) -> anyhow::Result<()> {
@@ -275,14 +455,14 @@ impl ConfigManager {
     }
 
     async fn load_from_file(&self) -> anyhow::Result<Vec<RcloneConfig>> {
-        let config_path = RCLONE_CONFIG_PATH;
+        let config_path = self.config_path();
 
-        if !Path::new(config_path).exists() {
+        if !config_path.exists() {
             return Ok(Vec::new());
         }
 
         let mut conf = Ini::new();
-        conf.load(config_path)
+        conf.load(&config_path)
             .map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
         let mut configs = Vec::new();
 
@@ -334,17 +514,17 @@ impl ConfigManager {
     }
 
     async fn save_to_file(&self, config_request: &ConfigRequest) -> anyhow::Result<()> {
-        let config_path = RCLONE_CONFIG_PATH;
+        let config_path = self.config_path();
 
         // Ensure directory exists
-        if let Some(parent) = Path::new(config_path).parent() {
+        if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
         let mut conf = Ini::new();
 
-        if Path::new(config_path).exists() {
-            conf.load(config_path)
+        if config_path.exists() {
+            conf.load(&config_path)
                 .map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
         }
 
@@ -396,7 +576,7 @@ impl ConfigManager {
         // liegt zwischen Abschneiden und vollstaendigem Schreiben ein Fenster,
         // in dem eine halbe `rclone.conf` auf Platte steht und dem Nutzer alle
         // Remotes fehlen.
-        write_config_atomically(Path::new(config_path), &conf.writes())
+        write_config_atomically(&config_path, &conf.writes())
     }
 
     /// Entfernt das gespeicherte Passwort eines Remotes.
@@ -434,13 +614,13 @@ impl ConfigManager {
     /// vollständige neue Fassung auf Platte oder unverändert die alte. Einen
     /// Zwischenzustand gibt es nicht.
     pub async fn remove_key(&self, section: &str, key: &str) -> anyhow::Result<()> {
-        let config_path = Path::new(RCLONE_CONFIG_PATH);
+        let config_path = self.config_path();
 
         if !config_path.exists() {
             return Ok(());
         }
 
-        let contents = tokio::fs::read_to_string(config_path)
+        let contents = tokio::fs::read_to_string(&config_path)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to read config: {}", e))?;
 
@@ -450,23 +630,17 @@ impl ConfigManager {
             return Ok(());
         };
 
-        write_config_atomically(config_path, &updated)
+        write_config_atomically(&config_path, &updated)
     }
 
     async fn delete_from_file(&self, name: &str) -> anyhow::Result<()> {
-        let config_path = RCLONE_CONFIG_PATH;
+        let config_path = self.config_path();
 
-        if !Path::new(config_path).exists() {
+        if !config_path.exists() {
             return Ok(());
         }
 
-        let mut conf = Ini::new();
-        conf.load(config_path)
-            .map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
-        conf.remove_section(name);
-        conf.write(config_path)
-            .map_err(|e| anyhow::anyhow!("Failed to write config: {}", e))?;
-        Ok(())
+        delete_section_atomically(&config_path, name)
     }
 
     /// Verschleiert ein Passwort mit `rclone obscure`.
@@ -593,6 +767,71 @@ fn remove_key_from_contents(contents: &str, section: &str, key: &str) -> Option<
     removed.then_some(out)
 }
 
+/// Rendert die im Speicher gehaltenen Remotes als `rclone.conf`-Text.
+///
+/// Ausgelagert aus `persist_to_file`, damit derselbe Text ohne globalen
+/// Konfigurationspfad im Test erzeugt und über [`write_config_atomically`]
+/// geschrieben werden kann.
+fn render_configs_ini(configs: &HashMap<String, RcloneConfig>) -> String {
+    let mut conf = Ini::new();
+
+    for config in configs.values() {
+        // Handle WebDAV subtypes and set appropriate type and vendor
+        let (actual_type, vendor) = match config.config_type.as_str() {
+            "webdav-nextcloud" => ("webdav", Some("nextcloud")),
+            "webdav-owncloud" => ("webdav", Some("owncloud")),
+            "webdav-sharepoint" => ("webdav", Some("sharepoint")),
+            "webdav-fastmail" => ("webdav", Some("fastmail")),
+            "webdav-other" => ("webdav", Some("other")),
+            _ => (config.config_type.as_str(), None),
+        };
+
+        conf.set(&config.name, "type", Some(actual_type.to_string()));
+
+        if let Some(url) = &config.url {
+            conf.set(&config.name, "url", Some(url.clone()));
+        }
+
+        if let Some(username) = &config.username {
+            conf.set(&config.name, "user", Some(username.clone()));
+        }
+
+        if let Some(password) = &config.password {
+            if !password.is_empty() {
+                // Note: Passwords in memory configs should already be obscured
+                // when they were saved initially
+                conf.set(&config.name, "pass", Some(password.clone()));
+            }
+        }
+
+        // Set vendor for WebDAV configurations
+        if let Some(vendor_value) = vendor {
+            conf.set(&config.name, "vendor", Some(vendor_value.to_string()));
+        }
+
+        for (key, value) in &config.additional_fields {
+            conf.set(&config.name, key, Some(value.clone()));
+        }
+    }
+
+    conf.writes()
+}
+
+/// Entfernt einen Abschnitt aus der `rclone.conf` und schreibt das Ergebnis
+/// über [`write_config_atomically`].
+///
+/// `Ini::write` wäre hier truncate + write. Dass der Inhalt beim Löschen
+/// üblicherweise *schrumpft*, macht das Fenster kleiner, aber nicht kleiner als
+/// null: das Abschneiden geschieht vor dem Schreiben, ein Fehler dazwischen
+/// hinterlässt eine abgeschnittene Datei — also alle Remotes des Nutzers weg.
+fn delete_section_atomically(config_path: &Path, name: &str) -> anyhow::Result<()> {
+    let mut conf = Ini::new();
+    conf.load(config_path)
+        .map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
+    conf.remove_section(name);
+    write_config_atomically(config_path, &conf.writes())
+}
+
 /// Schreibt die Konfiguration so, dass sie **nie halb** auf Platte liegt.
 ///
 /// Der Ablauf ist der übliche: in eine Nebendatei im **selben Verzeichnis**
@@ -604,8 +843,37 @@ fn remove_key_from_contents(contents: &str, section: &str, key: &str) -> Option<
 ///
 /// **Rechte:** `rclone.conf` enthält Zugangsdaten. Eine frisch angelegte Datei
 /// bekäme die Rechte aus der umask (typisch 0644, also weltlesbar), deshalb
-/// wird sie mit 0600 angelegt und anschliessend auf den Modus der Zieldatei
-/// gesetzt. Existiert noch keine Zieldatei, bleibt es bei 0600.
+/// wird sie mit 0600 angelegt und anschliessend auf den Modus der bestehenden
+/// **regulären** Datei am Pfad gesetzt. Gibt es dort keine — auch, wenn dort ein
+/// Symlink liegt, dessen eigene Modusbits als Vorlage sinnlos wären —, bleibt es
+/// bei 0600. Die Vorlage wird bewusst **nicht durch einen Symlink hindurch**
+/// gelesen: sonst liesse sich über einen untergeschobenen Link auf eine
+/// 0666-Datei eine weltlesbare `rclone.conf` erzwingen. Siehe
+/// [`existing_file_mode`].
+///
+/// **Symlinks werden ersetzt — das ist eine bewusste Entscheidung.** War
+/// `rclone.conf` ein Symlink (etwa auf eine Datei ausserhalb von `data/`), steht
+/// nach dem `rename` eine *reguläre* Datei am alten Ort, und das ursprüngliche
+/// Ziel wird nicht mehr beschrieben. Erhalten liesse sich der Symlink nur, indem
+/// man ihm folgt und die Nebendatei neben dem *Ziel* anlegt — also indem man
+/// aufgrund des Inhalts eines Verzeichniseintrags entscheidet, wohin geschrieben
+/// wird. Genau das ist der klassische Symlink-Angriff: `data/cfg/` ist zur
+/// Laufzeit beschreibbar, ein dort untergeschobener Symlink würde die
+/// Konfiguration samt Zugangsdaten an einen fremden Ort schreiben, und die
+/// TOCTOU-Lücke zwischen „Ziel auflösen" und „Nebendatei umbenennen" bleibt
+/// grundsätzlich offen. Der Schutz ist mehr wert als die Auslagerung: wer
+/// `rclone.conf` verlegen will, hängt `data/cfg` als Ganzes um (Bind-Mount,
+/// Symlink auf das *Verzeichnis*) — dann greift das `rename` innerhalb des
+/// verlegten Verzeichnisses und alles bleibt, wie es sein soll.
+///
+/// Damit niemand rätselt, warum seine Auslagerung nicht mehr wirkt, wird ein
+/// vorgefundener Symlink einmal pro Schreibvorgang mit `warn` protokolliert.
+///
+/// **Dauerhaftigkeit:** nach dem `rename` wird auch das **Verzeichnis**
+/// synchronisiert. Ohne das liegt der neue Inhalt zwar vollständig auf Platte,
+/// der Verzeichniseintrag aber möglicherweise nur im Cache — ein Systemabsturz
+/// direkt danach lässt die Änderung verschwinden. Eine halbe Datei kann es auch
+/// ohne den `fsync` nie geben; er schliesst nur die Lücke „Änderung verloren".
 fn write_config_atomically(path: &Path, contents: &str) -> anyhow::Result<()> {
     use std::io::Write;
 
@@ -613,6 +881,15 @@ fn write_config_atomically(path: &Path, contents: &str) -> anyhow::Result<()> {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
+
+    // `symlink_metadata` folgt dem Link nicht — genau das wird hier gebraucht.
+    if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink()) {
+        tracing::warn!(
+            path = %path.display(),
+            "rclone configuration is a symlink and will be replaced by a regular file; \
+             move the whole cfg directory instead of linking the single file"
+        );
+    }
 
     // Der Name enthält PID und Zeitstempel, damit zwei gleichzeitige Schreiber
     // nicht dieselbe Nebendatei benutzen. Der Punkt am Anfang hält sie aus der
@@ -669,17 +946,55 @@ fn write_config_atomically(path: &Path, contents: &str) -> anyhow::Result<()> {
         return Err(anyhow::anyhow!("Failed to write config: {}", e));
     }
 
+    // Der Verzeichniseintrag ist jetzt umgehängt, aber noch nicht zwingend auf
+    // Platte. Ein `fsync` auf das Verzeichnis macht ihn dauerhaft.
+    //
+    // Scheitert er, ist das **kein** Fehlschlag des Schreibvorgangs: die neue
+    // Fassung liegt bereits am Ziel, und ein `Err` würde dem Aufrufer das
+    // Gegenteil erzählen — der Nutzer bekäme eine Fehlermeldung für eine
+    // Änderung, die in Wahrheit gespeichert ist. Also nur protokollieren.
+    // (Auf Dateisystemen ohne Verzeichnis-`fsync` — etwa manchen
+    // Netzwerkdateisystemen — ist ein `EINVAL` hier normal.)
+    if let Err(e) = sync_directory(parent) {
+        tracing::warn!(
+            directory = %parent.display(),
+            error = %e,
+            "config written, but syncing its directory failed; \
+             the rename may be lost if the system crashes now"
+        );
+    }
+
     Ok(())
 }
 
-/// Der Rechte-Modus einer bestehenden Datei, sofern lesbar. `None` bedeutet
-/// „keine Vorlage" — der Aufrufer bleibt dann bei 0600, dem engeren Wert.
+/// `fsync` auf ein Verzeichnis. Zum Öffnen genügt Lesezugriff — geschrieben wird
+/// nicht in das Verzeichnis, es wird nur seine bereits erfolgte Änderung
+/// festgeschrieben.
+fn sync_directory(dir: &Path) -> std::io::Result<()> {
+    std::fs::File::open(dir)?.sync_all()
+}
+
+/// Der Rechte-Modus einer bestehenden **regulären** Datei, sofern lesbar.
+/// `None` bedeutet „keine Vorlage" — der Aufrufer bleibt dann bei 0600, dem
+/// engeren Wert.
+///
+/// Bewusst `symlink_metadata`, nicht `metadata`: `metadata` folgt dem Link und
+/// hätte die Rechtebits des **Link-Ziels** als Vorlage genommen. Damit liess
+/// sich der Riegel von [`write_config_atomically`] aushebeln — wer in `data/cfg`
+/// schreiben darf, legt dort einen Symlink auf eine 0666-Datei, und die neu
+/// entstandene, reguläre `rclone.conf` mit allen Zugangsdaten wäre weltlesbar
+/// gewesen. Genau das ist gemessen worden.
+///
+/// Ein Symlink hat eigene Modusbits (üblicherweise 0777), die als Vorlage
+/// sinnlos sind; alles, was keine reguläre Datei ist, liefert deshalb `None`
+/// und fällt auf 0600 zurück.
 fn existing_file_mode(path: &Path) -> Option<u32> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::metadata(path)
+        std::fs::symlink_metadata(path)
             .ok()
+            .filter(|meta| meta.file_type().is_file())
             .map(|meta| meta.permissions().mode() & 0o7777)
     }
     #[cfg(not(unix))]
@@ -1083,6 +1398,322 @@ region = eu-central
         assert!(remove_key_from_contents(SAMPLE_CONF, "unbekannt", "pass").is_none());
     }
 
+    // -----------------------------------------------------------------------
+    // Nutzergebundene Auflösung des Konfigurationspfads (Ticket bc7277d3)
+    // -----------------------------------------------------------------------
+
+    /// Der `const` und die Funktion müssen dasselbe bezeichnen. Läuft das
+    /// auseinander, prüft die App gegen eine andere Datei, als rclone per
+    /// `--config` liest — und genau das war `5d31b2f7`.
+    #[test]
+    fn shared_path_matches_the_constant() {
+        assert_eq!(shared_config_path(), Path::new(RCLONE_CONFIG_PATH));
+    }
+
+    #[test]
+    fn a_users_config_lives_under_its_own_directory() {
+        let id = "3f2a1b4c-0000-4000-8000-abcdefabcdef";
+        assert_eq!(
+            config_path_for(id).unwrap(),
+            Path::new("data/cfg/users").join(id).join("rclone.conf")
+        );
+        // Die gemeinsame Datei bleibt daneben stehen, nicht darunter.
+        assert!(!config_path_for(id)
+            .unwrap()
+            .starts_with(shared_config_path()));
+    }
+
+    /// Die Kennung wird ein Verzeichnisname. Sie kommt aus der Datenbank, und
+    /// eine von Hand bearbeitete `users`-Tabelle ist ein Pfad, den sonst
+    /// niemand prüft.
+    #[test]
+    fn a_user_id_that_is_not_one_path_segment_is_rejected() {
+        for id in [
+            "",
+            ".",
+            "..",
+            "../..",
+            "../../etc",
+            "/etc",
+            "a/b",
+            "a\\b",
+            "a b",
+            "a.b",
+            "a_b",
+            ".hidden",
+            "a\0b",
+            "üser",
+            "a\nb",
+        ] {
+            assert!(
+                config_path_for(id).is_err(),
+                "{:?} haette abgelehnt werden muessen",
+                id
+            );
+        }
+        assert!(config_path_for(&"a".repeat(MAX_USER_ID_LEN + 1)).is_err());
+        // Gegenprobe: die tatsächlich vorkommende Form geht durch.
+        assert!(config_path_for(&uuid::Uuid::new_v4().to_string()).is_ok());
+        assert!(config_path_for(&"a".repeat(MAX_USER_ID_LEN)).is_ok());
+    }
+
+    #[test]
+    fn creating_a_user_config_uses_0700_and_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = scratch_dir("usercfg");
+        let id = "11111111-2222-4333-8444-555555555555";
+
+        let path = ensure_user_config_in(&base, id).unwrap();
+        assert_eq!(path, config_path_in(&base, id).unwrap());
+
+        let dir_mode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let file_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "Verzeichnis muss 0700 sein");
+        assert_eq!(file_mode, 0o600, "Datei muss 0600 sein");
+        // Auch das Zwischenverzeichnis `users/` listet Nutzerkennungen auf.
+        let parents_mode = std::fs::metadata(base.join("users"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(parents_mode, 0o700);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+
+        // Idempotent, und die Rechte einer bestehenden Datei bleiben stehen.
+        std::fs::write(&path, SAMPLE_CONF).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        ensure_user_config_in(&base, id).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), SAMPLE_CONF);
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640,
+            "ein zweiter Aufruf darf bestehende Rechte nicht ueberschreiben"
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn removing_a_user_config_takes_the_whole_directory() {
+        let base = scratch_dir("usercfg-del");
+        let id = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+
+        let path = ensure_user_config_in(&base, id).unwrap();
+        std::fs::write(&path, SAMPLE_CONF).unwrap();
+
+        remove_user_config_in(&base, id).unwrap();
+        assert!(!path.exists());
+        assert!(!path.parent().unwrap().exists());
+        // Ein zweiter Aufruf ist kein Fehler …
+        remove_user_config_in(&base, id).unwrap();
+        // … eine unbrauchbare Kennung schon, statt irgendetwas zu loeschen.
+        assert!(remove_user_config_in(&base, "../..").is_err());
+        assert!(base.exists(), "die Wurzel darf nicht mitgeloescht werden");
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Der Kern der Isolation, und der Grund fuer die Gegenprobe: ein Remote,
+    /// das nur in der Konfiguration eines **anderen** Nutzers steht, ist
+    /// unbekannt. Ohne die Gegenprobe (dasselbe Remote in der **eigenen**
+    /// Konfiguration wird angenommen) beweist ein "abgelehnt" nichts — es
+    /// koennte auch heissen, dass die Pruefung immer ablehnt.
+    #[tokio::test]
+    async fn a_remote_of_another_user_is_unknown() {
+        let base = scratch_dir("isolation");
+        let alice = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        let bob = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+
+        let alice_conf = ensure_user_config_in(&base, alice).unwrap();
+        let bob_conf = ensure_user_config_in(&base, bob).unwrap();
+
+        // Nur Bob hat `bobbox`.
+        std::fs::write(&bob_conf, "[bobbox]\ntype = webdav\n").unwrap();
+
+        // Gegenprobe zuerst: bei Bob wird der Name angenommen. Erst damit ist
+        // das folgende "abgelehnt" eine Aussage.
+        assert!(
+            ensure_configured_remote_at(&bob_conf, "bobbox")
+                .await
+                .is_ok(),
+            "Gegenprobe: der Eigentuemer muss sein Remote benutzen duerfen"
+        );
+
+        // Und bei Alice nicht — ununterscheidbar von einem erfundenen Namen.
+        let err = ensure_configured_remote_at(&alice_conf, "bobbox")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "Unknown remote");
+        assert_eq!(
+            ensure_configured_remote_at(&alice_conf, "erfunden")
+                .await
+                .unwrap_err()
+                .to_string(),
+            err,
+            "die Meldung darf nicht verraten, dass der Name woanders existiert"
+        );
+
+        // Sobald Alice ihr eigenes Remote hat, geht es — auch das eine
+        // Gegenprobe: die Ablehnung kam vom Geltungsbereich, nicht vom Namen.
+        std::fs::write(&alice_conf, "[bobbox]\ntype = local\n").unwrap();
+        assert!(ensure_configured_remote_at(&alice_conf, "bobbox")
+            .await
+            .is_ok());
+
+        // Die syntaktische Pruefung bleibt vorgeschaltet: `:local:` kommt in
+        // keinem Geltungsbereich durch, auch nicht in der eigenen.
+        assert!(ensure_configured_remote_at(&alice_conf, ":local:")
+            .await
+            .is_err());
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Eine Konfiguration, die es nicht gibt, kennt kein Remote — und sagt das
+    /// als Lesefehler, nicht als "unknown". Die Unterscheidung ist der Grund,
+    /// warum `ensure_user_config` die leere Datei anlegt.
+    #[tokio::test]
+    async fn a_missing_config_rejects_every_remote() {
+        let base = scratch_dir("isolation-missing");
+        let path = base.join("gibtsnicht").join("rclone.conf");
+        let err = ensure_configured_remote_at(&path, "irgendwas")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not readable"), "{err}");
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Festgeschriebene Entscheidung, nicht nur beobachtetes Verhalten: ein
+    /// Symlink an der Stelle der `rclone.conf` wird **ersetzt**, das
+    /// ursprüngliche Ziel bleibt unverändert. Die Begründung steht an
+    /// `write_config_atomically`. Schlägt dieser Test eines Tages um, hat jemand
+    /// angefangen, Symlinks zu folgen — und das ist genau der Weg, auf dem die
+    /// Zugangsdaten an einen fremden Ort geraten.
+    #[test]
+    fn a_symlinked_config_is_replaced_and_its_target_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch_dir("symlink");
+        let target = dir.join("ausgelagert.conf");
+        let path = dir.join("rclone.conf");
+        std::fs::write(&target, SAMPLE_CONF).unwrap();
+        // Weit offenes Ziel: taugt es als Rechte-Vorlage, wird die neue Datei
+        // weltlesbar. Genau das darf nicht passieren.
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o666)).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        write_config_atomically(&path, "neue Fassung\n").unwrap();
+
+        // Am alten Ort steht jetzt eine reguläre Datei mit dem neuen Inhalt …
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(
+            !meta.file_type().is_symlink(),
+            "der Symlink muss durch eine reguläre Datei ersetzt sein"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "neue Fassung\n");
+        // … die **nicht** die Rechte des Link-Ziels geerbt hat. `metadata`
+        // statt `symlink_metadata` in `existing_file_mode` hätte hier 0666
+        // ergeben — die Zugangsdaten wären für jeden lesbar. Ohne lesbare
+        // Vorlage gilt 0600.
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o600,
+            "die ersetzte Datei darf die Rechte des Link-Ziels nicht übernehmen"
+        );
+        // … und das frühere Ziel ist unangetastet, auch in seinen Rechten.
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), SAMPLE_CONF);
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o666
+        );
+        // Keine Nebendatei übrig (Ziel + ersetzte Datei = 2).
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Kriterium 2 des Tickets — der Verzeichnis-`fsync` — war bisher nur durch
+    /// Codelesen belegt: ein Tester hat den Aufruf entfernt, und **kein** Test
+    /// fiel durch. Ein gelungenes `fsync` ist von aussen nicht beobachtbar, ein
+    /// **gescheitertes** aber schon: es wird protokolliert.
+    ///
+    /// Also wird es zum Scheitern gebracht. Das Zielverzeichnis bekommt `0300`
+    /// (schreiben und betreten, aber nicht lesen): Nebendatei anlegen und
+    /// `rename` gelingen weiterhin, das `File::open` des Verzeichnisses
+    /// scheitert mit `EACCES`. Steht die Warnung im Protokoll, ist der Aufruf
+    /// tatsächlich gelaufen; wird er entfernt, fällt dieser Test durch.
+    ///
+    /// Als root greifen die Rechtebits nicht — dann wird der Nachweis
+    /// übersprungen statt falsch bestanden.
+    #[test]
+    fn the_write_path_really_syncs_the_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch_dir("dirfsync");
+        let cfg = dir.join("cfg");
+        std::fs::create_dir_all(&cfg).unwrap();
+        let path = cfg.join("rclone.conf");
+        // Schreibbar und betretbar, aber nicht lesbar.
+        std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o300)).unwrap();
+
+        // Probe: verweigert das Öffnen des Verzeichnisses hier überhaupt
+        // jemandem den Dienst? Als root nicht.
+        let enforced = std::fs::File::open(&cfg).is_err();
+
+        if enforced {
+            let captured = dir.join("tracing.log");
+            let sink = captured.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(move || {
+                    std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&sink)
+                        .expect("die Auffangdatei")
+                })
+                .finish();
+
+            // `with_default` ist thread-lokal — im Gegensatz zu
+            // `set_global_default` verträgt es parallel laufende Tests.
+            let result = tracing::subscriber::with_default(subscriber, || {
+                write_config_atomically(&path, "neue Fassung\n")
+            });
+
+            // Der Schreibvorgang selbst gelingt: ein gescheitertes
+            // Verzeichnis-`fsync` ist kein Fehlschlag, die Datei liegt am Ziel.
+            result.expect("der Schreibvorgang gelingt trotz fehlgeschlagenem fsync");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "neue Fassung\n");
+
+            // Ohne Warnung entsteht die Auffangdatei nie — dann ist der Text
+            // leer, und die Zusicherung nennt den Grund statt eines
+            // rätselhaften `NotFound`.
+            let text = std::fs::read_to_string(&captured).unwrap_or_default();
+            assert!(
+                text.contains("syncing its directory failed"),
+                "ohne diese Warnung wurde `sync_directory` nie aufgerufen: {text}"
+            );
+        }
+
+        std::fs::set_permissions(&cfg, std::fs::Permissions::from_mode(0o700)).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Der Verzeichnis-`fsync` muss auf einem gewöhnlichen Verzeichnis
+    /// gelingen — sonst würde jeder Schreibvorgang eine Warnung erzeugen.
+    #[test]
+    fn syncing_a_directory_succeeds() {
+        let dir = scratch_dir("dirsync");
+        sync_directory(&dir).expect("fsync auf ein Verzeichnis muss gelingen");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn atomic_write_keeps_the_permissions_of_the_target() {
         use std::os::unix::fs::PermissionsExt;
@@ -1290,5 +1921,136 @@ region = eu-central
         // keine gültige Kodierung — es darf nichts Zufälliges herauskommen.
         assert!(manager.reveal_password("plaintext!").await.is_err());
         assert!(manager.reveal_password("AAAA").await.is_err());
+    }
+    /// `delete_from_file` schreibt jetzt ueber `write_config_atomically`.
+    /// Geprueft wird der ausgelagerte Kern `delete_section_atomically`, damit
+    /// der globale `RCLONE_CONFIG_PATH` aus dem Test bleibt.
+    ///
+    /// Der Erfolgsfall: der genannte Abschnitt ist weg, der andere vollstaendig
+    /// da. Verglichen wird die **Zeilenmenge**, nicht der Bytestrom — `Ini`
+    /// haelt die Schluessel in einer HashMap, die Reihenfolge ist nicht
+    /// zugesichert.
+    #[test]
+    fn deleting_a_section_removes_only_that_section() {
+        let dir = scratch_dir("del-atomic");
+        let path = dir.join("rclone.conf");
+        std::fs::write(&path, SAMPLE_CONF).unwrap();
+
+        delete_section_atomically(&path, "gdrive").unwrap();
+
+        let on_disk = std::fs::read_to_string(&path).unwrap();
+        assert!(!on_disk.contains("[gdrive]"));
+        assert!(on_disk.contains("[mybox]") || on_disk.contains("[MyBox]"));
+        assert!(on_disk.contains("https://example.org/dav"));
+        // Keine Nebendatei uebrig.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Der eigentliche Punkt des Tickets fuer den Loeschweg: schlaegt das
+    /// Schreiben fehl, liegt die **alte** Konfiguration vollstaendig da — nicht
+    /// eine abgeschnittene, in der dem Nutzer alle Remotes fehlen.
+    ///
+    /// Erzwungen ueber ein Verzeichnis auf `0500` (EACCES). Als root greift das
+    /// nicht — dann wird der Pruefteil uebersprungen statt falsch bestanden.
+    #[test]
+    fn a_failed_delete_leaves_the_old_configuration_complete() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = scratch_dir("del-fail");
+        let path = dir.join("rclone.conf");
+        std::fs::write(&path, SAMPLE_CONF).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        // Probe: darf hier ueberhaupt niemand mehr schreiben?
+        let probe = dir.join(".probe");
+        let writable = std::fs::File::create(&probe).is_ok();
+        std::fs::remove_file(&probe).ok();
+
+        if !writable {
+            let err = delete_section_atomically(&path, "gdrive").unwrap_err();
+            // Der genommene Zweig gehoert in die Ausgabe: der Test besteht in
+            // beiden Zweigen, nur die Ausgabe belegt, welcher lief.
+            eprintln!("delete_section_atomically Zweig: Err({err})");
+            assert!(err.to_string().contains("Failed to write config"));
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                SAMPLE_CONF,
+                "die alte Konfiguration muss vollstaendig zurueckbleiben"
+            );
+        }
+
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok();
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Derselbe Nachweis fuer den vierten Schreibweg, `persist_to_file`:
+    /// `render_configs_ini` erzeugt den Text, `write_config_atomically`
+    /// schreibt ihn. Der Inhalt waechst hier deutlich — auf einem winzigen
+    /// Dateisystem (`RCLONE_GUI_TEST_SCRATCH_DIR` auf ein 64k-tmpfs, siehe
+    /// `large_write_is_all_or_nothing`) scheitert das `write_all` mit ENOSPC.
+    #[test]
+    fn persisting_memory_configs_is_all_or_nothing() {
+        let dir = scratch_dir("persist");
+        let path = dir.join("rclone.conf");
+        std::fs::write(&path, SAMPLE_CONF).unwrap();
+
+        let mut configs = HashMap::new();
+        let mut additional_fields = HashMap::new();
+        for index in 0..64 {
+            additional_fields.insert(format!("field_{index}"), "v".repeat(1024));
+        }
+        configs.insert(
+            "neu".to_string(),
+            RcloneConfig {
+                name: "neu".to_string(),
+                config_type: "webdav-nextcloud".to_string(),
+                url: Some("https://example.org/dav".to_string()),
+                username: Some("frank".to_string()),
+                password: Some("OBSCURED_C".to_string()),
+                additional_fields,
+            },
+        );
+
+        let rendered = render_configs_ini(&configs);
+        assert!(
+            rendered.len() > SAMPLE_CONF.len(),
+            "der Testfall soll wachsenden Inhalt pruefen"
+        );
+        // Der WebDAV-Untertyp wird zu type + vendor aufgeloest.
+        assert!(rendered.contains("type=webdav") || rendered.contains("type = webdav"));
+        assert!(rendered.contains("nextcloud"));
+
+        match write_config_atomically(&path, &rendered) {
+            Ok(()) => {
+                eprintln!("persist_to_file Zweig: Ok(()) — Schreiben ging durch");
+                let on_disk = std::fs::read_to_string(&path).unwrap();
+                let written: std::collections::BTreeSet<&str> = on_disk
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                let expected: std::collections::BTreeSet<&str> = rendered
+                    .lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .collect();
+                assert_eq!(written, expected, "vollstaendige neue Fassung erwartet");
+            }
+            Err(err) => {
+                eprintln!("persist_to_file Zweig: Err({err})");
+                assert!(err.to_string().contains("Failed to write config"));
+                assert_eq!(
+                    std::fs::read_to_string(&path).unwrap(),
+                    SAMPLE_CONF,
+                    "die alte Konfiguration muss vollstaendig zurueckbleiben"
+                );
+            }
+        }
+        // In beiden Faellen: keine Nebendatei uebrig.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

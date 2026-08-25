@@ -1541,6 +1541,7 @@ dependencies = [
  "sqlx",
  "subtle",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "tower 0.4.13",
  "tower-http",
@@ -1548,6 +1549,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "walkdir",
+ "webpki-roots 0.26.11",
  "zip",
 ]
 
@@ -1650,6 +1652,7 @@ version = "0.23.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd3c25631629d034ce7cd9940adc9d45762d46de2b0f57193c4443b92c6d4d40"
 dependencies = [
+ "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
@@ -2217,6 +2220,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "tokio-rustls"
+version = "0.26.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
+dependencies = [
+ "rustls",
+ "tokio",
 ]
 
 [[package]]

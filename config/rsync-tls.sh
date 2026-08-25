@@ -210,6 +210,129 @@ tls_check_own_cert() {
     return 0
 }
 
+# Das Backend muss Loopback sein.
+#
+# stunnel terminiert TLS und reicht KLARTEXT weiter — das rsync-Protokoll mit
+# seiner md5-Challenge, ohne jede Verschlüsselung. Zeigt `connect` auf eine
+# andere Maschine, läuft genau der Teil, für den es TLS gibt, unverschlüsselt
+# über das Netz, und von aussen sieht die Verbindung trotzdem nach TLS aus.
+#
+# Deshalb wird hier abgebrochen und nicht gewarnt: eine Warnung im Startlog
+# hätte niemand gelesen, und der Zustand ist von aussen nicht erkennbar.
+# Gegenstück auf der Anwendungsseite: DAEMON_ADDRESS und
+# DaemonHandle::verify_it_listens_on_loopback_only in src/handlers/rsyncd.rs
+# (Ticket 4292d027). Beides zusammen heisst: es gibt keinen Klartextweg zum
+# Daemon, weder hinein noch heraus.
+#
+# # Warum das eine Positivpruefung ist und kein Muster (Ticket 7ec1f4db)
+#
+# Die erste Fassung fragte `case "$host" in 127.*|::1|localhost|...)`. Das Glob
+# `127.*` trifft nicht nur Adressen, sondern jeden **Namen**, der so anfaengt:
+#
+#     RCLONE_GUI_RSYNC_BACKEND=127.0.0.1.evil.com:873   ->   galt als Loopback
+#
+# Damit haette stunnel Klartext-rsync an einen fremden Rechner weitergereicht —
+# genau das, was der Riegel verhindern soll. Ein Angreifer braucht dafuer die
+# Umgebungsvariable, es ist also kein Fernangriff; ein Riegel, der bei einem
+# zurechtgelegten Namen aufgeht, ist trotzdem keiner.
+#
+# Deshalb wird jetzt **positiv** geprueft: entweder der Host ist einer von drei
+# ausgeschriebenen Namen, oder er ist eine Zahlenadresse, die Feld fuer Feld als
+# IPv4 in 127.0.0.0/8 zerlegbar ist. Alles andere wird abgewiesen, auch was
+# harmlos aussieht. Ein Muster kann die naechste Schreibweise nicht kennen, eine
+# Formatpruefung braucht sie nicht zu kennen.
+#
+# Die Wertetabelle steht in `every_backend_form_is_judged_by_the_tls_script`
+# (src/handlers/rsyncd.rs) und laeuft mit `cargo test` mit. `bash -n` prueft nur
+# die Syntax und haette diesen Fehler nie gefunden.
+# Hilfsfunktion: der Rest hinter dem Host darf nichts sein oder `:<ziffern>`.
+# Ein Glob `:[0-9]*` genuegt dafuer nicht — es liesse `:873:9999` durch.
+tls_port_suffix_ok() {
+    case "$1" in
+        "") return 0 ;;
+        :*) case "${1#:}" in ""|*[!0-9]*) return 1 ;; *) return 0 ;; esac ;;
+        *) return 1 ;;
+    esac
+}
+
+tls_backend_is_loopback() {
+    local backend="$1" host
+
+    # Aussen liegende Leerzeichen abschneiden — ein Wert aus einer .env-Datei
+    # oder einem docker-compose-Block traegt sie leicht mit sich.
+    backend="${backend#"${backend%%[![:space:]]*}"}"
+    backend="${backend%"${backend##*[![:space:]]}"}"
+
+    # Leer ist kein Loopback. Ohne diesen Zweig kaeme unten der leere Host
+    # heraus, und der wuerde durch keine der Pruefungen fallen — aber ein leeres
+    # `connect` in der stunnel-Konfiguration ist ein Startfehler, kein Loopback.
+    [ -n "$backend" ] || return 1
+
+    # Innen liegende Leerzeichen: ein solcher Wert ist entweder ein Tippfehler
+    # oder ein Versuch, die Zerlegung zu verwirren. In beiden Faellen wird er
+    # unverandert in `connect = …` gerendert und ist dort ohnehin falsch.
+    case "$backend" in
+        *[[:space:]]*) return 1 ;;
+    esac
+
+    # Host und Port trennen. Drei Formen kommen vor:
+    case "$backend" in
+        # [::1]:874 und [::1] — IPv6 in eckigen Klammern, Port optional.
+        \[*\]*)
+            host="${backend#[}"
+            host="${host%%]*}"
+            # Nach der schliessenden Klammer darf nur nichts oder :<port> stehen.
+            tls_port_suffix_ok "${backend#*]}" || return 1
+            ;;
+        # Mehr als ein Doppelpunkt und keine Klammern: eine nackte
+        # IPv6-Adresse. `::1:873` ist nicht entscheidbar — Adresse mit Port oder
+        # Adresse ohne? — also gilt der ganze Wert als Adresse. Wer einen Port
+        # angeben will, nimmt die Klammerform, so wie es die Vorlage tut.
+        *:*:*)
+            host="$backend"
+            ;;
+        # Alles andere: host oder host:port.
+        *)
+            host="${backend%%:*}"
+            tls_port_suffix_ok "${backend#"$host"}" || return 1
+            ;;
+    esac
+
+    # Ein leerer Host, ein fuehrender oder abschliessender Punkt und eine
+    # doppelte Punktfolge sind in keiner der zulaessigen Formen gueltig. Ohne den
+    # Zweig waere `127.0.0.1.` eine Loopback-Adresse, weil `read` das leere Feld
+    # hinter dem letzten Punkt einfach nach `extra` schreibt.
+    case "$host" in
+        ""|.*|*.|*..*) return 1 ;;
+    esac
+
+    # 1. Die ausgeschriebenen Namen, exakt. `localhost.localdomain` steht mit
+    #    drin, weil manche Basisbilder es als kanonischen Namen von 127.0.0.1
+    #    fuehren; es ist ein Name aus /etc/hosts, kein aufloesbarer Fremdname.
+    case "$host" in
+        localhost|localhost.localdomain) return 0 ;;
+        ::1|0:0:0:0:0:0:0:1) return 0 ;;
+    esac
+
+    # 2. Eine IPv4-Zahlenadresse in 127.0.0.0/8. Zerlegt, nicht geglobbt: vier
+    #    Felder, jedes nur Ziffern und hoechstens dreistellig, jedes <= 255, das
+    #    erste genau 127. `127.0.0.1.evil.com` hat fuenf Felder und faellt schon
+    #    an der Zahl heraus; `127.0.0.1x` faellt an der Ziffernpruefung heraus.
+    local a b c d extra
+    IFS=. read -r a b c d extra <<<"$host"
+    [ -z "$extra" ] || return 1
+    local field
+    for field in "$a" "$b" "$c" "$d"; do
+        case "$field" in
+            ""|*[!0-9]*) return 1 ;;
+        esac
+        [ "${#field}" -le 3 ] || return 1
+        [ "$field" -le 255 ] || return 1
+    done
+    [ "$a" -eq 127 ] || return 1
+    return 0
+}
+
 # ---------------------------------------------------------------------------
 # Einstieg
 # ---------------------------------------------------------------------------
@@ -230,6 +353,17 @@ rsync_tls_start() {
     if [ ! -r "$STUNNEL_TEMPLATE" ]; then
         echo "⚠️  stunnel-Vorlage nicht gefunden: ${STUNNEL_TEMPLATE}" >&2
         return 0
+    fi
+
+    # TLS ist Pflicht, nicht Vorgabe: hinter stunnel liegt Klartext, also darf
+    # das Backend den Rechner nicht verlassen. Siehe tls_backend_is_loopback.
+    if ! tls_backend_is_loopback "$RCLONE_GUI_RSYNC_BACKEND"; then
+        echo "❌ RCLONE_GUI_RSYNC_BACKEND=${RCLONE_GUI_RSYNC_BACKEND} ist keine" >&2
+        echo "   Loopback-Adresse. stunnel reicht hinter der TLS-Terminierung" >&2
+        echo "   KLARTEXT weiter — das rsync-Protokoll ginge damit unverschlüsselt" >&2
+        echo "   über das Netz, während die Verbindung von aussen nach TLS aussieht." >&2
+        echo "   Kein Start. Einen unverschlüsselten Peer-Weg gibt es nicht." >&2
+        return 1
     fi
 
     mkdir -p "$TLS_DIR" 2>/dev/null

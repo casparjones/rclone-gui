@@ -3,7 +3,7 @@ use axum::{
     http::{header, HeaderValue, Method},
     middleware::{self, Next},
     response::Html,
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
     Extension, Router,
 };
 use chrono;
@@ -31,12 +31,21 @@ struct Args {
         help = "Use in-memory configuration (changes not saved to file until explicitly saved)"
     )]
     memory_mode: bool,
+    /// Address the server listens on.
+    ///
+    /// Deliberately an `Option` without a clap `default_value`: only that way
+    /// can "the user passed `--bind`" be told apart from "nobody said
+    /// anything", and the precedence
+    /// `--bind` > `RCLONE_GUI_BIND` > [`BIND_DEFAULT`] needs exactly that
+    /// distinction. clap's own `env =` would do the same, but that lives behind
+    /// the `env` feature which this crate does not enable — and `Cargo.toml`
+    /// belongs to another ticket. Resolved by [`resolve_bind_address`]; the
+    /// default is named in the help text so `--help` stays truthful.
     #[arg(
         long,
-        default_value = "127.0.0.1:8080",
-        help = "Address to bind the server to"
+        help = "Address to bind the server to (default: 127.0.0.1:8080, env: RCLONE_GUI_BIND)"
     )]
-    bind: String,
+    bind: Option<String>,
     #[arg(long, help = "Start a task by name and exit")]
     start_task: Option<String>,
     #[arg(
@@ -57,6 +66,43 @@ struct Args {
     reset_password: Option<String>,
 }
 
+/// Environment variable holding the listen address, e.g. `0.0.0.0:9000`.
+const BIND_ENV: &str = "RCLONE_GUI_BIND";
+
+/// Listen address when neither `--bind` nor [`BIND_ENV`] says anything.
+///
+/// Loopback on purpose: an unconfigured start must not expose the interface to
+/// the network. The container overrides it via `CMD --bind 0.0.0.0:8080`.
+const BIND_DEFAULT: &str = "127.0.0.1:8080";
+
+/// Resolve the listen address and say where it came from.
+///
+/// Precedence is `--bind` > [`BIND_ENV`] > [`BIND_DEFAULT`]. **The command
+/// line argument wins**, and that is not a detail: every agent working on this
+/// project binds its test server to its own loopback address via `--bind`,
+/// because session cookies are not separated by port. An environment variable
+/// that could override `--bind` — from a `.env` in the working directory, no
+/// less — would silently drag those servers onto one address and make parallel
+/// runs overwrite each other's sessions.
+///
+/// An empty or whitespace-only variable counts as unset. `RCLONE_GUI_BIND=`
+/// in a `.env` is how one comments a setting out; treating it as an address
+/// would only produce a parse error further down.
+///
+/// The returned second element is the source, for the startup line. Before
+/// this existed, the variable was *printed* but never read, so the startup
+/// output confirmed a bind address the server did not use.
+fn resolve_bind_address(arg: Option<&str>) -> (String, &'static str) {
+    if let Some(addr) = arg {
+        return (addr.to_string(), "from --bind");
+    }
+
+    match env::var(BIND_ENV) {
+        Ok(addr) if !addr.trim().is_empty() => (addr.trim().to_string(), "from RCLONE_GUI_BIND"),
+        _ => (BIND_DEFAULT.to_string(), "default"),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     // Load environment variables with detailed feedback
@@ -69,9 +115,14 @@ async fn main() {
     setup_tracing();
     let args = Args::parse();
 
+    // Muss nach `load_environment_config()` stehen: `.env`/`.env.local` sind
+    // erst dort in der Prozessumgebung, und `RCLONE_GUI_BIND` darf von dort
+    // kommen wie jede andere Variable der Anwendung.
+    let (bind, bind_source) = resolve_bind_address(args.bind.as_deref());
+
     println!("⚙️  Command line arguments:");
     println!("   Memory mode: {}", args.memory_mode);
-    println!("   Bind address: {}", args.bind);
+    println!("   Bind address: {} ({})", bind, bind_source);
     if let Some(ref task_name) = args.start_task {
         println!("   Start task: {}", task_name);
     }
@@ -103,7 +154,7 @@ async fn main() {
     // whole point. What comes back is printed and then dropped — the token
     // exists in this process's memory and nowhere else in plaintext.
     if let Some(username) = args.reset_password {
-        return handle_cli_password_reset(db_pool, &username, &args.bind).await;
+        return handle_cli_password_reset(db_pool, &username, &bind).await;
     }
 
     // Jobs, die einen Neustart nicht überlebt haben, in einen Endzustand
@@ -181,9 +232,9 @@ async fn main() {
     println!("   GET    /api/preview/video             -> preview_video");
     println!("   POST   /api/sync                      -> start_sync");
     println!("   GET    /api/sync                      -> list_sync_jobs");
-    println!("   GET    /api/sync-log/:job_id          -> get_sync_log (temp route)");
+    println!("   GET    /api/sync-log/:job_id          -> get_sync_log_for (temp route)");
     println!("   DELETE /api/sync-delete/:job_id       -> delete_sync_job (temp route)");
-    println!("   GET    /api/sync/:job_id/log          -> get_sync_log");
+    println!("   GET    /api/sync/:job_id/log          -> get_sync_log_for");
     println!("   GET    /api/sync/:job_id              -> get_sync_progress");
     println!("   DELETE /api/sync/:job_id              -> delete_sync_job");
     println!("   GET    /api/tasks                     -> get_tasks");
@@ -191,6 +242,12 @@ async fn main() {
     println!("   DELETE /api/tasks/:task_id            -> delete_task");
     println!("   POST   /api/tasks/start               -> start_task");
     println!("   GET    /api/rsyncd/status             -> rsyncd_status");
+    println!("   GET    /api/users                     -> list_users            [admin]");
+    println!("   POST   /api/users                     -> create_user           [admin]");
+    println!("   GET    /api/users/:id                 -> get_user              [admin]");
+    println!("   PATCH  /api/users/:id                 -> update_user           [admin]");
+    println!("   DELETE /api/users/:id?data=keep|delete -> delete_user          [admin]");
+    println!("   POST   /api/users/me/password          -> change_own_password");
     println!("   GET    /login                         -> login_page            [public]");
     println!("   POST   /login                         -> login_form_submit     [public]");
     println!("   POST   /api/auth/login                -> login_json_submit     [public]");
@@ -251,7 +308,18 @@ async fn main() {
         .route("/api/preview/image", get(handlers::preview::preview_image))
         .route("/api/preview/video", get(handlers::preview::preview_video))
         .route("/api/sync", post(handlers::sync::start_sync))
-        .route("/api/sync", get(handlers::sync::list_sync_jobs))
+        .route("/api/sync", get(list_jobs_handler))
+        // „Von URL holen": der Server holt eine vom Nutzer angegebene URL ab.
+        // Der Abruf läuft als Job und erscheint deshalb in derselben Liste
+        // wie ein Sync (siehe `list_jobs_handler`).
+        .route(
+            "/api/download-url",
+            post(handlers::downloader::start_url_fetch),
+        )
+        .route(
+            "/api/download-url/:job_id/cancel",
+            post(cancel_url_fetch_handler),
+        )
         .route("/api/sync-log/:job_id", get(get_sync_log_handler))
         .route("/api/sync-delete/:job_id", delete(delete_sync_job_handler))
         .route("/api/sync/:job_id/log", get(get_sync_log_handler))
@@ -262,6 +330,24 @@ async fn main() {
         .route("/api/tasks/:task_id", delete(handlers::tasks::delete_task))
         .route("/api/tasks/start", post(handlers::tasks::start_task))
         .route("/api/rsyncd/status", get(rsyncd_status_handler))
+        // Benutzerverwaltung. Die Rollenprüfung steht **im Handler**
+        // (`handlers::users::require_admin`) und nicht hier: eine Route sieht
+        // man beim Lesen des Routers, eine fehlende Prüfung im Handler nicht —
+        // und die Prüfung muss vor dem ersten Datenbankzugriff liegen, damit
+        // ein Nicht-Admin einem vorhandenen Konto nichts ansehen kann. Der
+        // Sitzungswächter weiter unten deckt diese Routen ohnehin mit ab.
+        .route("/api/users", get(handlers::users::list_users))
+        .route("/api/users", post(handlers::users::create_user))
+        // Vor `/api/users/:id`, obwohl axum die vier Segmente ohnehin
+        // unterscheidet — die Reihenfolge macht beim Lesen klar, dass `me`
+        // kein Konto-Bezeichner ist.
+        .route(
+            "/api/users/me/password",
+            post(handlers::users::change_own_password),
+        )
+        .route("/api/users/:id", get(handlers::users::get_user))
+        .route("/api/users/:id", patch(handlers::users::update_user))
+        .route("/api/users/:id", delete(handlers::users::delete_user))
         .nest_service("/static", ServeDir::new("static"))
         .merge(auth_routes)
         // ------------------------------------------------------------------
@@ -338,7 +424,17 @@ async fn main() {
         None => app,
     };
 
-    let addr: SocketAddr = args.bind.parse().expect("Invalid bind address");
+    // Kein `expect()` mehr: seit `RCLONE_GUI_BIND` wirkt, kann der Wert aus
+    // einer `.env` stammen, und ein Tippfehler dort soll eine Meldung ergeben,
+    // die die Quelle nennt — nicht einen Panik-Backtrace.
+    let addr: SocketAddr = match bind.parse() {
+        Ok(addr) => addr,
+        Err(e) => {
+            eprintln!("❌ Invalid bind address '{}' ({}): {}", bind, bind_source, e);
+            eprintln!("   Expected something like 127.0.0.1:8080 or [::1]:8080");
+            std::process::exit(1);
+        }
+    };
 
     println!("🌐 Starting server...");
     println!("   📍 Binding to: {}", addr);
@@ -439,21 +535,76 @@ async fn delete_config_handler(
     handlers::config::delete_config(Extension(config_manager), name).await
 }
 
+// ---------------------------------------------------------------------------
+// Job-Wege: Sync und URL-Abruf in einer Liste
+//
+// Der URL-Abruf ist ein regulärer Job, führt seine Einträge aber in
+// `handlers::downloader` — die Tabelle des Syncs (`SYNC_JOBS`) ist modulprivat,
+// und `sync.rs` gehört in diesem Ticket einem anderen Ticket. Für den Client
+// ist das unsichtbar: die Liste wird hier zusammengeführt, und Fortschritt und
+// Löschen fallen auf den Downloader zurück, wenn der Sync die ID nicht kennt.
+// Der Log-Weg braucht keine Verzweigung — beide schreiben nach
+// `data/log/<job_id>.log`.
+// ---------------------------------------------------------------------------
+
+/// `GET /api/sync` — Sync-Jobs **und** URL-Abrufe.
+///
+/// Sortiert nach Startzeit, neueste zuerst. Die Sync-Liste allein war nach
+/// Job-ID sortiert; das ist bei UUIDs eine willkürliche Reihenfolge und taugt
+/// nicht als gemeinsame Ordnung für zwei Quellen.
+async fn list_jobs_handler() -> axum::response::Json<models::ApiResponse<Vec<models::SyncProgress>>>
+{
+    let mut response = handlers::sync::list_sync_jobs().await.0;
+    let mut fetches = handlers::downloader::job_list();
+    if let Some(list) = response.data.as_mut() {
+        list.append(&mut fetches);
+        list.sort_by(|a, b| b.start_time.cmp(&a.start_time).then(b.id.cmp(&a.id)));
+    }
+    axum::response::Json(response)
+}
+
+async fn cancel_url_fetch_handler(
+    Path(job_id): Path<String>,
+) -> axum::response::Json<models::ApiResponse<String>> {
+    handlers::downloader::cancel_job(job_id).await
+}
+
 async fn get_sync_progress_handler(
     Path(job_id): Path<String>,
 ) -> axum::response::Json<models::ApiResponse<models::SyncProgress>> {
+    if let Some(progress) = handlers::downloader::job_progress(&job_id) {
+        return axum::response::Json(models::ApiResponse::success(progress));
+    }
     handlers::sync::get_sync_progress(job_id).await
 }
 
+/// `GET /api/sync/:job_id/log` — das Log eines Jobs, **mit** Besitzprüfung.
+///
+/// Der angemeldete Nutzer kommt aus `Extension<CurrentUser>`, das die
+/// Sitzungsprüfung in die Request-Extensions gelegt hat — dasselbe Muster wie
+/// `start_sync`. `get_sync_log_for` prüft fail closed: ein Job ohne bekannten
+/// Eigentümer ist so unlesbar wie der eines fremden Kontos, und beide Fälle
+/// antworten byte-gleich, damit der Endpunkt keine fremden Job-IDs bestätigt.
+///
+/// **Folge für den URL-Abruf:** dessen Jobs liegen in
+/// `handlers::downloader::JOBS`, das keinen Eigentümer mitführt, und ihre Logs
+/// werden dadurch für *jeden* unlesbar. Das ist die richtige Richtung — bisher
+/// waren sie für jedes angemeldete Konto lesbar —, aber es ist ein
+/// Funktionsverlust, der eine Eigentümerspalte im Downloader braucht. Beides
+/// liegt in fremden Dateien und ist im Bericht vermerkt.
 async fn get_sync_log_handler(
+    Extension(current): Extension<handlers::auth_web::CurrentUser>,
     Path(job_id): Path<String>,
 ) -> axum::response::Json<models::ApiResponse<String>> {
-    handlers::sync::get_sync_log(job_id).await
+    handlers::sync::get_sync_log_for(&current, job_id).await
 }
 
 async fn delete_sync_job_handler(
     Path(job_id): Path<String>,
 ) -> axum::response::Json<models::ApiResponse<String>> {
+    if let Some(response) = handlers::downloader::delete_job(&job_id).await {
+        return axum::response::Json(response);
+    }
     handlers::sync::delete_sync_job(job_id).await
 }
 
@@ -1044,10 +1195,6 @@ fn load_environment_config() {
         println!("   🐛 Log level: {}", rust_log);
     }
 
-    if let Ok(bind_addr) = env::var("RCLONE_GUI_BIND") {
-        println!("   🌐 Custom bind address: {}", bind_addr);
-    }
-
     println!("");
 }
 
@@ -1485,6 +1632,27 @@ async fn handle_cli_task_execution(
                     println!("✅ Task '{}' completed successfully!", task_name);
                     break;
                 }
+                // Teilerfolg ist ein eigener Ausgang, kein Fehlschlag.
+                //
+                // Ein Skript, das `--start-task` aufruft, muss „ein Teil der
+                // Daten ist angekommen" von „nichts ist angekommen"
+                // unterscheiden können; mit einem gemeinsamen Exit 1 kann es
+                // das nicht. Deshalb **4**: nicht 0 (kein Erfolg), nicht 1
+                // (Fehlschlag), nicht 2 (Aufruffehler). Die Meldung geht auf
+                // **stdout** — es ist kein Fehler, sondern ein Ergebnis.
+                //
+                // Der rsync-Code selbst (23 oder 24) wird bewusst **nicht**
+                // durchgereicht: `JobStatus::Partial` fasst beide zusammen, und
+                // ein durchgereichter Code würde behaupten, ein Skript könne
+                // sie unterscheiden. Der Grund steht im Klartext in der
+                // Meldung und ausführlich im Job-Log.
+                if progress.status.is_partial() {
+                    println!(
+                        "◑ Task '{}' finished partially: {}",
+                        task_name, progress.status
+                    );
+                    std::process::exit(4);
+                }
                 eprintln!("❌ Task '{}' failed: {}", task_name, progress.status);
                 std::process::exit(1);
             }
@@ -1607,5 +1775,74 @@ mod reset_logging_tests {
         // A parameter that merely ends in "token" is a different parameter.
         let other: axum::http::Uri = "/x?next_token=abc".parse().unwrap();
         assert_eq!(log_safe_uri(&other), "/x?next_token=abc");
+    }
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use super::*;
+
+    /// Everything in one test on purpose: `RCLONE_GUI_BIND` is process-wide
+    /// state, and cargo runs tests of a module on several threads. Two tests
+    /// setting and clearing the same variable would flake against each other.
+    #[test]
+    fn bind_precedence_is_argument_then_variable_then_default() {
+        // No variable, no argument: the loopback default.
+        env::remove_var(BIND_ENV);
+        assert_eq!(
+            resolve_bind_address(None),
+            (BIND_DEFAULT.to_string(), "default")
+        );
+
+        // Variable alone: it takes effect. This is the whole point of the
+        // ticket — it used to be printed and ignored.
+        env::set_var(BIND_ENV, "0.0.0.0:9000");
+        assert_eq!(
+            resolve_bind_address(None),
+            ("0.0.0.0:9000".to_string(), "from RCLONE_GUI_BIND")
+        );
+
+        // Argument against variable: **the argument wins.** If this ever flips,
+        // every agent's `--bind 127.0.1.<n>:<port>` test server silently moves
+        // to whatever a stray `.env` says, and parallel runs start overwriting
+        // each other's session cookies.
+        assert_eq!(
+            resolve_bind_address(Some("127.0.1.9:8099")),
+            ("127.0.1.9:8099".to_string(), "from --bind")
+        );
+
+        // An empty or blank variable is "unset", the way one comments a line
+        // out in a `.env`. It must not become a parse error further down.
+        env::set_var(BIND_ENV, "");
+        assert_eq!(
+            resolve_bind_address(None),
+            (BIND_DEFAULT.to_string(), "default")
+        );
+        env::set_var(BIND_ENV, "   ");
+        assert_eq!(
+            resolve_bind_address(None),
+            (BIND_DEFAULT.to_string(), "default")
+        );
+
+        // Surrounding whitespace is trimmed, not passed to the parser.
+        env::set_var(BIND_ENV, "  127.0.0.1:8081\n");
+        assert_eq!(
+            resolve_bind_address(None),
+            ("127.0.0.1:8081".to_string(), "from RCLONE_GUI_BIND")
+        );
+
+        env::remove_var(BIND_ENV);
+    }
+
+    /// The default must not be reachable from outside the machine. A typo that
+    /// turns it into `0.0.0.0` would expose an unconfigured start to the
+    /// network, and nothing else in the code would complain.
+    #[test]
+    fn the_default_is_loopback_only() {
+        let addr: SocketAddr = BIND_DEFAULT.parse().expect("default must parse");
+        assert!(
+            addr.ip().is_loopback(),
+            "default bind address {BIND_DEFAULT} is not loopback"
+        );
     }
 }

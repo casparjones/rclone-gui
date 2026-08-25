@@ -151,8 +151,43 @@ pub async fn require_session(
 
     match auth::authenticate_session(&state.pool, &token).await {
         Ok(Some((session, user))) => {
+            // Sliding expiration. Done *before* the handler runs, so
+            // `/api/auth/me` reports the deadline this request produced and not
+            // the one it replaced.
+            let refresh = auth::refresh_session(
+                &state.pool,
+                &state.config,
+                &token,
+                &session,
+                chrono::Utc::now(),
+            )
+            .await;
+
+            let (session, refreshed_cookie) = match refresh {
+                Ok(auth::SessionRefresh::Unchanged) => (session, None),
+                Ok(auth::SessionRefresh::Renewed {
+                    session: renewed,
+                    set_cookie,
+                }) => (renewed, set_cookie),
+                Ok(auth::SessionRefresh::Expired) => {
+                    return reject(&state, &path, req.uri(), true);
+                }
+                Err(e) => {
+                    // A failed renewal is not a failed request: the session is
+                    // valid, it just keeps the deadline it already had.
+                    tracing::warn!("session renewal failed: {e}");
+                    (session, None)
+                }
+            };
+
             req.extensions_mut().insert(CurrentUser { user, session });
-            next.run(req).await
+            let mut response = next.run(req).await;
+            if let Some(cookie) = refreshed_cookie {
+                if let Ok(value) = cookie.parse() {
+                    response.headers_mut().append(header::SET_COOKIE, value);
+                }
+            }
+            response
         }
         // Expired, unknown or belonging to a disabled account. The cookie is
         // cleared on the way out so the browser stops sending a token that will
@@ -342,7 +377,12 @@ pub struct UserInfo {
     pub username: String,
     pub role: String,
     pub home_path: String,
+    /// The **idle** deadline: moves forward while the user is active.
     pub session_expires_at: chrono::DateTime<chrono::Utc>,
+    /// The **absolute** deadline: never moves. Beyond it no amount of activity
+    /// keeps the session alive, so a countdown in the UI has to show the
+    /// earlier of the two.
+    pub session_absolute_expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// `POST /login` — the browser form. Answers with a redirect either way.
@@ -520,13 +560,19 @@ async fn destroy_session(state: &AuthState, headers: &HeaderMap) {
 
 /// `GET /api/auth/me` — who the caller is. Behind the guard, so the extension
 /// is always present.
-pub async fn me(Extension(current): Extension<CurrentUser>) -> Json<ApiResponse<UserInfo>> {
+pub async fn me(
+    State(state): State<AuthState>,
+    Extension(current): Extension<CurrentUser>,
+) -> Json<ApiResponse<UserInfo>> {
+    let session_absolute_expires_at = state.config.absolute_deadline(&current.session);
+
     Json(ApiResponse::success(UserInfo {
         id: current.user.id,
         username: current.user.username,
         role: current.user.role,
         home_path: current.user.home_path,
         session_expires_at: current.session.expires_at,
+        session_absolute_expires_at,
     }))
 }
 
@@ -640,11 +686,30 @@ fn client_key(headers: &HeaderMap) -> String {
         .to_string()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct ResetPageQuery {
     /// The token from the link. Never logged, never echoed anywhere but into
     /// the hidden field of the form below.
     pub token: Option<String>,
+}
+
+impl std::fmt::Debug for ResetPageQuery {
+    /// The comment above used to say "never logged" while a *derived* `Debug`
+    /// stood right on top of it — the query carries a live password-reset
+    /// token, so `{:?}` was exactly the way it would have reached a log. Shows
+    /// whether a token was present, and how long it was, which is what one
+    /// actually wants when debugging a broken reset link.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResetPageQuery")
+            .field(
+                "token",
+                &match &self.token {
+                    Some(token) => format!("Some(<redacted, {} chars>)", token.chars().count()),
+                    None => "None".to_string(),
+                },
+            )
+            .finish()
+    }
 }
 
 // No `Debug` on the form: it carries the token *and* the new password, and a
@@ -1091,6 +1156,53 @@ mod tests {
         }))
         .await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Fall 7 der `derive(Debug)`-Serie: die Query traegt ein lebendes
+    /// Reset-Token. Die Gegenprobe steht mit im Test — ein abgeleitetes `Debug`
+    /// wuerde den Token ausgeben, und genau das muss hier fehlschlagen.
+    #[test]
+    fn debug_of_the_reset_query_redacts_the_token() {
+        let token = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEF-_";
+        let rendered = format!(
+            "{:?}",
+            ResetPageQuery {
+                token: Some(token.to_string()),
+            }
+        );
+        assert!(
+            !rendered.contains(token),
+            "das Reset-Token steht in der Debug-Ausgabe: {rendered}"
+        );
+        // Redigiert, nicht entfernt: es bleibt erkennbar, dass ein Token da war.
+        assert!(rendered.contains("redacted"), "{rendered}");
+        assert!(
+            rendered.contains(&token.chars().count().to_string()),
+            "die Laenge fehlt, die Ausgabe ist zum Debuggen wertlos: {rendered}"
+        );
+
+        // Gegenprobe: dieselbe Zeichenkette in einem Typ mit abgeleitetem
+        // `Debug` erscheint im Klartext. Der Test kann also fehlschlagen.
+        #[derive(Debug)]
+        #[allow(dead_code)] // nur via `Debug` gelesen, was die Analyse ignoriert
+        struct Leaky {
+            token: Option<String>,
+        }
+        let leaky = format!(
+            "{:?}",
+            Leaky {
+                token: Some(token.to_string()),
+            }
+        );
+        assert!(
+            leaky.contains(token),
+            "die Pruefung sieht den Token nicht einmal, wenn er gedruckt wird"
+        );
+
+        assert_eq!(
+            format!("{:?}", ResetPageQuery { token: None }),
+            "ResetPageQuery { token: \"None\" }"
+        );
     }
 
     #[tokio::test]

@@ -5,6 +5,7 @@ import * as api from '../api.js';
 import { showAlert } from '../util/dom.js';
 import { formatBytes } from '../util/format.js';
 import { updateRemoteSelect } from './remote.js';
+import { rememberJobSource } from './jobmarks.js';
 
 export function openSyncModal(sourcePath) {
     state.currentSyncSource = sourcePath;
@@ -71,6 +72,9 @@ export async function startSync() {
 
         if (result.ok) {
             state.currentSyncJobId = result.data;
+            // The row this job belongs to gets a marker; the path is only
+            // known here, the API answer carries the basename alone.
+            rememberJobSource(result.data, syncRequest.source_path);
             closeSyncModal();
             openProgressModal();
             monitorProgress();
@@ -110,6 +114,17 @@ function setProgressModalIcon(iconState) {
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
             </svg>
         `;
+    } else if (iconState === 'partial') {
+        // Half-filled circle, amber: terminal but not a success. The shape
+        // differs from both neighbours (✓ ring / ✕ ring), so the state stays
+        // readable on a monochrome screen and for a red-green colour blind
+        // reader — colour alone would not carry it.
+        iconContainer.innerHTML = `
+            <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 sync-progress-partial-icon inline mr-2" viewBox="0 0 24 24" fill="none" stroke="currentColor">
+                <circle cx="12" cy="12" r="9" stroke-width="2" />
+                <path d="M12 3a9 9 0 010 18z" fill="currentColor" stroke="none" />
+            </svg>
+        `;
     } else if (iconState === 'error') {
         iconContainer.innerHTML = `
             <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 text-error inline mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
@@ -143,18 +158,41 @@ export async function monitorProgress() {
 }
 
 function updateProgressDisplay(progress) {
-    document.getElementById('progress-fill').style.width = progress.progress + '%';
+    // No rounding, in any state. `finish_job` sets 100 % only for a successful
+    // run; a `partial` job that stopped at 42.5 % keeps that number on the
+    // server, and a bar snapping to full here would undo exactly what the
+    // state exists for. The value is clamped, not corrected — a width comes
+    // out of it and must never leave the 0…100 range.
+    const percent = Math.min(100, Math.max(0, Number(progress.progress) || 0));
+    const fill = document.getElementById('progress-fill');
+    fill.style.width = percent + '%';
+    // Own classes, not Tailwind utilities: the browser build only generates
+    // what it finds in the DOM when it scans, so a colour attached from here
+    // would have no rule behind it. The rules live in the <style> block of
+    // index.html and are keyed on the id, which outranks `bg-primary`.
+    fill.classList.toggle('is-partial', progress.state === 'partial');
+    fill.classList.toggle('is-failed', progress.state === 'failed' || progress.state === 'cancelled');
     document.getElementById('progress-info').textContent = `Status: ${progress.status}`;
-    document.getElementById('progress-details').innerHTML = `
-        <p>Progress: ${progress.progress.toFixed(1)}%</p>
-        <p>Transferred: ${formatBytes(progress.transferred)}</p>
-        <p>Total: ${formatBytes(progress.total)}</p>
-    `;
+
+    // Built as elements: `formatBytes` returns a formatted number, but the
+    // dialog is one of the places server data is shown and nothing here needs
+    // markup. See the stored XSS these modules had.
+    const details = document.getElementById('progress-details');
+    details.replaceChildren(
+        detailLine(`Progress: ${percent.toFixed(1)}%`),
+        detailLine(`Transferred: ${formatBytes(progress.transferred)}`),
+        detailLine(`Total: ${formatBytes(progress.total)}`)
+    );
 
     // Das Icon hängt am maschinenlesbaren `state`
-    // (starting|running|completed|failed|cancelled), nicht am Anzeigetext.
+    // (starting|running|completed|partial|failed|cancelled), nicht am
+    // Anzeigetext.
     if (progress.state === 'completed') {
         setProgressModalIcon('completed');
+    } else if (progress.state === 'partial') {
+        // Teilerfolg (rsync-Exit 23/24): terminal, aber kein Erfolg und kein
+        // Totalausfall. Weder grün noch rot — eigenes Symbol, eigene Farbe.
+        setProgressModalIcon('partial');
     } else if (progress.terminal === true) {
         // Alles andere Beendete ist ein Fehlschlag oder Abbruch — unabhängig
         // davon, wie die Meldung formuliert ist.
@@ -162,6 +200,40 @@ function updateProgressDisplay(progress) {
     } else {
         setProgressModalIcon('loading');
     }
+
+    setProgressReason(progress);
+}
+
+function detailLine(text) {
+    const node = document.createElement('p');
+    node.textContent = text;
+    return node;
+}
+
+// The reason is the whole content of `partial` and of `failed`: `JobStatus`
+// serialises the text into `status`, and for those two states that text is the
+// only place the outcome is spelled out. It goes on screen next to the bar and
+// not into a tooltip — a reason nobody sees is a reason nobody reads.
+//
+// The line is created here rather than in index.html so it cannot survive into
+// the next run of the dialog with a stale message.
+function setProgressReason(progress) {
+    const details = document.getElementById('progress-details');
+    const existing = document.getElementById('progress-reason');
+    if (existing) {
+        existing.remove();
+    }
+
+    if (progress.state !== 'partial' && progress.state !== 'failed') {
+        return;
+    }
+
+    const line = document.createElement('div');
+    line.id = 'progress-reason';
+    line.className = 'sync-progress-reason is-' + progress.state;
+    line.textContent = (progress.state === 'partial' ? 'Partial: ' : 'Failed: ')
+        + (progress.status || 'no reason reported');
+    details.parentNode.insertBefore(line, details);
 }
 
 // ---------------------------------------------------------------------------
@@ -432,6 +504,7 @@ async function startSelectionSync() {
 
             if (result.ok) {
                 started.push(result.data);
+                rememberJobSource(result.data, entry.path);
             } else {
                 failed.push(`${entry.name}: ${result.error}`);
             }

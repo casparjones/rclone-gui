@@ -8,6 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json;
 use std::collections::HashMap;
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::fs;
 use tokio::process::Command;
@@ -17,11 +18,18 @@ use uuid::Uuid;
 
 type SyncJobs = Arc<Mutex<HashMap<String, SyncProgress>>>;
 type JobEngines = Arc<Mutex<HashMap<String, Arc<dyn SyncEngine>>>>;
+/// Job-ID -> `users.id` des Kontos, dem der Lauf zugerechnet wird.
+type JobOwners = Arc<Mutex<HashMap<String, String>>>;
 
 lazy_static::lazy_static! {
     static ref SYNC_JOBS: SyncJobs = Arc::new(Mutex::new(HashMap::new()));
     /// Engine used by a running job. Entries live only while the job runs.
     static ref JOB_ENGINES: JobEngines = Arc::new(Mutex::new(HashMap::new()));
+    /// Wer einen Job gestartet hat. Wird beim Anlegen gesetzt und mit dem Job
+    /// wieder entfernt; ein Job ohne Eintrag gilt als **fremd**, nicht als
+    /// frei (fail closed — nach einem Neustart ist die Jobtabelle ohnehin
+    /// leer, siehe `recover_stranded_jobs`).
+    static ref JOB_OWNERS: JobOwners = Arc::new(Mutex::new(HashMap::new()));
 }
 
 // ---------------------------------------------------------------------------
@@ -292,12 +300,21 @@ fn backup_dir_target(sync_request: &SyncRequest) -> anyhow::Result<Option<String
     //
     // Hier abgefangen heisst: der Request wird abgelehnt, bevor ein Job
     // entsteht — und die Meldung sagt, was zu tun ist.
-    let dest = raw_path(&sync_request.remote_path);
-    let backup = raw_path(raw);
-    let overlaps = dest.is_empty()
-        || backup == dest
-        || backup.starts_with(&format!("{}/", dest))
-        || dest.starts_with(&format!("{}/", backup));
+    // Verglichen wird **segmentweise** auf vollstaendig normalisierten Pfaden.
+    // Beides ist noetig, und beides hat einen Grund:
+    //
+    // * Normalisieren: `raw_path` schnitt nur aussen `/` ab. Ein doppelter
+    //   Slash im Inneren (`dst//sub` gegen `dst/sub/backup`) lief damit an der
+    //   Pruefung vorbei — rclone brach den Lauf dann selbst ab, aber erst
+    //   mitten drin. `.`-Segmente fallen aus demselben Grund weg; `..` ist
+    //   oben bereits abgewiesen.
+    // * Segmentweise: ein Praefixvergleich auf der Zeichenkette wuerde
+    //   `dst-backup` als „innerhalb von `dst`" lesen und einen zulaessigen
+    //   Ordner ablehnen.
+    let dest = path_segments(&sync_request.remote_path);
+    let backup = path_segments(raw);
+    let overlaps =
+        dest.is_empty() || backup.starts_with(&dest[..]) || dest.starts_with(&backup[..]);
     if overlaps {
         if dest.is_empty() {
             anyhow::bail!(
@@ -311,13 +328,26 @@ fn backup_dir_target(sync_request: &SyncRequest) -> anyhow::Result<Option<String
         );
     }
 
-    Ok(Some(format!("{}:{}", sync_request.remote_name, raw)))
+    // Weitergegeben wird die **normalisierte** Form, nicht die Eingabe: sonst
+    // pruefen wir einen Pfad und geben rclone einen anderen.
+    Ok(Some(format!(
+        "{}:{}",
+        sync_request.remote_name,
+        backup.join("/")
+    )))
 }
 
-/// Vergleichsform eines Remote-Pfads: ohne führende und abschliessende `/`.
-/// `"/"`, `""` und `"//"` sind damit alle das Remote-Wurzelverzeichnis.
-fn raw_path(path: &str) -> &str {
-    path.trim().trim_matches('/')
+/// Vergleichsform eines Remote-Pfads: die bedeutungstragenden Segmente.
+///
+/// Leere Segmente (führende, abschliessende und doppelte `/`) und `.` fallen
+/// weg. `"/"`, `""`, `"//"` und `"/./"` ergeben damit alle die leere Liste —
+/// das Remote-Wurzelverzeichnis. Innerhalb eines Segments wird **nicht**
+/// getrimmt: ein Ordnername darf am Rand ein Leerzeichen tragen.
+fn path_segments(path: &str) -> Vec<&str> {
+    path.trim()
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect()
 }
 
 /// Everything an engine needs to build the command line for one job.
@@ -733,15 +763,135 @@ fn initial_log_text(
     }
     if let Some(dir) = sync_request.backup_dir.as_deref().map(str::trim) {
         if !dir.is_empty() {
+            // Dieselbe normalisierte Form, die auch in die Kommandozeile geht —
+            // sonst nennt das Log einen anderen Pfad als den, der laeuft.
             text.push_str(&format!(
                 "[{}] Backup dir: {}:{} (statt loeschen wird dorthin verschoben)\n",
-                timestamp, sync_request.remote_name, dir
+                timestamp,
+                sync_request.remote_name,
+                path_segments(dir).join("/")
             ));
         }
     }
 
     text.push_str(&format!("[{}] Starting rclone operation...\n\n", timestamp));
     text
+}
+
+// ---------------------------------------------------------------------------
+// Logdatei-Jail
+//
+// `get_sync_log` hat den Pfad früher **ungeprüft** aus dem Pfadsegment gebaut
+// (`format!("data/log/{}.log", job_id)`). Gemessen:
+//
+//     GET /api/sync/..%2F..%2Fserver/log   ->   liefert ../../server.log
+//
+// Also eine Datei ausserhalb von `data/log`. Dieselbe Fehlerklasse war für
+// Auflistung, Vorschau, Download, ZIP, Thumbnails und die Sync-Quelle bereits
+// je einmal als Sicherheitsticket geschlossen; hier fehlte sie noch.
+//
+// Zwei Riegel, absichtlich hintereinander:
+//
+//   1. **Positivprüfung auf das bekannte Format.** Eine Job-ID ist eine UUID.
+//      Geprüft wird sie als solche, nicht durch eine Liste verbotener Zeichen —
+//      die nächste Kodierungsvariante (`%252f`, Backslash, U+2215 …) umgeht
+//      eine Negativliste, ein `Uuid::parse_str` nicht.
+//   2. **Kanonisierung gegen `data/log/`**, wie AGENTS.md es für jeden vom
+//      Client kommenden Pfad verlangt. Das ist der Teil, der auch dann noch
+//      hält, wenn das Format der Job-IDs eines Tages wechselt, und der einen
+//      Symlink im Logverzeichnis mitnimmt: der aufgelöste Pfad muss unterhalb
+//      der Wurzel liegen, nicht die Eingabe.
+//
+// Wer die Logdatei eines *eigenen* Jobs schreibt (`create_initial_log`,
+// `execute_sync`, die Fortschrittsauswertung), arbeitet mit einer selbst
+// erzeugten ID und geht über `internal_log_path`. Der Unterschied ist die
+// Herkunft der Zeichenkette, nicht der Dateiname.
+// ---------------------------------------------------------------------------
+
+/// Verzeichnis der Job-Logs, relativ zum Arbeitsverzeichnis — wie überall in
+/// diesem Modul.
+const LOG_DIR: &str = "data/log";
+
+/// Eine Antwort für „gibt es nicht", „gehört dir nicht" und „ist kein
+/// gültiges Segment".
+///
+/// Bewusst **eine** Zeichenkette ohne Detail: unterschiedliche Meldungen (oder
+/// ein durchgereichter `io::Error`) machten den Endpunkt zu einem Orakel, mit
+/// dem sich fremde Job-IDs und die Existenz von Dateien ausserhalb des
+/// Logverzeichnisses abfragen liessen.
+const LOG_UNAVAILABLE: &str = "Log file not found";
+
+/// Pfad der Logdatei zu einer **selbst erzeugten** Job-ID.
+fn internal_log_path(job_id: &str) -> String {
+    format!("{}/{}.log", LOG_DIR, job_id)
+}
+
+/// Riegel 1: Ist dieses Segment eine Job-ID, und wie heisst dann ihre Datei?
+///
+/// Verlangt die kanonische Schreibweise, die `Uuid::new_v4().to_string()`
+/// erzeugt — also klein geschrieben und mit Bindestrichen. `Uuid::parse_str`
+/// nimmt auch `{…}`, `urn:uuid:…` und Grossschreibung an; alle drei wären
+/// Zeichenketten, die für dieselbe ID einen *anderen* Dateinamen ergeben, und
+/// keine davon kann von einem Client stammen, der eine ID benutzt, die er
+/// vorher von uns bekommen hat.
+fn job_log_file_name(job_id: &str) -> Option<String> {
+    let parsed = Uuid::parse_str(job_id).ok()?;
+    if parsed.hyphenated().to_string() != job_id {
+        return None;
+    }
+    Some(format!("{}.log", job_id))
+}
+
+/// Riegel 1 **und** 2: Segment prüfen, Pfad kanonisieren, gegen `data/log`
+/// halten. `None` heisst „kein lesbares Log" und sagt nicht, warum.
+async fn resolved_log_path(job_id: &str) -> Option<PathBuf> {
+    let file_name = job_log_file_name(job_id).or_else(|| {
+        warn!("📖 Logabruf abgelehnt: '{}' ist keine Job-ID", job_id);
+        None
+    })?;
+
+    // Die Wurzel muss kanonisch sein, sonst trägt der `starts_with`-Test
+    // nichts. Fehlt das Verzeichnis, gibt es auch kein Log.
+    let root = match fs::canonicalize(LOG_DIR).await {
+        Ok(root) => root,
+        Err(e) => {
+            debug!("📖 Logverzeichnis {} nicht auflösbar: {}", LOG_DIR, e);
+            return None;
+        }
+    };
+
+    match resolve_within_root(&root, &file_name).await {
+        Ok(path) => Some(path),
+        Err(e) => {
+            debug!("📖 Log von Job {} nicht auflösbar: {:?}", job_id, e);
+            None
+        }
+    }
+}
+
+/// Merkt sich, wem ein Job gehört.
+async fn remember_job_owner(job_id: &str, user_id: &str) {
+    JOB_OWNERS
+        .lock()
+        .await
+        .insert(job_id.to_string(), user_id.to_string());
+}
+
+/// Vergisst den Eigentümer eines Jobs, der aus der Tabelle fällt.
+async fn forget_job_owner(job_id: &str) {
+    JOB_OWNERS.lock().await.remove(job_id);
+}
+
+/// Darf `current` den Job `job_id` sehen?
+///
+/// **Fail closed**, in beide Richtungen: ein Job ohne bekannten Eigentümer ist
+/// so unlesbar wie der eines fremden Kontos. Auch ein Admin bekommt hier keine
+/// Ausnahme — dieselbe Begründung wie beim fehlenden `scope=system` für den
+/// Sync weiter oben: die Job-Logs enthalten Quell- und Zielpfade fremder
+/// Konten, und ein Hintergrundlauf ist kein sichtbarer Einzelzugriff, bei dem
+/// eine Ausnahme pro Request in der URL stünde.
+async fn job_belongs_to(job_id: &str, current: &CurrentUser) -> bool {
+    JOB_OWNERS.lock().await.get(job_id) == Some(&current.user.id)
 }
 
 /// Ensure the log directory exists and create a new log file with an initial entry
@@ -751,9 +901,9 @@ async fn create_initial_log(
     mode: TransferMode,
     dry_run: bool,
 ) -> tokio::io::Result<()> {
-    fs::create_dir_all("data/log").await?;
+    fs::create_dir_all(LOG_DIR).await?;
 
-    let log_file_path = format!("data/log/{}.log", job_id);
+    let log_file_path = internal_log_path(job_id);
     let initial_log = initial_log_text(job_id, sync_request, mode, dry_run);
 
     fs::write(&log_file_path, initial_log).await
@@ -955,6 +1105,11 @@ pub async fn start_sync_for(
         jobs.insert(job_id.clone(), progress);
     }
 
+    // Wer den Lauf gestartet hat, wird zusammen mit dem Job vermerkt — die
+    // Grundlage der Zugriffsprüfung in `get_sync_log_for`. Der CLI-Weg geht
+    // durch dieselbe Funktion und trägt deshalb ebenfalls ein.
+    remember_job_owner(&job_id, &current.user.id).await;
+
     // Immediately create the log file so it is visible in the UI
     if let Err(e) = create_initial_log(&job_id, &sync_request, mode, dry_run).await {
         error!("Failed to create initial log for {}: {}", job_id, e);
@@ -1033,10 +1188,12 @@ pub async fn list_sync_jobs() -> ResponseJson<ApiResponse<Vec<SyncProgress>>> {
             );
 
             // Remove log file
-            let log_file_path = format!("data/log/{}.log", job_id);
+            let log_file_path = internal_log_path(&job_id);
             if let Err(e) = tokio::fs::remove_file(&log_file_path).await {
                 debug!("⚠️ Could not delete log file {}: {}", log_file_path, e);
             }
+
+            forget_job_owner(&job_id).await;
         }
     }
 
@@ -1048,11 +1205,54 @@ pub async fn list_sync_jobs() -> ResponseJson<ApiResponse<Vec<SyncProgress>>> {
     ResponseJson(ApiResponse::success(job_list))
 }
 
+/// Liest das Log eines Jobs aus einem Request-Segment.
+///
+/// Der Pfad geht durch das Logdatei-Jail (siehe oben) — ohne gültige Job-ID
+/// und ohne kanonisierten Pfad unterhalb von `data/log` wird gar nichts
+/// gelesen. Eine **Zugriffsprüfung** findet hier noch nicht statt, weil dieser
+/// Einstieg keinen `CurrentUser` bekommt; die gibt es in
+/// [`get_sync_log_for`], das dafür gedacht ist, in der Route an die Stelle
+/// dieser Funktion zu treten.
 pub async fn get_sync_log(job_id: String) -> ResponseJson<ApiResponse<String>> {
-    let log_file_path = format!("data/log/{}.log", job_id);
-    debug!("📖 Reading log file for job {}: {}", job_id, log_file_path);
+    let Some(path) = resolved_log_path(&job_id).await else {
+        return ResponseJson(ApiResponse::error(LOG_UNAVAILABLE));
+    };
 
-    match fs::read_to_string(&log_file_path).await {
+    read_job_log(&job_id, &path).await
+}
+
+/// Wie [`get_sync_log`], zusätzlich mit Zugriffsprüfung.
+///
+/// Fremder Job und unbekannter Job antworten **identisch** (dieselbe Meldung,
+/// derselbe Erfolgsstatus), sonst wäre der Endpunkt ein Orakel, mit dem sich
+/// fremde Job-IDs bestätigen liessen. Aus dem gleichen Grund wird die
+/// Ablehnung nur mit `user_id` und Job-ID protokolliert, nicht dem Client
+/// mitgeteilt.
+#[allow(dead_code)] // wartet auf die Route: `main.rs` gehört einem anderen Ticket
+pub async fn get_sync_log_for(
+    current: &CurrentUser,
+    job_id: String,
+) -> ResponseJson<ApiResponse<String>> {
+    let Some(path) = resolved_log_path(&job_id).await else {
+        return ResponseJson(ApiResponse::error(LOG_UNAVAILABLE));
+    };
+
+    if !job_belongs_to(&job_id, current).await {
+        warn!(
+            "📖 Logabruf abgelehnt: Job {} gehört nicht zu Konto {}",
+            job_id, current.user.id
+        );
+        return ResponseJson(ApiResponse::error(LOG_UNAVAILABLE));
+    }
+
+    read_job_log(&job_id, &path).await
+}
+
+/// Gemeinsames Lesen für beide Einstiege. Nimmt einen bereits geprüften Pfad.
+async fn read_job_log(job_id: &str, path: &std::path::Path) -> ResponseJson<ApiResponse<String>> {
+    debug!("📖 Reading log file for job {}: {}", job_id, path.display());
+
+    match fs::read_to_string(path).await {
         Ok(content) => {
             info!(
                 "📖 Log file read successfully for job {}, {} bytes",
@@ -1062,8 +1262,10 @@ pub async fn get_sync_log(job_id: String) -> ResponseJson<ApiResponse<String>> {
             ResponseJson(ApiResponse::success(content))
         }
         Err(e) => {
+            // Der Grund bleibt im Log; die Antwort ist für jeden Fehlerfall
+            // dieselbe.
             warn!("📖 Log file read failed for job {}: {}", job_id, e);
-            ResponseJson(ApiResponse::error(&format!("Log file not found: {}", e)))
+            ResponseJson(ApiResponse::error(LOG_UNAVAILABLE))
         }
     }
 }
@@ -1094,9 +1296,13 @@ pub async fn delete_sync_job(job_id: String) -> ResponseJson<ApiResponse<String>
 
     // Remove from memory
     jobs.remove(&job_id);
+    forget_job_owner(&job_id).await;
 
-    // Remove log file
-    let log_file_path = format!("data/log/{}.log", job_id);
+    // Remove log file. `job_id` hat oben den Abgleich mit der Jobtabelle
+    // bestanden, ist also ein selbst erzeugter Schlüssel und kein beliebiges
+    // Pfadsegment mehr — genau deshalb war dieser Weg von der Lücke in
+    // `get_sync_log` nicht betroffen.
+    let log_file_path = internal_log_path(&job_id);
     if let Err(e) = fs::remove_file(&log_file_path).await {
         println!(
             "Warning: Could not delete log file {}: {}",
@@ -1113,7 +1319,7 @@ async fn execute_sync(
     sync_jobs: SyncJobs,
     engine: Arc<dyn SyncEngine>,
 ) {
-    let log_file_path = format!("data/log/{}.log", job_id);
+    let log_file_path = internal_log_path(&job_id);
 
     // Der Modus wird hier **erneut** aus dem Request abgeleitet und nicht von
     // `start_sync_for` durchgereicht. Beide Wege benutzen dieselbe Funktion,
@@ -1339,7 +1545,10 @@ async fn parse_latest_progress_from_log(
     job_id: &str,
     engine: &dyn SyncEngine,
 ) -> Option<ProgressSnapshot> {
-    let log_file_path = format!("data/log/{}.log", job_id);
+    // `job_id` ist hier immer ein Schlüssel aus `SYNC_JOBS`, also eine
+    // selbst erzeugte ID — der Aufrufer hat den Job vorher in der Tabelle
+    // gefunden. Kein Request-Segment, deshalb kein Jail.
+    let log_file_path = internal_log_path(job_id);
 
     // Read the log file
     let content = match fs::read_to_string(&log_file_path).await {
@@ -1703,13 +1912,18 @@ pub fn parse_planned_deletions(content: &str) -> Vec<PlannedDeletion> {
 /// abgeräumter Job (Neustart) den Bericht nicht als „echt" ausgibt.
 #[allow(dead_code)] // siehe `PlannedDeletion`: Route fehlt noch
 pub async fn get_sync_deletions(job_id: String) -> ResponseJson<ApiResponse<DeletionReport>> {
-    let log_file_path = format!("data/log/{}.log", job_id);
+    // Dasselbe Jail wie in `get_sync_log`: die ID kommt aus einem
+    // Request-Segment, also wird sie geprüft, bevor sie einen Pfad bildet —
+    // auch schon, solange die Route noch fehlt.
+    let Some(log_file_path) = resolved_log_path(&job_id).await else {
+        return ResponseJson(ApiResponse::error(LOG_UNAVAILABLE));
+    };
 
     let content = match fs::read_to_string(&log_file_path).await {
         Ok(content) => content,
         Err(e) => {
             warn!("📖 Löschvorschau für {} nicht lesbar: {}", job_id, e);
-            return ResponseJson(ApiResponse::error("Log file not found"));
+            return ResponseJson(ApiResponse::error(LOG_UNAVAILABLE));
         }
     };
 
@@ -2720,6 +2934,86 @@ mod tests {
         }
     }
 
+    /// Ticket `9a481914`: doppelte Slashes und `.`-Segmente liefen an der
+    /// Ueberschneidungspruefung vorbei, weil nur aussen getrimmt wurde. rclone
+    /// brach den Lauf dann selbst ab — aber erst mitten drin, und die Pruefung
+    /// ist ausdruecklich eine Vorab-Pruefung.
+    #[test]
+    fn backup_dir_pruefung_normalisiert_den_pfad_vollstaendig() {
+        let mut req = request(None);
+        req.remote_path = "/dst/sub".to_string();
+
+        // Alle Schreibweisen desselben ueberschneidenden Pfades.
+        for bad in [
+            "//dst/sub/backup",
+            "dst//sub/backup",
+            "dst/./sub/backup",
+            "dst/sub/./backup",
+            "./dst/sub",
+            "dst//sub",
+            "dst/sub//",
+            "//dst//sub//",
+            "/./",
+            "//",
+            ".",
+        ] {
+            req.backup_dir = Some(bad.to_string());
+            assert!(
+                backup_dir_target(&req).is_err(),
+                "'{}' haette als Ueberschneidung abgelehnt werden muessen",
+                bad
+            );
+        }
+
+        // Und umgekehrt: das **Ziel** in krummer Schreibweise darf die Pruefung
+        // genauso nicht aushebeln.
+        for dest in ["//dst//sub", "dst/./sub/", "/dst/sub//"] {
+            req.remote_path = dest.to_string();
+            req.backup_dir = Some("dst/sub/backup".to_string());
+            assert!(
+                backup_dir_target(&req).is_err(),
+                "Ziel '{}' haette die Ueberschneidung erkennen muessen",
+                dest
+            );
+        }
+    }
+
+    /// Die Gegenprobe zur Normalisierung: verglichen wird auf **Segment**-
+    /// grenzen. Ein Praefixvergleich auf der Zeichenkette wuerde `dst-backup`
+    /// faelschlich als „innerhalb von `dst`" lesen — derselbe Fehler wie eine
+    /// Origin-Pruefung per Praefix.
+    #[test]
+    fn backup_dir_neben_dem_ziel_wird_nicht_faelschlich_abgelehnt() {
+        let mut req = request(None);
+        req.remote_path = "/dst".to_string();
+
+        for good in ["dst-backup", "dstx", "dst-backup/2026", "/dst-backup/"] {
+            req.backup_dir = Some(good.to_string());
+            assert!(
+                backup_dir_target(&req).is_ok(),
+                "'{}' liegt neben dem Ziel und ist zulaessig",
+                good
+            );
+        }
+
+        // Weitergegeben wird die normalisierte Form — geprueft und ausgefuehrt
+        // ist derselbe Pfad.
+        req.backup_dir = Some("//dst-backup//2026/./alt/".to_string());
+        assert_eq!(
+            backup_dir_target(&req).expect("neben dem Ziel"),
+            Some("myremote:dst-backup/2026/alt".to_string())
+        );
+        let args = args_for(&req);
+        let idx = args
+            .iter()
+            .position(|a| a == "--backup-dir")
+            .expect("--backup-dir gesetzt");
+        assert_eq!(args[idx + 1], "myremote:dst-backup/2026/alt");
+        // Und das Log nennt denselben Pfad.
+        assert!(initial_log_text("job-1", &req, TransferMode::Mirror, false)
+            .contains("Backup dir: myremote:dst-backup/2026/alt"));
+    }
+
     /// Der Modus steht im Log-Kopf, in Klartext und ohne Zweideutigkeit.
     #[test]
     fn log_kopf_nennt_den_modus() {
@@ -2862,5 +3156,229 @@ mod tests {
             "\n",
         );
         assert!(parse_planned_deletions(log).is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // Logdatei-Jail (Ticket e785215e)
+    // -----------------------------------------------------------------
+
+    /// Eine Datei unter `data/log`, die sich selbst wieder aufräumt — auch
+    /// wenn der Test durchfällt oder in der Mitte abbricht.
+    struct TestLogFile {
+        path: std::path::PathBuf,
+    }
+
+    impl TestLogFile {
+        fn new(file_name: &str, content: &str) -> Self {
+            std::fs::create_dir_all(LOG_DIR).expect("Logverzeichnis anlegbar");
+            let path = std::path::Path::new(LOG_DIR).join(file_name);
+            std::fs::write(&path, content).expect("Logdatei schreibbar");
+            Self { path }
+        }
+
+        /// Datei **neben** dem Logverzeichnis, also das Ziel eines Ausbruchs.
+        fn beside(file_name: &str, content: &str) -> Self {
+            let path = std::path::Path::new(LOG_DIR)
+                .parent()
+                .expect("data/")
+                .join(file_name);
+            std::fs::create_dir_all(path.parent().expect("data/")).expect("data/ anlegbar");
+            std::fs::write(&path, content).expect("Datei schreibbar");
+            Self { path }
+        }
+    }
+
+    impl Drop for TestLogFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+
+    fn user_with_id(id: &str) -> CurrentUser {
+        let mut current = user_with_home(std::path::Path::new("/nonexistent"), "user");
+        current.user.id = id.to_string();
+        current
+    }
+
+    /// Riegel 1, ohne Dateisystem: nur die kanonische UUID-Schreibweise ist
+    /// eine Job-ID. Die Liste enthält den gemessenen Angriff sowohl in der
+    /// Form, in der er auf der Leitung steht, als **auch** so, wie axum ihn
+    /// dekodiert an den Handler gibt — und dazu die Kodierungsvarianten, an
+    /// denen eine Negativliste scheitern würde.
+    #[test]
+    fn only_a_canonical_uuid_becomes_a_log_file_name() {
+        let real = Uuid::new_v4().to_string();
+
+        for candidate in [
+            // Der gemessene Befund, dekodiert und undekodiert.
+            "../../server",
+            "..%2F..%2Fserver",
+            "..%2f..%2fserver",
+            // Doppelt kodiert — die zweite Runde entsteht erst im Handler.
+            "..%252F..%252Fserver",
+            "%2e%2e/%2e%2e/server",
+            // Backslash und Mischformen aus `.` und `..`.
+            r"..\..\server",
+            "./../data/tasks",
+            "a/../../etc/hosts",
+            "./.././server",
+            // Absolute Pfade.
+            "/etc/passwd",
+            "/var/log/syslog",
+            "//etc/passwd",
+            // Slash-Homoglyphen, die schon einmal probiert wurden.
+            "..\u{2215}..\u{2215}server",
+            "..\u{ff0f}..\u{ff0f}server",
+            "..\u{2044}..\u{2044}server",
+            // Leeres, entartetes, nicht-UUID-Segment.
+            "",
+            " ",
+            ".",
+            "..",
+            "job-1",
+            "\0",
+            // Eine echte UUID, aber mit Anhang oder in einer Schreibweise,
+            // die einen anderen Dateinamen ergäbe als die ausgegebene ID.
+            &format!("{real}.log"),
+            &format!("{real}/../../etc/hosts"),
+            &format!("{real}\0"),
+            &format!(" {real}"),
+            &format!("{real} "),
+            &real.to_uppercase(),
+            &format!("{{{real}}}"),
+            &format!("urn:uuid:{real}"),
+            &real.replace('-', ""),
+        ] {
+            assert!(
+                job_log_file_name(candidate).is_none(),
+                "hätte abgewiesen werden müssen: {candidate:?}"
+            );
+        }
+
+        // Gegenprobe: die Form, die `Uuid::new_v4().to_string()` erzeugt, geht
+        // durch — sonst prüfte der Test nur, dass die Funktion immer `None`
+        // liefert.
+        assert_eq!(
+            job_log_file_name(&real).as_deref(),
+            Some(format!("{real}.log").as_str())
+        );
+    }
+
+    /// Der gemessene Ausbruch, gegen eine Datei die es **wirklich** gibt:
+    /// `data/<uuid>.log` liegt eine Ebene über dem Logverzeichnis und wäre
+    /// über `..` erreichbar. Der Endpunkt liefert sie nicht.
+    #[tokio::test]
+    async fn the_log_endpoint_does_not_escape_the_log_directory() {
+        let id = Uuid::new_v4().to_string();
+        let outside = TestLogFile::beside(&format!("{id}.log"), "GEHEIM: nicht ausliefern\n");
+
+        // Kontrolle: die Datei ist da und lesbar. Ohne diesen Nachweis könnte
+        // der Test auch bestehen, weil das Ziel gar nicht existiert.
+        assert!(
+            std::fs::read_to_string(&outside.path)
+                .expect("Kontrolldatei lesbar")
+                .contains("GEHEIM"),
+            "Testaufbau kaputt: die Zieldatei fehlt"
+        );
+
+        for attempt in [
+            format!("../{id}"),
+            format!("..%2F{id}"),
+            format!("../../{id}"),
+            format!(r"..\{id}"),
+            format!("./../{id}"),
+        ] {
+            let response = get_sync_log(attempt.clone()).await.0;
+            assert!(!response.success, "Ausbruch gelungen mit {attempt:?}");
+            assert!(
+                response
+                    .data
+                    .as_deref()
+                    .is_none_or(|body| !body.contains("GEHEIM")),
+                "Inhalt ausserhalb von {LOG_DIR} ausgeliefert: {attempt:?}"
+            );
+            assert_eq!(response.error.as_deref(), Some(LOG_UNAVAILABLE));
+        }
+    }
+
+    /// Eine gültige Job-ID funktioniert unverändert, und der aufgelöste Pfad
+    /// liegt unter der kanonisierten Wurzel.
+    #[tokio::test]
+    async fn a_valid_job_id_still_reads_its_log() {
+        let id = Uuid::new_v4().to_string();
+        let _log = TestLogFile::new(&format!("{id}.log"), "[test] hallo\n");
+
+        let resolved = resolved_log_path(&id).await.expect("Pfad auflösbar");
+        let root = tokio::fs::canonicalize(LOG_DIR).await.expect("Wurzel");
+        assert!(resolved.starts_with(&root), "Pfad ausserhalb: {resolved:?}");
+
+        let response = get_sync_log(id).await.0;
+        assert!(response.success, "Log nicht lesbar: {:?}", response.error);
+        assert_eq!(response.data.as_deref(), Some("[test] hallo\n"));
+    }
+
+    /// Riegel 2 allein: heisst die Datei richtig, zeigt aber per Symlink nach
+    /// draussen, entscheidet der **kanonisierte** Pfad — nicht der Name.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_symlinked_log_file_does_not_leave_the_directory() {
+        let base = temp_dir("logjail");
+        let target = base.join("geheim.log");
+        std::fs::write(&target, "GEHEIM\n").expect("Zieldatei");
+
+        let id = Uuid::new_v4().to_string();
+        let link = std::path::Path::new(LOG_DIR).join(format!("{id}.log"));
+        std::fs::create_dir_all(LOG_DIR).expect("Logverzeichnis");
+        std::os::unix::fs::symlink(&target, &link).expect("Symlink");
+        // Aufräumen auch im Fehlerfall.
+        let _guard = TestLogFile { path: link.clone() };
+
+        assert!(
+            resolved_log_path(&id).await.is_none(),
+            "Symlink nach draussen wurde akzeptiert"
+        );
+        let response = get_sync_log(id).await.0;
+        assert!(!response.success);
+        assert!(response
+            .data
+            .as_deref()
+            .is_none_or(|body| !body.contains("GEHEIM")));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Zugriffsrecht: das Log eines fremden Jobs ist nicht lesbar, und die
+    /// Antwort ist von der für eine unbekannte Job-ID **nicht zu
+    /// unterscheiden** — sonst wäre der Endpunkt ein Orakel für fremde IDs.
+    #[tokio::test]
+    async fn a_foreign_job_log_is_indistinguishable_from_an_unknown_one() {
+        let id = Uuid::new_v4().to_string();
+        let _log = TestLogFile::new(&format!("{id}.log"), "[test] Quelle: /home/alice\n");
+
+        let owner = user_with_id("u-owner");
+        let stranger = user_with_id("u-stranger");
+        remember_job_owner(&id, &owner.user.id).await;
+
+        let mine = get_sync_log_for(&owner, id.clone()).await.0;
+        assert!(mine.success, "Eigenes Log nicht lesbar: {:?}", mine.error);
+        assert_eq!(mine.data.as_deref(), Some("[test] Quelle: /home/alice\n"));
+
+        let foreign = get_sync_log_for(&stranger, id.clone()).await.0;
+        // Eine Job-ID, die es nie gegeben hat: dieselbe Antwort, Wort für Wort.
+        let unknown = get_sync_log_for(&stranger, Uuid::new_v4().to_string())
+            .await
+            .0;
+
+        assert!(!foreign.success, "fremdes Log wurde ausgeliefert");
+        assert!(foreign.data.is_none(), "fremder Loginhalt in der Antwort");
+        assert_eq!(foreign.success, unknown.success);
+        assert_eq!(foreign.error, unknown.error);
+        assert_eq!(foreign.error.as_deref(), Some(LOG_UNAVAILABLE));
+
+        // Und ein Job ohne bekannten Eigentümer bleibt zu (fail closed).
+        forget_job_owner(&id).await;
+        let orphan = get_sync_log_for(&owner, id).await.0;
+        assert!(!orphan.success);
+        assert_eq!(orphan.error, unknown.error);
     }
 }

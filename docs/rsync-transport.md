@@ -105,7 +105,7 @@ port = 873
     gid = 1001
     max connections = 4
     temp dir = /.rsync-tmp
-    refuse options = copy-links copy-dirlinks copy-unsafe-links delete remove-source-files
+    refuse options = copy-links copy-dirlinks copy-unsafe-links delete remove-source-files remove-sent-files force
 ```
 
 > **Der Block ist bewusst nicht spaltenausgerichtet.** `render_conf` und
@@ -144,15 +144,66 @@ lässt sich auch von einem Fehler nicht dazu überreden (Entscheidung E2, siehe 
 ### `refuse options` — die vollständige Liste, und warum das Wort `delete` bar steht
 
 ```
-refuse options = copy-links copy-dirlinks copy-unsafe-links delete remove-source-files
+refuse options = copy-links copy-dirlinks copy-unsafe-links delete remove-source-files remove-sent-files force
 ```
 
 Die ersten drei Einträge schliessen den Symlink-Ausbruch (siehe „Modulgrenzen"), die
-letzten beiden den **Datenverlust**: eine Kopplung vergibt Schreibrecht, und ohne diese
-zwei Einträge darf ein Peer, der schreiben darf, auch **vernichten**. Gemessen: ein Push
-mit `--delete` löschte jede Datei im Share, die der Sender nicht hatte — exit 0, keine
-Warnung. `remove-source-files` ist dieselbe Waffe in die andere Richtung, es räumt das
-Verzeichnis der **Quellseite** leer.
+übrigen vier den **Datenverlust**: eine Kopplung vergibt Schreibrecht, und ohne sie darf
+ein Peer, der schreiben darf, auch **vernichten**. Gemessen: ein Push mit `--delete`
+löschte jede Datei im Share, die der Sender nicht hatte — exit 0, keine Warnung.
+`remove-source-files` ist dieselbe Waffe in die andere Richtung, es räumt das Verzeichnis
+der **Quellseite** leer — und wenn das Modul die Quellseite ist, ist das der Share.
+
+**`remove-sent-files` ist der veraltete Aliasname davon und wird von der Verweigerung des
+modernen Namens nicht mitgedeckt.** rsync vergleicht die Schreibweise, die der Client
+geschickt hat, nicht die Option, auf die sie hinausläuft. Gemessen auf 3.5.0 und 3.4.3:
+ein **Push** mit `--remove-sent-files` kam mit **exit 0** zurück und leerte das
+Quellverzeichnis, während `--remove-source-files` mit exit 4 abgewiesen wurde. In der
+Pull-Richtung — der teuren, weil dort der Share die Quelle ist — fiel der Alias in die
+delete-Gruppe und war schon vorher verweigert; sich darauf zu verlassen heisst, sich auf
+eine Asymmetrie zu verlassen, die niemand aufgeschrieben hatte.
+
+#### `--force` vernichtet **ohne** jedes `--delete`
+
+Das ist die Lücke, die Ticket `674170ac` geschlossen hat, und sie war weder eine
+delete-Variante noch am Handbuch zu erkennen. `--force` heisst „räume dem eingehenden
+Eintrag den Platz frei" — und was freigeräumt wird, ist ein **nicht-leeres Verzeichnis**,
+das dort steht, wo eine Datei geschrieben werden soll. Gemessen auf beiden Versionen,
+schreibbares Modul mit `keep/precious.txt`, auf der Senderseite eine **Datei** namens
+`keep`, und **keine** Löschoption im Aufruf:
+
+| Client | 3.5.0 (Host) | 3.4.3 (`alpine:3.22`, das Image) |
+|---|---|---|
+| `rsync -a` | exit 23, `cannot delete non-empty directory: keep` | exit 23, ebenso |
+| `rsync -a --force` | **exit 0, `precious.txt` weg** | **exit 0, `precious.txt` weg** |
+| `rsync -a --force`, `force` verweigert | exit 4, Datei unberührt | exit 4, Datei unberührt |
+
+Dasselbe gilt eine Ebene tiefer (`keep/sub/precious.txt`) und wenn der eingehende Eintrag
+ein Symlink statt einer Datei ist. `force` steht deshalb aus **eigenem** Grund auf der
+Liste, nicht als Spielart von `delete`.
+
+#### Was gemessen und bewusst **nicht** verweigert wird
+
+Am Daemon ausgeschlossen, nicht am Handbuch, auf 3.5.0 und 3.4.3:
+
+- `--inplace`, `--partial`, `--delay-updates`, `--temp-dir=…`,
+  `--partial-dir=../../..` — sie ändern, **wie** eine Datei geschrieben wird, die der
+  Peer schreiben darf, und erreichten nichts ausserhalb des Moduls. Dieselbe Datei kann
+  er mit einem blanken `rsync -a` ohnehin überschreiben.
+- `--append`, `--append-verify` — die vorhandene, längere Datei blieb unberührt.
+- `--backup`, `--backup-dir=…`, `--suffix=…` — sie **legen** eine Kopie des alten Stands
+  im Modul **an**. Auf ein Verzeichnis gerichtet, in dem schon eine Datei gleichen Namens
+  lag, blieben Original **und** vorgesehene Sicherung unberührt; vernichtet wurde nichts.
+- `--keep-dirlinks` — schreibt durch einen Verzeichnis-Symlink, der bereits im Share
+  liegt. Mit `use chroot = yes` **ist** die Modulwurzel die chroot-Wurzel, das Ziel eines
+  solchen Links kann also nicht darüber liegen; mit einem Link auf ein Verzeichnis
+  oberhalb des Shares blieb die Datei dort unberührt.
+- `--trust-sender`, `--relative ../..` — der Sender verweigert eine Dateiliste mit einer
+  `..`-Komponente, bevor irgendetwas den Daemon erreicht.
+- `--write-devices` — der Daemon verweigert es von sich aus (`write devices` ist aus).
+  Ein Eintrag dafür wäre eine Zeile, deren Wirkung man nicht zeigen kann.
+- `--chmod=F000` — setzt den Modus der Datei, die gerade übertragen wurde, also einer
+  Datei des Peers. Das verwehrt Zugriff, es entfernt keinen Inhalt.
 
 **Die Wildcard `delete*` ist kein „aufgeräumtes" Äquivalent, sondern eine
 Abschwächung.** Gemessen an einem echten Daemon auf **beiden** Versionen, die im Spiel
@@ -166,7 +217,8 @@ und einer Opferdatei im Share:
 | `delete delete*` | verweigert, exit 4 | **durchgelassen, exit 0** |
 
 Ein Tester hat alle neun Varianten einzeln gegengeprüft; mit dem baren Wort endet jede
-mit exit 4.
+mit exit 4. Was dieselbe Prüfung **nicht** erfasste, weil sie nur nach Löschschreibweisen
+suchte, war `--force` — siehe unten.
 
 Der Grund: das bare Wort ist in rsync eine **Gruppen**-Verweigerung — es markiert die
 ganze delete-Familie, `--delete-missing-args` eingeschlossen. Ein Wildcard-Eintrag

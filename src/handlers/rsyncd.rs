@@ -11,6 +11,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -53,14 +54,18 @@ use tokio::sync::Mutex as TokioMutex;
 //     `/etc/passwd` (1278 bytes) that way. `munge symlinks` does NOT help
 //     here, it only rewrites links that rsync itself writes.
 //
-//   * `delete remove-source-files` in the same list — a pairing carries write
-//     access, and without this a peer that may write may also *destroy*: a push
-//     with `--delete` removed every file in the share that the sender did not
-//     have, exit 0, measured. `remove-source-files` is the same weapon pointed
-//     the other way, it empties the *sender's* directory. Both are refused
+//   * `delete remove-source-files remove-sent-files force` in the same list —
+//     a pairing carries write access, and without this a peer that may write
+//     may also *destroy*: a push with `--delete` removed every file in the
+//     share that the sender did not have, exit 0, measured.
+//     `remove-source-files` and its old alias `remove-sent-files` are the same
+//     weapon pointed the other way, they empty the *sender's* directory — and
+//     when the module is the sender, that directory is the share.
+//     `--force` destroys without any `--delete` at all: it lets a single
+//     incoming file replace a non-empty directory. All of them are refused
 //     unconditionally today; see [`REFUSED_OPTIONS`] for what has to happen
-//     once the scope model knows `rsync:delete`, and for why the entry is the
-//     bare word `delete` and emphatically not the wildcard `delete*`.
+//     once the scope model knows `rsync:delete`, and for why the delete entry
+//     is the bare word `delete` and emphatically not the wildcard `delete*`.
 //
 //   * `use chroot = yes` — usable since the base image moved to alpine:3.22
 //     (ticket 3f276e8c); on musl 1.2.4 it broke every transfer with exit 23.
@@ -105,7 +110,57 @@ pub const DAEMON_PORT: u16 = 873;
 /// `remove-source-files` has no group and is listed on its own. It points the
 /// other way — it empties the *sender's* directory — and is refused for the
 /// same reason: a pairing grants access to a share, not permission to clear out
-/// whatever is pushed through it.
+/// whatever is pushed through it. Its deprecated alias `remove-sent-files` is
+/// listed as well, because refusal matches the spelling the client sent and not
+/// the option it resolves to: measured on 3.5.0 and 3.4.3, a *push* with
+/// `--remove-sent-files` was **accepted, exit 0** while `--remove-source-files`
+/// was refused. In the pull direction — the one that costs the share its
+/// content — the alias falls into the delete group and was already refused, but
+/// relying on that is relying on an asymmetry nobody wrote down.
+///
+/// # `--force` destroys without any `--delete`
+///
+/// The list above is about deleting. `--force` is not on that list and it does
+/// not need to be there to be lethal: it makes rsync *make way* for an incoming
+/// entry, which means removing a non-empty directory that stands where a file is
+/// being written. Measured on both versions, against a writable module holding
+/// `keep/precious.txt`, with a plain file named `keep` on the sender and **no
+/// delete option whatsoever**:
+///
+/// | client | 3.5.0 (host) | 3.4.3 (`alpine:3.22`, the image) |
+/// |---|---|---|
+/// | `rsync -a` | exit 23, `cannot delete non-empty directory: keep` | exit 23, same |
+/// | `rsync -a --force` | **exit 0, `precious.txt` gone** | **exit 0, `precious.txt` gone** |
+/// | `rsync -a --force` with `force` refused | exit 4, file intact | exit 4, file intact |
+///
+/// The same holds one level deeper (`keep/sub/precious.txt`) and when the
+/// incoming entry is a symlink rather than a file. So `force` is in the list,
+/// and it is there for its own reason — not as a variant of `delete`.
+///
+/// # What was measured and is deliberately *not* refused
+///
+/// Ruled out at the daemon, not from the manual page, on 3.5.0 and 3.4.3:
+///
+/// * `--inplace`, `--partial`, `--delay-updates`, `--temp-dir=…`,
+///   `--partial-dir=../../..` — they change how a file the peer is allowed to
+///   write gets written, and they reached nothing outside the module. A peer
+///   with write access can already overwrite that file with a plain `rsync -a`.
+/// * `--append`, `--append-verify` — the existing longer file was left alone.
+/// * `--backup`, `--backup-dir=…`, `--suffix=…` — they *add* a copy of the
+///   previous version inside the module. Pointed at a directory that already
+///   held a file of the same name, the transfer left both the original and the
+///   would-be backup untouched; nothing was destroyed.
+/// * `--keep-dirlinks` — writes through a directory symlink that already lies
+///   in the share. Under `use chroot = yes` the module root *is* the chroot
+///   root, so the target of such a link cannot be outside it; measured with a
+///   link to a directory above the share, the file there was untouched.
+/// * `--trust-sender`, `--relative ../..` — the sender refuses to build a file
+///   list with a `..` component before anything reaches the daemon.
+/// * `--write-devices` — refused by the daemon on its own (`write devices` is
+///   off by default), so it needs no entry here. Listing it would only add a
+///   line that cannot be shown to do anything.
+/// * `--chmod=F000` — sets the mode of the file it transfers, which is a file
+///   the peer just wrote. It denies access, it does not remove content.
 ///
 /// # Once the scope model knows `rsync:delete`
 ///
@@ -118,8 +173,8 @@ pub const DAEMON_PORT: u16 = 873;
 /// about. Until then a peer with write access can add and overwrite, never
 /// destroy: that is the whole point, since a write-only peer being able to wipe
 /// somebody else's share is data loss, not merely an excess of rights.
-pub const REFUSED_OPTIONS: &str =
-    "copy-links copy-dirlinks copy-unsafe-links delete remove-source-files";
+pub const REFUSED_OPTIONS: &str = "copy-links copy-dirlinks copy-unsafe-links delete \
+     remove-source-files remove-sent-files force";
 
 /// Literal marker at the front of every per-file line the daemon writes.
 ///
@@ -210,12 +265,64 @@ const RUN_DIR_WARN_REPEAT: Duration = Duration::from_secs(15 * 60);
 /// unrelated earlier connection is not silently adopted.
 const STUNNEL_MATCH_WINDOW: Duration = Duration::from_secs(30);
 
+// ---------------------------------------------------------------------------
+// What stands between a peer and somebody else's share (ticket 4292d027)
+//
+// There are exactly three things, and it is worth writing down which, because
+// the obvious fourth one does not exist here.
+//
+//   1. **The module name is unguessable and not enumerable.** 64 bits of
+//      randomness behind a fixed prefix, derived from nothing about the share,
+//      plus `list = no` in every module — without that line
+//      `rsync rsync://host/` hands out every module name anonymously and
+//      before any authentication, and then nobody has to guess.
+//   2. **The secret is 256 bits.** rsync's challenge-response runs on md5 in
+//      the image (`auth digest` needs an rsync built against openssl-crypto,
+//      Alpine builds without), so the entropy of the secret is what carries
+//      the authentication, together with TLS over the exchange.
+//   3. **`max connections` per module**, which the daemon itself enforces and
+//      which is measured in `secrets_and_limits_on_the_real_daemon`. It counts
+//      connections open at the same time, not transfers over time, so a peer
+//      pushing many small files in sequence cannot lock itself out with it.
+//
+// The fourth one — throttling a peer that keeps guessing — has **no place to
+// live in this module**, and pretending otherwise would be worse than saying
+// so. Every connection arrives from `127.0.0.1` through stunnel; the daemon
+// never sees the peer address, so an address-based limit either matches nothing
+// or matches everybody, and the second kind is a lever an attacker pulls on
+// purpose to shut the transport for all peers. The real client address is only
+// in the stunnel log, which the application reads *after* the fact (see
+// `StunnelIndex`) — that is enough to record and to alert on, and not enough to
+// refuse a connection with.
+//
+// Rate limits on an authorize and a token endpoint are the other half of the
+// ticket. Those endpoints belong to the OAuth2 provider (ticket 8b1f4477) and
+// do not exist yet; `ResetRateLimiter` in `handlers/auth_web.rs` is the shape
+// they should take, including its note on why a global bucket is the one that
+// actually bites.
+// ---------------------------------------------------------------------------
+
 /// Prefix of a generated module name. Carries no information about the share.
 const MODULE_NAME_PREFIX: &str = "pair";
 /// Random bytes behind the prefix, rendered as hex (16 characters, 64 bits).
 const MODULE_NAME_RANDOM_BYTES: usize = 8;
 /// Entropy of a module secret. The ticket requires at least 32 bytes.
+///
+/// 32 bytes from the OS CSPRNG, rendered as 64 hex characters (see
+/// [`generate_secret`] for why hex and not base64). A secret this size is not
+/// brute-forced offline whatever the daemon's challenge-response is built on —
+/// which matters here, because `auth digest` is not available in the image and
+/// rsync falls back to md5: the entropy of the secret is what carries that,
+/// together with the TLS layer over the exchange.
 const SECRET_BYTES: usize = 32;
+
+/// The floor is a requirement, not a preference, so lowering it must not
+/// compile. A `const` block is the cheapest way to say so — a test could be
+/// deleted along with the change it was guarding.
+const _: () = assert!(
+    SECRET_BYTES >= 32,
+    "a module secret must carry at least 32 bytes of entropy"
+);
 /// Mode for both generated files: owner read/write, nothing else.
 const FILE_MODE: u32 = 0o600;
 
@@ -1261,6 +1368,12 @@ fn verify_mode(path: &Path, expected: u32) -> Result<()> {
 /// The rsync binary, when the caller does not name one.
 pub const DEFAULT_RSYNC_BINARY: &str = "rsync";
 
+/// Daemon parameters that must never be overridden from the command line.
+///
+/// See [`DaemonSettings::check_listen_is_not_overridden`] for what happens when
+/// they are.
+const LISTEN_PARAMS: &[&str] = &["address", "port"];
+
 /// How long a daemon must survive before its restart counter is forgiven.
 const RESTART_BACKOFF_RESET: Duration = Duration::from_secs(60);
 /// First restart delay; doubles per consecutive failure up to the cap.
@@ -1400,9 +1513,55 @@ impl DaemonSettings {
     /// Meant for the probes (`strict modes=no` when the configuration is
     /// bind-mounted from another user). Production settings belong in the
     /// generated configuration, not here.
+    ///
+    /// A dparam that names one of [`LISTEN_PARAMS`] is refused by
+    /// [`DaemonSettings::check_listen_is_not_overridden`] at start; see there
+    /// for the measurement.
     pub fn with_dparam(mut self, param: impl Into<String>) -> Self {
         self.extra_dparams.push(param.into());
         self
+    }
+
+    /// Refuse a dparam that would move the daemon off loopback.
+    ///
+    /// # The measurement this exists for
+    ///
+    /// `address = 127.0.0.1` in the generated configuration is the whole reason
+    /// the plaintext daemon is unreachable and stunnel on 874 is the only way
+    /// in. `--dparam` **overrides it**: measured on the host (rsync 3.5.0),
+    /// the same generated configuration started with
+    /// `--dparam=address=0.0.0.0` gave
+    ///
+    /// ```text
+    /// LISTEN 0 5 0.0.0.0:18690 0.0.0.0:*
+    /// ```
+    ///
+    /// — the rsync protocol, unauthenticated challenge-response over md5, on
+    /// every interface, with no TLS anywhere near it. Nothing in the
+    /// application noticed, because the configuration file still said
+    /// `address = 127.0.0.1` and every existing test reads the file.
+    ///
+    /// So the escape hatch that exists for the probes is closed for these two
+    /// keys. `port` is in the list as well: a daemon on a port the application
+    /// does not know about is a daemon it cannot supervise, check or shut down
+    /// — [`DaemonSettings::with_port`] is the way to move it.
+    ///
+    /// This is the cheap half. The other half does not trust the argument
+    /// vector at all and looks at what the kernel says: see
+    /// [`DaemonHandle::verify_it_listens_on_loopback_only`].
+    fn check_listen_is_not_overridden(&self) -> Result<()> {
+        for param in &self.extra_dparams {
+            let key = param.split('=').next().unwrap_or(param).trim();
+            if LISTEN_PARAMS.contains(&key) {
+                return Err(anyhow!(
+                    "refusing to start the rsync daemon with --dparam={param}: \"{key}\" \
+                     decides where the plaintext daemon can be reached, and it must stay on \
+                     {DAEMON_ADDRESS} behind the TLS terminator — there is no unencrypted \
+                     peer path"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// How old a temp file has to be before the startup sweep removes it.
@@ -2146,6 +2305,121 @@ fn hex_port(address: &str) -> Option<u16> {
     u16::from_str_radix(address.rsplit(':').next()?, 16).ok()
 }
 
+/// The address out of a `/proc/net/tcp` or `/proc/net/tcp6` field.
+///
+/// The kernel prints the address as hexadecimal 32-bit words in **host** byte
+/// order, not in network order: `0100007F:0369` is `127.0.0.1:873`, not
+/// `1.0.0.127`. Reading it the obvious way round turns loopback into a routable
+/// address and back, which is precisely the mistake this parser exists to avoid
+/// making — so the words are taken apart with `to_le_bytes` and reassembled.
+fn hex_address(field: &str) -> Option<IpAddr> {
+    let hex = field.rsplit_once(':')?.0;
+    match hex.len() {
+        8 => {
+            let raw = u32::from_str_radix(hex, 16).ok()?;
+            Some(IpAddr::V4(Ipv4Addr::from(raw.to_le_bytes())))
+        }
+        32 => {
+            let mut bytes = [0u8; 16];
+            for (word, slot) in hex.as_bytes().chunks(8).zip(bytes.chunks_mut(4)) {
+                let word = std::str::from_utf8(word).ok()?;
+                let raw = u32::from_str_radix(word, 16).ok()?;
+                slot.copy_from_slice(&raw.to_le_bytes());
+            }
+            Some(IpAddr::V6(Ipv6Addr::from(bytes)))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `address` is one the outside world can reach us on.
+///
+/// An IPv4-mapped IPv6 address is unwrapped first: a socket on
+/// `::ffff:127.0.0.1` is loopback, and `Ipv6Addr::is_loopback` says it is not.
+fn is_reachable_from_outside(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(v4) => !v4.is_loopback(),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => !v4.is_loopback(),
+            None => !v6.is_loopback(),
+        },
+    }
+}
+
+/// The `st` value `/proc/net/tcp` uses for a listening socket.
+const PROC_TCP_LISTEN: &str = "0A";
+
+/// Every address something is *listening* on `port`, from the two tcp tables.
+///
+/// `None` when neither table could be read at all — a missing `/proc` is a
+/// reason to say so, not to claim the check passed.
+fn listening_addresses(port: u16) -> Option<Vec<IpAddr>> {
+    let mut found = Vec::new();
+    let mut read_one = false;
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(content) = fs::read_to_string(table) else {
+            continue;
+        };
+        read_one = true;
+        found.extend(listeners_in_table(&content, port));
+    }
+    read_one.then_some(found)
+}
+
+/// Whether anything but loopback is listening on `port`.
+///
+/// The body of [`DaemonHandle::verify_it_listens_on_loopback_only`], split off
+/// so that both answers can be produced in an ordinary test: a plain
+/// `TcpListener` on `127.0.0.1:0` and one on `0.0.0.0:0` are enough, no rsync
+/// and no `#[ignore]` needed. A check of this kind that is only ever exercised
+/// on the passing side may as well be `Ok(())`.
+fn loopback_only_verdict(port: u16) -> Result<()> {
+    let Some(addresses) = listening_addresses(port) else {
+        tracing::error!(
+            port,
+            "cannot read /proc/net/tcp, so it is unverified that the rsync daemon is \
+             reachable on loopback only; the plaintext daemon must never be reachable \
+             from outside — stunnel on the TLS port is the only peer path"
+        );
+        return Ok(());
+    };
+    let exposed: Vec<IpAddr> = addresses
+        .into_iter()
+        .filter(|address| is_reachable_from_outside(*address))
+        .collect();
+    if exposed.is_empty() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "the rsync daemon is listening on {exposed:?} as well as {DAEMON_ADDRESS}, so the \
+         plaintext rsync protocol is reachable without TLS; refusing to run it — the only \
+         peer path is the TLS terminator, and port {port} does not belong outside the host"
+    ))
+}
+
+/// The listeners on `port` in one `/proc/net/tcp`-shaped table.
+///
+/// Split out from [`listening_addresses`] so that the parsing can be tested
+/// against a captured table instead of against whatever this machine happens to
+/// have open.
+fn listeners_in_table(content: &str, port: u16) -> Vec<IpAddr> {
+    let mut found = Vec::new();
+    for line in content.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // sl, local_address, rem_address, st, ...
+        let (Some(local), Some(state)) = (fields.get(1), fields.get(3)) else {
+            continue;
+        };
+        if *state != PROC_TCP_LISTEN || hex_port(local) != Some(port) {
+            continue;
+        }
+        if let Some(address) = hex_address(local) {
+            found.push(address);
+        }
+    }
+    found
+}
+
 /// What the application knows about the daemon right now.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct DaemonStatus {
@@ -2254,6 +2528,9 @@ impl DaemonHandle {
         settings: DaemonSettings,
         registry: Arc<TokioMutex<ModuleRegistry>>,
     ) -> Result<Arc<Self>> {
+        // Before anything is created or spawned: a daemon that would come up
+        // reachable from outside must not come up at all.
+        settings.check_listen_is_not_overridden()?;
         fs::create_dir_all(&settings.run_dir).with_context(|| {
             format!(
                 "cannot create the daemon run directory {}",
@@ -2305,7 +2582,39 @@ impl DaemonHandle {
         )));
 
         handle.wait_until_listening().await?;
+        // It answers on loopback — that says nothing about where else it
+        // answers. Ask the kernel, and take the daemon down again if the answer
+        // is wrong.
+        if let Err(error) = handle.verify_it_listens_on_loopback_only().await {
+            handle.shutdown().await;
+            return Err(error);
+        }
         Ok(handle)
+    }
+
+    /// Refuse a daemon that is reachable from anywhere but loopback.
+    ///
+    /// TLS is not the default for a peer connection, it is the only one: the
+    /// daemon speaks rsync's own challenge-response in the clear, stunnel on
+    /// 874 terminates TLS in front of it, and port 873 is not published. The
+    /// three things that hold that together are `address = 127.0.0.1` in the
+    /// generated configuration, the absence of an `--dparam=address=…` (see
+    /// [`DaemonSettings::check_listen_is_not_overridden`]) and the container not
+    /// mapping the port.
+    ///
+    /// All three are statements about *inputs*. This one is about the outcome:
+    /// `/proc/net/tcp` and `/proc/net/tcp6` are asked which addresses something
+    /// is listening on our port, and anything that is not loopback aborts the
+    /// start. It therefore also catches what the two checks above cannot — a
+    /// future rsync that ignores `address`, a hand-edited configuration file, a
+    /// second process squatting the port on a routable interface.
+    ///
+    /// A `/proc` that cannot be read at all is reported and let through. The
+    /// alternative is refusing to run the transport wherever `/proc` is not
+    /// mounted, which would break the deployment over a check rather than over
+    /// a finding — and the two input-side guarantees still stand there.
+    async fn verify_it_listens_on_loopback_only(&self) -> Result<()> {
+        loopback_only_verdict(self.settings.port)
     }
 
     /// The current status, for the configuration display.
@@ -4105,7 +4414,7 @@ mod tests {
              \x20   max connections = 4\n\
              \x20   temp dir = /.rsync-tmp\n\
              \x20   refuse options = copy-links copy-dirlinks copy-unsafe-links delete \
-             remove-source-files\n\
+             remove-source-files remove-sent-files force\n\
              \x20   transfer logging = yes\n\
              \x20   log format = rclone-gui-audit %a %u %m %o %l %b %f\n",
             name = module.name(),
@@ -4170,7 +4479,7 @@ mod tests {
         let conf = cfg.render_conf().unwrap();
         assert!(conf.contains(
             "    refuse options = copy-links copy-dirlinks copy-unsafe-links delete \
-             remove-source-files\n"
+             remove-source-files remove-sent-files force\n"
         ));
         assert!(conf.contains("    use chroot = yes\n"));
         assert!(conf.contains("    munge symlinks = yes\n"));
@@ -4183,7 +4492,430 @@ mod tests {
         fs::remove_dir_all(&base).ok();
     }
 
-    /// A write-only peer must not be able to destroy anything.
+    /// Whether a rendered configuration mentions `insecure links` at all.
+    ///
+    /// Written as a function rather than inlined so that the test below can
+    /// point it at a configuration that *does* set the parameter and show that
+    /// it says so. A check that has never been seen to fire is not a check —
+    /// and "the string is absent" is exactly the shape of assertion that stays
+    /// green after somebody renames the thing it was looking for.
+    fn mentions_insecure_links(conf: &str) -> bool {
+        conf.lines()
+            .any(|line| line.trim_start().starts_with("insecure links"))
+    }
+
+    /// `insecure links` must not appear in a generated configuration.
+    ///
+    /// # What the parameter does, measured
+    ///
+    /// rsync 3.5.0 resolves the paths of a served module with a symlink-race
+    /// defence that is on by default: it follows a symlink component only when
+    /// that component belongs to uid 0 or to the module's own uid, and refuses
+    /// one planted by anybody else. `insecure links = yes` turns that off for
+    /// the module and restores the pre-hardening behaviour (the man page names
+    /// CVE-2026-53797 and CVE-2026-53801).
+    ///
+    /// Measured on the host (rsync 3.5.0) with a module whose share held
+    /// `passwd.link -> /etc/passwd`, `use chroot = no`, `munge symlinks = no`
+    /// and no `refuse options` — so nothing but this one parameter separated the
+    /// two runs:
+    ///
+    /// | `insecure links` | `rsync -aL <module>/ dst/` |
+    /// |---|---|
+    /// | not set (default) | `failed to open "passwd.link": Too many levels of symbolic links (40)`, nothing leaked |
+    /// | `yes` | **2597 bytes of `/etc/passwd` in `dst/passwd.link`** |
+    ///
+    /// The parameter does not exist in rsync 3.4.3, which is what the image
+    /// ships: setting it there would produce `Unknown Parameter encountered`
+    /// and protect nothing. Not setting it is therefore right on both versions,
+    /// and this test is what keeps it that way.
+    ///
+    /// The end-to-end half of this — the leak actually happening once the
+    /// parameter is set — is `module_boundaries_on_the_real_daemon`.
+    #[test]
+    fn no_module_ever_carries_insecure_links() {
+        let base = scratch("insecure-links");
+        let share = base.join("share");
+        fs::create_dir_all(&share).unwrap();
+
+        for writable in [true, false] {
+            let mut cfg = DaemonConfig::new("/etc/rsyncd/secrets");
+            cfg.add_module(module_in(&share, writable));
+            cfg.set_log_file(base.join("daemon.log"));
+            let conf = cfg.render_conf().unwrap();
+            assert!(
+                !mentions_insecure_links(&conf),
+                "a generated module carries \"insecure links\" (writable={writable}):\n{conf}"
+            );
+            // The whole `refuse options` list is what stops a client from
+            // asking for the same effect from the outside.
+            assert!(conf.contains(&format!("    refuse options = {REFUSED_OPTIONS}\n")));
+        }
+
+        // The counter-proof: the same check, aimed at a configuration that does
+        // set the parameter, has to notice.
+        assert!(
+            mentions_insecure_links("[m]\n    path = /srv\n    insecure links = yes\n"),
+            "the check cannot see the parameter it exists to forbid"
+        );
+        fs::remove_dir_all(&base).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // Secrets, rate limits and the TLS obligation (ticket 4292d027)
+    // -----------------------------------------------------------------------
+
+    /// No `Debug` or `Serialize` in this module may print a module secret.
+    ///
+    /// # Why this is a test and not a code review
+    ///
+    /// `derive(Debug)` on a type that holds a secret has been found in this
+    /// project **six** times (`LoginOutcome`, `ModuleConfig`, `RcloneConfig`,
+    /// `ConfigRequest`, `NewShare`, `SessionRefresh`). Twice the series was
+    /// declared closed after somebody searched `src/**` by hand, and twice the
+    /// next ticket added another one: a hand search cannot cover a type that
+    /// does not exist yet.
+    ///
+    /// So this does not search, it *asks*. Every type in this module that
+    /// carries a secret, or carries something that carries one, is formatted
+    /// here with a secret whose value the test knows, and the output has to not
+    /// contain it. A new field on any of them is covered the moment it is
+    /// added; a new type is one line here.
+    ///
+    /// The counter-proof is at the end: the same check, aimed at a type that
+    /// really does print its secret, has to notice.
+    #[test]
+    fn nothing_in_this_module_can_print_a_module_secret() {
+        let base = scratch("no-secret-in-debug");
+        let share = base.join("share");
+        fs::create_dir_all(&share).unwrap();
+
+        let module = module_in(&share, true);
+        let secret = module.secret().to_string();
+        assert_eq!(
+            secret.len(),
+            SECRET_BYTES * 2,
+            "the fixture is the real thing"
+        );
+
+        let mut config = DaemonConfig::new(base.join("etc").join("secrets"));
+        config.add_module(module.clone());
+        config.set_log_file(base.join("daemon.log"));
+
+        let settings = DaemonSettings::new(base.join("etc").join("rsyncd.conf"), base.join("run"));
+        let status = DaemonStatus {
+            running: true,
+            pid: Some(1),
+            address: DAEMON_ADDRESS.to_string(),
+            port: DAEMON_PORT,
+            modules: vec![module.name().to_string()],
+            active_modules: vec![module.name().to_string()],
+            connections: 1,
+            restarts: 0,
+            already_running_elsewhere: false,
+            zombie_children: 0,
+            last_error: None,
+        };
+        let event = AuditEvent {
+            at: "2026/08/25 17:00:00".to_string(),
+            pid: 1,
+            module: Some(module.name().to_string()),
+            user: Some(module.name().to_string()),
+            client: Some("192.0.2.7".to_string()),
+            client_port: Some(4711),
+            client_source: ClientAddressSource::StunnelPort,
+            action: AuditAction::AccessGranted,
+            destructive: false,
+            path: None,
+            size: None,
+            refused_option: None,
+            detail: "rsync allowed access on module".to_string(),
+        };
+        let session = Session {
+            module: Some(module.name().to_string()),
+            user: Some(module.name().to_string()),
+            client: Some("192.0.2.7".to_string()),
+            client_port: Some(4711),
+            client_source: Some(ClientAddressSource::StunnelPort),
+        };
+
+        // `{:?}` for everything, and `serde_json` on top for the types that are
+        // serialised into the status API — a redacted `Debug` and a derived
+        // `Serialize` on the same type would still put the secret on the wire.
+        // The flag says whether this rendering is *about* a module. Where it
+        // is, the module name has to show up: "no secret in it" would otherwise
+        // also hold for an empty string, and two of these renderings really do
+        // not mention a module at all.
+        let rendered: Vec<(&str, String, bool)> = vec![
+            ("ModuleConfig", format!("{module:?}"), true),
+            ("DaemonConfig", format!("{config:?}"), true),
+            ("DaemonStatus", format!("{status:?}"), true),
+            ("AuditEvent", format!("{event:?}"), true),
+            ("Session", format!("{session:?}"), true),
+            // ... and the configuration file, which the secret is deliberately
+            // kept out of — it lives in the secrets file next to it.
+            ("render_conf", config.render_conf().unwrap(), true),
+            (
+                "DaemonStatus as json",
+                serde_json::to_string(&status).unwrap(),
+                true,
+            ),
+            (
+                "AuditEvent as json",
+                serde_json::to_string(&event).unwrap(),
+                true,
+            ),
+            ("DaemonSettings", format!("{settings:?}"), false),
+            (
+                "RevokeOutcome",
+                format!(
+                    "{:?}",
+                    RevokeOutcome {
+                        module_removed: true,
+                        connections_terminated: 1,
+                    }
+                ),
+                false,
+            ),
+            // `argv` is world-readable through `/proc/<pid>/cmdline` for every
+            // user on the host, which is why the secret travels in a 0600 file
+            // and never on the command line.
+            ("DaemonSettings::argv", settings.argv().join(" "), false),
+        ];
+
+        for (what, output, about_a_module) in &rendered {
+            assert!(
+                !output.contains(&secret),
+                "{what} printed the module secret: {output}"
+            );
+            if *about_a_module {
+                assert!(
+                    output.contains(module.name()),
+                    "{what} does not mention the module at all, so finding no secret \
+                     in it says nothing: {output}"
+                );
+            }
+        }
+
+        // The secret is in exactly one rendering, and that one is written to a
+        // 0600 file and to nothing else.
+        assert!(config.render_secrets().unwrap().contains(&secret));
+
+        // The counter-proof: a type that does print its secret has to be
+        // caught by the same test.
+        #[derive(Debug)]
+        struct Leaky {
+            name: String,
+            secret: String,
+        }
+        let leaky = format!(
+            "{:?}",
+            Leaky {
+                name: module.name().to_string(),
+                secret: secret.clone(),
+            }
+        );
+        assert!(
+            leaky.contains(&secret),
+            "the check cannot see a secret even when it is printed"
+        );
+
+        fs::remove_dir_all(&base).ok();
+    }
+
+    /// `max connections` is per module, is always rendered, and is the one
+    /// number the daemon itself enforces.
+    ///
+    /// The enforcement is measured against a real daemon in
+    /// `secrets_and_limits_on_the_real_daemon`; what is checked here is that
+    /// the value reaches the configuration at all and cannot be zero — a module
+    /// without the parameter has no limit, and `max connections = 0` means
+    /// *unlimited* in rsync, not "closed".
+    #[test]
+    fn every_module_carries_a_connection_limit() {
+        let base = scratch("conn-limit");
+        let share = base.join("share");
+        fs::create_dir_all(&share).unwrap();
+
+        for limit in [1u32, 4, 64] {
+            let mut cfg = DaemonConfig::new("/etc/rsyncd/secrets");
+            cfg.add_module(ModuleConfig::new(&share, true, 1001, 1001, limit).unwrap());
+            let conf = cfg.render_conf().unwrap();
+            assert!(
+                conf.contains(&format!("    max connections = {limit}\n")),
+                "the limit {limit} did not reach the configuration:\n{conf}"
+            );
+        }
+        // Zero is refused rather than written: rsync reads it as "no limit".
+        assert!(ModuleConfig::new(&share, true, 1001, 1001, 0).is_err());
+        fs::remove_dir_all(&base).ok();
+    }
+
+    /// A `--dparam` must not be able to move the daemon off loopback.
+    ///
+    /// Measured before this check existed: the shipped configuration started
+    /// with `--dparam=address=0.0.0.0` listened on `0.0.0.0:<port>` — the
+    /// plaintext rsync protocol on every interface — while the configuration
+    /// file still said `address = 127.0.0.1` and every test that read the file
+    /// stayed green. See
+    /// [`DaemonSettings::check_listen_is_not_overridden`].
+    #[test]
+    fn a_dparam_cannot_move_the_daemon_off_loopback() {
+        let base = scratch("dparam-listen");
+        let conf = base.join("rsyncd.conf");
+        let run = base.join("run");
+
+        for param in [
+            "address=0.0.0.0",
+            "address = 0.0.0.0",
+            "address=::",
+            "port=8873",
+        ] {
+            let settings = DaemonSettings::new(&conf, &run).with_dparam(param);
+            let error = settings
+                .check_listen_is_not_overridden()
+                .expect_err(&format!("--dparam={param} was accepted"));
+            assert!(
+                error.to_string().contains("TLS terminator"),
+                "the refusal has to say why: {error}"
+            );
+        }
+
+        // And the one the probes actually need is still allowed, or the check
+        // would have closed the door on the tests that measure everything else.
+        let settings = DaemonSettings::new(&conf, &run)
+            .with_dparam("strict modes=no")
+            .with_dparam("lock file=/tmp/x");
+        assert!(settings.check_listen_is_not_overridden().is_ok());
+        fs::remove_dir_all(&base).ok();
+    }
+
+    /// `/proc/net/tcp` prints addresses in host byte order, and reading them the
+    /// other way round turns loopback into a routable address.
+    ///
+    /// The two tables are real captures: `0100007F` is `127.0.0.1` and
+    /// `00000000` is `0.0.0.0`; in the v6 table the all-zero address is `::`
+    /// and the trailing `01000000` word is `::1`.
+    #[test]
+    fn a_proc_net_tcp_address_is_read_in_host_byte_order() {
+        assert_eq!(
+            hex_address("0100007F:0369"),
+            Some(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))),
+            "127.0.0.1 was misread; a byte-swapped loopback address reads as routable"
+        );
+        assert_eq!(
+            hex_address("00000000:0369"),
+            Some(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+        );
+        assert_eq!(
+            hex_address("0000000000000000FFFF00000100007F:0369"),
+            Some(IpAddr::V6("::ffff:127.0.0.1".parse().unwrap()))
+        );
+        assert_eq!(hex_address("nonsense"), None);
+        assert_eq!(hex_address("0100007F"), None);
+
+        assert!(!is_reachable_from_outside(IpAddr::V4(Ipv4Addr::new(
+            127, 0, 0, 1
+        ))));
+        assert!(!is_reachable_from_outside(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        // The one `Ipv6Addr::is_loopback` gets wrong on its own.
+        assert!(!is_reachable_from_outside(IpAddr::V6(
+            "::ffff:127.0.0.1".parse().unwrap()
+        )));
+        assert!(is_reachable_from_outside(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+        assert!(is_reachable_from_outside(IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
+        assert!(is_reachable_from_outside(IpAddr::V4(Ipv4Addr::new(
+            192, 0, 2, 7
+        ))));
+
+        // Only sockets in state 0A are listeners; an established connection to
+        // the same port must not be mistaken for one.
+        let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n\
+                      0: 0100007F:0369 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 12345 1\n\
+                      1: 00000000:0369 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 12346 1\n\
+                      2: 0100007F:1F90 0100007F:C000 01 00000000:00000000 00:00000000 00000000  1000        0 12347 1\n";
+        let found = listeners_in_table(table, 873);
+        assert_eq!(
+            found,
+            vec![
+                IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+                IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+            ],
+            "the table was parsed wrongly: {found:?}"
+        );
+        assert!(
+            listeners_in_table(table, 8080).is_empty(),
+            "a connection in state 01 was counted as a listener"
+        );
+    }
+
+    /// The loopback check against the kernel, with both answers.
+    ///
+    /// No rsync involved: a plain `TcpListener` is enough to show that the check
+    /// says "loopback only" for a loopback socket and "reachable from outside"
+    /// for one on `0.0.0.0`. Without the second half the check could be
+    /// hard-wired to `Ok(())` and this test would not notice.
+    #[test]
+    fn the_loopback_check_reads_the_real_listening_socket() {
+        let loopback = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback listener");
+        let port = loopback.local_addr().unwrap().port();
+        let found = listening_addresses(port).expect("/proc/net/tcp is readable here");
+        assert!(
+            !found.is_empty(),
+            "the check found no listener on a port that is definitely open"
+        );
+        assert!(
+            !found.iter().copied().any(is_reachable_from_outside),
+            "a socket bound to 127.0.0.1 was reported as reachable: {found:?}"
+        );
+        assert!(
+            loopback_only_verdict(port).is_ok(),
+            "a loopback-only port was refused, which would stop every start"
+        );
+        drop(loopback);
+
+        // The counter-proof, on a fresh port so the one above cannot linger.
+        let anywhere = std::net::TcpListener::bind("0.0.0.0:0").expect("wildcard listener");
+        let port = anywhere.local_addr().unwrap().port();
+        let found = listening_addresses(port).expect("/proc/net/tcp is readable here");
+        assert!(
+            found.iter().copied().any(is_reachable_from_outside),
+            "a socket bound to 0.0.0.0 was reported as loopback-only, so the check \
+             cannot detect an exposed daemon: {found:?}"
+        );
+        // The verdict the start actually asks for, on the same port.
+        let error = loopback_only_verdict(port)
+            .expect_err("a wildcard socket on the daemon port has to abort the start");
+        assert!(
+            error.to_string().contains("without TLS"),
+            "the refusal has to say what is wrong with it: {error}"
+        );
+        drop(anywhere);
+    }
+
+    /// Every option *measured* to destroy content is on the refusal list.
+    ///
+    /// # The name of this test used to promise more than it delivered
+    ///
+    /// It was called `every_module_refuses_every_way_of_deleting`, and it read
+    /// the constant — a string — so the only thing it could ever establish is
+    /// which words are in a list. It said "every way", a tester went looking for
+    /// the ways it did not name, and found `--force`: a peer with nothing but
+    /// write access replaced a non-empty directory with a file and took
+    /// `precious.txt` with it, exit 0, empty stderr, no `--delete` anywhere.
+    ///
+    /// A test that claims completeness it cannot check is worse than one that
+    /// lists what was checked, because the claim is what stops the next person
+    /// from looking. So the name now says what this is: the *ledger* of the
+    /// options that were measured against a real daemon. The measuring itself
+    /// happens in [`module_boundaries_on_the_real_daemon`], where every entry
+    /// below is fired at a live module and the [`WeakDaemon`] counter-proof
+    /// shows the same option destroying content when the refusal is absent.
+    ///
+    /// Adding a spelling here without measuring it first is the failure mode
+    /// this comment exists to prevent: `remove-sent-files` looked redundant
+    /// next to `remove-source-files` and was not — a push carrying the alias
+    /// came back exit 0 on both versions.
     ///
     /// The exact spelling matters and is measured, not assumed: see the note on
     /// [`REFUSED_OPTIONS`]. A wildcard `delete*` lets `--delete-missing-args`
@@ -4191,7 +4923,7 @@ mod tests {
     /// bare word — and must keep carrying it after somebody decides the list
     /// looks repetitive.
     #[test]
-    fn every_module_refuses_every_way_of_deleting() {
+    fn every_module_refuses_the_options_measured_to_destroy_content() {
         let base = scratch("refuse-delete");
         let share = base.join("share");
         fs::create_dir_all(&share).unwrap();
@@ -4210,10 +4942,33 @@ mod tests {
             "a wildcard entry replaces rsync's delete group refusal with a plain \
              name match and lets --delete-missing-args through: {REFUSED_OPTIONS}"
         );
-        assert!(
-            refused.contains(&"remove-source-files"),
-            "--remove-source-files empties the sender's directory and has no group"
-        );
+        // The ledger. Every line names what the option did to a live module
+        // when it was *not* refused; nothing is on the list on the strength of
+        // the manual page alone.
+        for (option, measured) in [
+            (
+                "remove-source-files",
+                "empties the sender's directory, which is the share when the \
+                 module is the sender; has no group",
+            ),
+            (
+                "remove-sent-files",
+                "deprecated alias of --remove-source-files that the refusal for \
+                 the modern spelling does not cover: a push carrying it came \
+                 back exit 0 on 3.5.0 and 3.4.3",
+            ),
+            (
+                "force",
+                "lets an incoming file replace a non-empty directory with no \
+                 delete option present at all: exit 0, empty stderr, the file \
+                 inside the directory gone, on 3.5.0 and 3.4.3",
+            ),
+        ] {
+            assert!(
+                refused.contains(&option),
+                "--{option} is missing from the refusal list; measured: it {measured}"
+            );
+        }
         // A read-only module gets the same list; refusing deletes is not a
         // consequence of the write scope, it is unconditional until the scope
         // model knows `rsync:delete`.
@@ -5952,6 +6707,13 @@ mod real_rsync_probe {
             };
             let child = command
                 .args(args)
+                // `/dev/null`, not the test harness's stdin: `rsync --daemon`
+                // inspects fd 0 and serves a single connection from it instead
+                // of listening when it is a socket. See the note above
+                // `DaemonSettings`. Inherited stdin made this harness fail as
+                // `malformed address localhost` / `connect from UNKNOWN`
+                // depending on how `cargo test` was invoked.
+                .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()
@@ -6484,7 +7246,15 @@ mod real_rsync_probe {
         assert!(out.status.success(), "first push: {}", stderr(&out));
         assert!(probe.path("share/f.txt").exists());
 
-        // --- 2. every way of deleting is refused, the share survives ---------
+        // --- 2. every measured way of destroying is refused, the share survives
+        // `--force` is on the list although it is not a delete option: it lets
+        // an incoming file take the place of a non-empty directory, which
+        // removed a file in the share with exit 0 and empty stderr before
+        // `force` went into [`REFUSED_OPTIONS`]. The three shapes of that attack
+        // are exercised against a prepared directory in
+        // `module_boundaries_on_the_real_daemon`; here it is only the refusal.
+        // `--remove-sent-files` is the deprecated alias that the refusal for
+        // `--remove-source-files` does not cover on a push.
         for option in [
             "--delete",
             "--delete-before",
@@ -6494,7 +7264,9 @@ mod real_rsync_probe {
             "--delete-excluded",
             "--delete-missing-args",
             "--remove-source-files",
+            "--remove-sent-files",
             "--del",
+            "--force",
         ] {
             let out = probe.client(&[option], &a, &small);
             assert!(
@@ -7093,5 +7865,1120 @@ mod real_rsync_probe {
         );
         daemon.shutdown().await;
         let _ = fs::remove_dir_all(&probe.base);
+    }
+
+    // -----------------------------------------------------------------------
+    // Secrets and the connection limit against a real daemon (ticket 4292d027)
+    //
+    //     RSYNCD_PROBE_DIR=<scratch>/rsyncd-4292d027 \
+    //       cargo test secrets_and_limits_on_the_real_daemon -- --ignored --nocapture
+    //
+    // Two claims that can only be checked while a daemon is actually running:
+    //
+    //   1. the module secret is in the 0600 secrets file and **nowhere else** —
+    //      not in `/proc/<pid>/cmdline` of the daemon or of any connection
+    //      child (world-readable for every user on the host), not in the daemon
+    //      log, not in the configuration file
+    //   2. `max connections` is enforced by the daemon, and it is enforced on
+    //      *concurrency* — so a peer with many small transfers one after
+    //      another cannot lock itself out with it
+    //
+    // Every "the secret is not in X" below is paired with something that *is*
+    // in X, so that an empty file or an unreadable path cannot pass as a clean
+    // result. That pairing is the whole reason this probe is longer than it
+    // looks like it needs to be.
+    // -----------------------------------------------------------------------
+
+    /// Every live child of `pid`, from `/proc`.
+    fn children_of(parent: u32) -> Vec<u32> {
+        let Ok(entries) = fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
+            .filter(|pid| is_child_of(*pid, parent))
+            .collect()
+    }
+
+    /// `/proc/<pid>/cmdline` as a readable string, or `None`.
+    fn cmdline_of(pid: u32) -> Option<String> {
+        let raw = fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        Some(
+            raw.split(|byte| *byte == 0)
+                .map(|part| String::from_utf8_lossy(part).into_owned())
+                .collect::<Vec<String>>()
+                .join(" "),
+        )
+    }
+
+    #[test]
+    #[ignore]
+    fn secrets_and_limits_on_the_real_daemon() {
+        let mut probe = Probe::new(Backend::Host);
+        let (uid, gid) = (probe.uid, probe.gid);
+
+        let small = probe.path("src/f.txt");
+        fs::write(&small, "hello\n").unwrap();
+        // Big enough that three pushes overlap under `--bwlimit`, small enough
+        // that the whole probe stays under half a minute: 3 MiB at 512 KiB/s is
+        // about six seconds per transfer.
+        let big = probe.path("src/big.bin");
+        fs::write(&big, vec![b'x'; 3 * 1024 * 1024]).unwrap();
+
+        let conf_path = probe.path("etc/rsyncd.conf");
+        let secrets_path = probe.path("etc/secrets");
+        let mut registry = ModuleRegistry::new(&conf_path, &secrets_path);
+        // Two concurrent connections, so the limit can be reached with three
+        // clients rather than with a crowd.
+        let limit = 2u32;
+        let module = registry
+            .add_pairing(&probe.share("share"), true, uid, gid, limit)
+            .expect("pairing");
+        let secret = module.secret().to_string();
+        probe.start_daemon();
+
+        let daemon_pid = probe.daemon.as_ref().expect("the daemon is running").id();
+
+        // --- 1. the secret is in one file and nowhere else -------------------
+        // The control first: the file that is *supposed* to hold it does, with
+        // mode 0600. Without this the four "not in X" checks below would also
+        // pass if `generate_secret` had returned an empty string.
+        let secrets = fs::read_to_string(&secrets_path).expect("the secrets file");
+        assert!(
+            secrets.contains(&secret),
+            "the secrets file does not hold the secret, so nothing below means anything"
+        );
+        assert_eq!(
+            fs::metadata(&secrets_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        // The argument vector, of the daemon and of every child it forks. This
+        // is the one that matters most: `/proc/<pid>/cmdline` is readable by
+        // every user on the host, so a secret passed on the command line is
+        // public for as long as the process lives.
+        let mut checked = 0usize;
+        let daemon_cmdline = cmdline_of(daemon_pid).expect("the daemon's own cmdline");
+        assert!(
+            daemon_cmdline.contains(&conf_path.display().to_string()),
+            "this is not the daemon's command line, so reading it proves nothing: \
+             {daemon_cmdline}"
+        );
+        assert!(
+            !daemon_cmdline.contains(&secret),
+            "the module secret is in the daemon's command line: {daemon_cmdline}"
+        );
+        checked += 1;
+
+        // A connection child, caught while it is serving: it inherits the
+        // daemon's argv, but a future change that hands a child anything of its
+        // own would show up here.
+        let running = probe.client_in_background(
+            &["--bwlimit=512K", "--no-owner", "--no-group"],
+            &module,
+            &big,
+        );
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut seen_child = false;
+        while Instant::now() < deadline {
+            let children = children_of(daemon_pid);
+            if !children.is_empty() {
+                for child in children {
+                    if let Some(cmdline) = cmdline_of(child) {
+                        assert!(
+                            !cmdline.contains(&secret),
+                            "the module secret is in the command line of connection \
+                             child {child}: {cmdline}"
+                        );
+                        checked += 1;
+                        seen_child = true;
+                    }
+                }
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            seen_child,
+            "no connection child was ever observed, so its command line was not checked"
+        );
+        assert!(checked >= 2, "only {checked} command lines were examined");
+        let out = running.wait_with_output().expect("background client");
+        assert!(out.status.success(), "push: {}", stderr(&out));
+
+        // The configuration file the daemon reads, and its own log.
+        let conf = fs::read_to_string(&conf_path).expect("the configuration");
+        assert!(
+            conf.contains(module.name()),
+            "the configuration does not name the module: {conf}"
+        );
+        assert!(
+            !conf.contains(&secret),
+            "the module secret is in rsyncd.conf, which is not the file with the \
+             restricted mode: {conf}"
+        );
+
+        let log = probe.daemon_log();
+        assert!(
+            log.contains(module.name()),
+            "the daemon log does not mention the module, so searching it for the \
+             secret proves nothing:\n{log}"
+        );
+        assert!(
+            !log.contains(&secret),
+            "the module secret reached the daemon log:\n{log}"
+        );
+
+        // --- 2. the connection limit ----------------------------------------
+        // `max connections` needs the lock file the daemon was started with;
+        // without one rsync falls back to `/var/run/rsyncd.lock` and the limit
+        // silently does nothing. That is why `DaemonSettings` passes one.
+        let mut concurrent: Vec<Child> = (0..(limit + 1))
+            .map(|_| {
+                probe.client_in_background(
+                    &["--bwlimit=512K", "--no-owner", "--no-group"],
+                    &module,
+                    &big,
+                )
+            })
+            .collect();
+        let mut refused = 0usize;
+        let mut succeeded = 0usize;
+        for client in concurrent.drain(..) {
+            let out = client.wait_with_output().expect("concurrent client");
+            if out.status.success() {
+                succeeded += 1;
+            } else if stderr(&out).contains(&format!("max connections ({limit}) reached")) {
+                refused += 1;
+            } else {
+                panic!("a client failed for an unrelated reason: {}", stderr(&out));
+            }
+        }
+        assert!(
+            refused >= 1,
+            "{} clients ran against a module with max connections = {limit} and none \
+             was refused; the limit is not being enforced",
+            limit + 1
+        );
+        assert!(
+            succeeded >= 1,
+            "the limit refused every client, which is a closed module and not a limit"
+        );
+        println!("max connections = {limit}: {succeeded} served, {refused} refused");
+
+        // And the other half, which is what keeps the limit from being a foot
+        // gun: it counts connections that are open at the same time, not
+        // transfers over time. Ten small pushes in a row — the shape of a
+        // legitimate peer syncing many small files — must all get through.
+        for round in 0..10 {
+            let out = probe.client(&["--no-owner", "--no-group"], &module, &small);
+            assert!(
+                out.status.success(),
+                "sequential transfer {round} was refused, so a peer with many small \
+                 transfers locks itself out: {}",
+                stderr(&out)
+            );
+        }
+
+        // --- 3. loopback only, according to the kernel ----------------------
+        let addresses = listening_addresses(probe.port).expect("/proc/net/tcp is readable here");
+        assert!(
+            !addresses.is_empty(),
+            "the daemon is serving clients, so it has to appear in /proc/net/tcp"
+        );
+        assert!(
+            loopback_only_verdict(probe.port).is_ok(),
+            "the shipped configuration produced a daemon that is reachable from \
+             outside: {addresses:?}"
+        );
+
+        probe.stop();
+        let _ = fs::remove_dir_all(&probe.base);
+    }
+
+    /// A daemon that would come up reachable from outside must not come up.
+    ///
+    ///     RSYNCD_PROBE_DIR=<dir> \
+    ///       cargo test the_daemon_refuses_to_come_up_without_tls -- --ignored
+    ///
+    /// The unit tests cover the two halves of the check separately (the dparam
+    /// guard, and the verdict against a real listening socket). This is the one
+    /// that shows `DaemonHandle::start` actually asks: the same settings that
+    /// start a daemon fine are given `--dparam=address=0.0.0.0`, and the start
+    /// has to fail — with no daemon left behind, because a refusal that leaves
+    /// the thing it refused running would be worse than no check.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn the_daemon_refuses_to_come_up_without_tls() {
+        let probe = LifecycleProbe::new();
+        let registry = Arc::new(TokioMutex::new(ModuleRegistry::new(
+            probe.path("etc/rsyncd.conf"),
+            probe.path("etc/secrets"),
+        )));
+        registry
+            .lock()
+            .await
+            .add_pairing(&probe.share("share"), true, 0, 0, 4)
+            .expect("pairing");
+
+        // The control: these settings do start a daemon. Without it a refusal
+        // below could just as well be a broken fixture.
+        let daemon = DaemonHandle::start(probe.settings(), Arc::clone(&registry))
+            .await
+            .expect("the unmodified settings must start a daemon");
+        let pid = daemon.status().await.pid.expect("pid");
+        daemon.shutdown().await;
+        until(
+            "the control daemon to be gone",
+            Duration::from_secs(30),
+            || !process_alive(pid),
+        )
+        .await;
+
+        // And the same settings with the listen address overridden do not.
+        for param in ["address=0.0.0.0", "port=1", "address=::"] {
+            let error = match DaemonHandle::start(
+                probe.settings().with_dparam(param),
+                Arc::clone(&registry),
+            )
+            .await
+            {
+                Ok(_) => panic!("a daemon with --dparam={param} must not start"),
+                Err(error) => error.to_string(),
+            };
+            assert!(
+                error.contains("TLS terminator"),
+                "the refusal for {param} has to say why: {error}"
+            );
+            // Nothing was started, so nothing holds the pid file: the next
+            // start has to be free to take it.
+            assert!(
+                !probe.path("run/rsyncd.pid").exists()
+                    || fs::read_to_string(probe.path("run/rsyncd.pid"))
+                        .map(|content| pid_file_blocker(Path::new(&content)).is_none())
+                        .unwrap_or(true),
+                "the refused start left a daemon holding the pid file"
+            );
+        }
+
+        // The port is free again afterwards, which is the practical form of
+        // "nothing was left behind".
+        let daemon = DaemonHandle::start(probe.settings(), registry)
+            .await
+            .expect("a start after the refusals must work");
+        let pid = daemon.status().await.pid.expect("pid");
+        daemon.shutdown().await;
+        until("the daemon to be gone", Duration::from_secs(30), || {
+            !process_alive(pid)
+        })
+        .await;
+        let _ = fs::remove_dir_all(&probe.base);
+    }
+
+    // -----------------------------------------------------------------------
+    // Path and module boundaries against a real daemon (ticket 674170ac)
+    //
+    //     RSYNCD_PROBE_DIR=<scratch>/rsyncd-674170ac \
+    //       cargo test module_boundaries_on_the_real_daemon -- --ignored --nocapture
+    //
+    // The unit tests above check what is written into `rsyncd.conf`. A line in
+    // that file is not a boundary: `auth digest` was accepted by every parser
+    // and ignored by rsync, and the spike read `/etc/passwd` out of a module
+    // through a server-side symlink *while* `munge symlinks` was set. So every
+    // boundary here is driven against a daemon that is really running, and the
+    // verdict is always the same one: did the file that lives outside the
+    // module arrive on the client side, yes or no.
+    //
+    // What is measured, and how each measurement is shown to be able to fail:
+    //
+    //   1. a pull of an in-module file (the control — it delivers content
+    //      through the same code path every escape below uses, so a silently
+    //      broken harness cannot pass as "nothing escaped")
+    //   2. `..` and `../../etc/passwd` in the requested path
+    //   3. an absolute path instead of a module name
+    //   4. a **server-side** symlink out of the module, read with `-L`,
+    //      `--copy-links`, `--copy-unsafe-links` and `--copy-dirlinks`
+    //   5. the same symlinks on a plain pull: they come across as symlinks,
+    //      never as the content behind them
+    //   6. an unknown module name
+    //   7. `list = no`: the module names are not enumerable
+    //   8. an **uploaded** symlink is stored munged, so the daemon cannot
+    //      follow it later
+    //   9. `--delete` and `--remove-source-files`
+    //
+    // and then, on a second daemon, the counter-proof: the same attacks against
+    // a module with `use chroot = no`, `munge symlinks = no`,
+    // `insecure links = yes`, `list = yes` and no `refuse options` **succeed**,
+    // `/etc/passwd` included. Without that half, "nothing leaked" would only
+    // mean the harness never leaks anything.
+    //
+    // Two of the nine are honest exceptions and are marked as such below:
+    // rsync refuses `..` and an absolute path itself, in **both**
+    // configurations, so no configuration change can make those two
+    // assertions fail. Their ability to fail rests on the control in 1.
+    // -----------------------------------------------------------------------
+
+    /// A file that lives outside the module and must never arrive.
+    const OUTSIDE_SENTINEL: &str = "OUTSIDE-THE-MODULE-a7f3c1";
+    /// A file inside the module, for the control transfer.
+    const INSIDE_SENTINEL: &str = "INSIDE-THE-MODULE-b2c94e";
+
+    /// Every regular file below `dir`, without ever following a symlink.
+    ///
+    /// Not following them is the whole point. The probe runs on the same host
+    /// as the daemon, so a symlink that arrived as a symlink — `passwd.link ->
+    /// /etc/passwd`, which is the correct and harmless outcome — would resolve
+    /// locally and read exactly like a leak. A check that cannot tell those two
+    /// apart would fail the hardened daemon and pass nothing.
+    fn regular_files(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let Ok(entries) = fs::read_dir(dir) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_dir() {
+                out.extend(regular_files(&path));
+            } else if meta.is_file() {
+                out.push(path);
+            }
+        }
+        out
+    }
+
+    /// Whether any regular file below `dir` holds `needle`.
+    fn tree_holds(dir: &Path, needle: &str) -> bool {
+        regular_files(dir).iter().any(|path| {
+            fs::read(path)
+                .map(|bytes| String::from_utf8_lossy(&bytes).contains(needle))
+                .unwrap_or(false)
+        })
+    }
+
+    /// The first line of `/etc/passwd`, when it is readable.
+    ///
+    /// The spike's escape ended in this file, so it is checked for by name as
+    /// well as through our own sentinel. Optional on purpose: a host that does
+    /// not have it must not turn the probe red, and the sentinel carries the
+    /// measurement either way.
+    fn passwd_marker() -> Option<String> {
+        let content = fs::read_to_string("/etc/passwd").ok()?;
+        let line = content.lines().next()?.trim().to_string();
+        (line.len() > 8).then_some(line)
+    }
+
+    impl Probe {
+        /// Run rsync with this module's password file and nothing else fixed.
+        ///
+        /// [`Probe::client`] hard-codes a push; the escapes below are pulls, and
+        /// two of them do not name the module in the usual place at all.
+        fn rsync(&self, module: &ModuleConfig, args: &[&str]) -> Output {
+            let password = self.password_file(module);
+            let mut command = match self.backend {
+                Backend::Host => Command::new("rsync"),
+                Backend::Docker => {
+                    let owner = fs::metadata(&self.base).expect("scratch dir");
+                    let mut c = Command::new("docker");
+                    c.args([
+                        "exec",
+                        "-u",
+                        &format!("{}:{}", owner.uid(), owner.gid()),
+                        &self.container,
+                        "rsync",
+                    ]);
+                    c
+                }
+            };
+            command
+                .arg("-a")
+                // Never `-o`/`-g`: the daemon runs as root inside the user
+                // namespace and would stamp the invoking user's numeric uid on
+                // everything it receives, which lands outside the namespace as
+                // a subuid the probe can no longer delete.
+                .args(["--no-owner", "--no-group"])
+                .arg(format!("--password-file={}", password.display()))
+                .args(args)
+                .output()
+                .expect("cannot run rsync")
+        }
+
+        /// An empty destination directory. rsync creates only the last
+        /// component itself, so a nested one has to exist beforehand.
+        fn dst(&self, name: &str) -> PathBuf {
+            let dir = self.base.join("dst").join(name);
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("destination dir");
+            dir
+        }
+
+        /// `rsync://<module>@127.0.0.1:<port>/<path>`.
+        fn url(&self, module: &ModuleConfig, path: &str) -> String {
+            format!(
+                "rsync://{name}@127.0.0.1:{port}/{path}",
+                name = module.name(),
+                port = self.port
+            )
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn module_boundaries_on_the_real_daemon() {
+        let mut probe = Probe::new(Backend::Host);
+        let (uid, gid) = (probe.uid, probe.gid);
+
+        // The file the escapes are after: one level above the share root.
+        let outside = probe.path("outside.txt");
+        fs::write(&outside, format!("{OUTSIDE_SENTINEL}\n")).unwrap();
+
+        let share = probe.share("share");
+        fs::write(share.join("inside.txt"), format!("{INSIDE_SENTINEL}\n")).unwrap();
+        let victim = share.join("victim.txt");
+        fs::write(&victim, "do not delete me\n").unwrap();
+        // Three server-side symlinks — planted by somebody with access to the
+        // share, not uploaded through rsync, which is the case `munge symlinks`
+        // does *not* cover and the spike got burned by.
+        std::os::unix::fs::symlink(&outside, share.join("escape.link")).unwrap();
+        std::os::unix::fs::symlink("../outside.txt", share.join("relative.link")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", share.join("passwd.link")).unwrap();
+
+        let mut registry =
+            ModuleRegistry::new(probe.path("etc/rsyncd.conf"), probe.path("etc/secrets"));
+        let module = registry
+            .add_pairing(&share, true, uid, gid, 4)
+            .expect("pairing");
+        probe.start_daemon();
+
+        let passwd = passwd_marker();
+        // Asserts that nothing below `dir` holds anything from outside the
+        // module. Used after every escape; `what` names the attempt.
+        let clean = |dir: &Path, what: &str| {
+            assert!(
+                !tree_holds(dir, OUTSIDE_SENTINEL),
+                "{what}: the file above the share root reached the client ({})",
+                dir.display()
+            );
+            if let Some(marker) = &passwd {
+                assert!(
+                    !tree_holds(dir, marker),
+                    "{what}: /etc/passwd reached the client ({})",
+                    dir.display()
+                );
+            }
+        };
+
+        // --- 1. the control -------------------------------------------------
+        // Everything below is "the outside file did not arrive". This is the
+        // proof that a file *can* arrive this way, so that a broken harness
+        // cannot pass all nine boundaries by transferring nothing at all.
+        let control = probe.dst("control");
+        let out = probe.rsync(
+            &module,
+            &[
+                &probe.url(&module, &format!("{}/", module.name())),
+                &format!("{}/", control.display()),
+            ],
+        );
+        assert!(out.status.success(), "control pull: {}", stderr(&out));
+        assert!(
+            tree_holds(&control, INSIDE_SENTINEL),
+            "the control pull delivered no content, so no later \"nothing \
+             leaked\" assertion means anything: {}",
+            stderr(&out)
+        );
+
+        // --- 5. the symlinks arrived as symlinks, not as their content ------
+        // Same transfer as the control: a plain pull of the whole module.
+        for name in ["escape.link", "relative.link", "passwd.link"] {
+            let path = control.join(name);
+            let meta = fs::symlink_metadata(&path)
+                .unwrap_or_else(|e| panic!("{name} is missing from the control pull: {e}"));
+            assert!(
+                meta.file_type().is_symlink(),
+                "{name} came across as a regular file, so the daemon followed it"
+            );
+        }
+        clean(&control, "a plain pull of the module");
+
+        // --- 2. `..` in the requested path ----------------------------------
+        // rsync sanitises this itself, in every configuration: `link_stat
+        // "/outside.txt" (in <module>) failed`. Kept because it is what the
+        // ticket asks to be shown, and because a future rsync — or a `path`
+        // with a `/./` split — could change it; but see the header, this one
+        // cannot be made to fail by weakening the configuration.
+        for (attempt, remote) in [
+            ("..", format!("{}/../outside.txt", module.name())),
+            ("../..", format!("{}/../../etc/passwd", module.name())),
+        ] {
+            let dst = probe.dst(&format!("dotdot-{}", attempt.len()));
+            let out = probe.rsync(
+                &module,
+                &[&probe.url(&module, &remote), &format!("{}/", dst.display())],
+            );
+            assert!(
+                !out.status.success(),
+                "a request through {attempt} succeeded: {}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            clean(&dst, &format!("a request through {attempt}"));
+        }
+
+        // --- 3. an absolute path instead of a module name -------------------
+        let dst = probe.dst("absolute");
+        let out = probe.rsync(
+            &module,
+            &[
+                &probe.url(&module, "/etc/passwd"),
+                &format!("{}/", dst.display()),
+            ],
+        );
+        assert!(!out.status.success(), "an absolute remote path was served");
+        assert!(
+            stderr(&out).contains("must start with a module name"),
+            "an absolute path failed for the wrong reason: {}",
+            stderr(&out)
+        );
+        clean(&dst, "an absolute remote path");
+
+        // --- 4. dereferencing a server-side symlink -------------------------
+        // The spike's escape, exactly: the symlink is already in the share and
+        // the client asks the daemon to follow it. This is what `refuse
+        // options` is for — `munge symlinks` covers uploads, not what is
+        // already lying there.
+        for option in [
+            "-L",
+            "--copy-links",
+            "--copy-unsafe-links",
+            "--copy-dirlinks",
+        ] {
+            let dst = probe.dst(&format!("deref{}", option.replace('-', "")));
+            let out = probe.rsync(
+                &module,
+                &[
+                    option,
+                    &probe.url(&module, &format!("{}/", module.name())),
+                    &format!("{}/", dst.display()),
+                ],
+            );
+            assert!(
+                !out.status.success(),
+                "{option} was accepted; a peer could read any file the daemon can"
+            );
+            assert!(
+                stderr(&out).contains("configured to refuse"),
+                "{option} failed for the wrong reason: {}",
+                stderr(&out)
+            );
+            clean(&dst, option);
+        }
+
+        // --- 6. an unknown module name --------------------------------------
+        let dst = probe.dst("unknown");
+        let unknown = format!("{}-nope", module.name());
+        let out = probe.rsync(
+            &module,
+            &[
+                &probe.url(&module, &format!("{unknown}/")),
+                &format!("{}/", dst.display()),
+            ],
+        );
+        assert!(!out.status.success(), "an unknown module was served");
+        assert!(
+            stderr(&out).contains("Unknown module"),
+            "an unknown module failed for the wrong reason: {}",
+            stderr(&out)
+        );
+
+        // --- 7. the module names are not enumerable -------------------------
+        // Without `list = no` this answers with every module name, anonymously
+        // and before any authentication — which would make the unguessable
+        // module name pointless, because nobody would have to guess it.
+        let listing = Command::new("rsync")
+            .arg(format!("rsync://127.0.0.1:{}/", probe.port))
+            .output()
+            .expect("cannot run rsync");
+        let listed = String::from_utf8_lossy(&listing.stdout).into_owned();
+        assert!(
+            listed.trim().is_empty(),
+            "the daemon enumerated its modules to an anonymous client: {listed:?}"
+        );
+        assert!(
+            !listed.contains(module.name()),
+            "the module name was handed out for free"
+        );
+
+        // --- 8. an uploaded symlink is stored munged ------------------------
+        // The other direction of the symlink problem: a peer with write access
+        // uploads `-> /etc/passwd` and reads it back through the same module.
+        // `munge symlinks = yes` prefixes the stored value with
+        // `/rsyncd-munged/`, a directory that does not exist, so the daemon
+        // cannot follow it. Measured on the host: the value on disk is
+        // `/rsyncd-munged//etc/passwd` and the client sees `/etc/passwd` again
+        // on the way out.
+        let upload = probe.path("upload");
+        fs::create_dir_all(&upload).unwrap();
+        fs::write(upload.join("plain.txt"), "harmless\n").unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", upload.join("evil.link")).unwrap();
+        std::os::unix::fs::symlink("../../../../etc/passwd", upload.join("evilrel.link")).unwrap();
+        let out = probe.rsync(
+            &module,
+            &[
+                &format!("{}/", upload.display()),
+                &probe.url(&module, &format!("{}/up/", module.name())),
+            ],
+        );
+        assert!(out.status.success(), "upload: {}", stderr(&out));
+        for name in ["evil.link", "evilrel.link"] {
+            let stored = fs::read_link(share.join("up").join(name))
+                .unwrap_or_else(|e| panic!("{name} was not stored as a symlink: {e}"));
+            let stored = stored.to_string_lossy().into_owned();
+            assert!(
+                stored.starts_with("/rsyncd-munged/"),
+                "an uploaded symlink was stored unmunged as {stored:?}; the daemon \
+                 can follow it and the peer can read whatever it points at"
+            );
+        }
+        // And reading the module back does not deliver what they point at.
+        let back = probe.dst("back");
+        let out = probe.rsync(
+            &module,
+            &[
+                &probe.url(&module, &format!("{}/up/", module.name())),
+                &format!("{}/", back.display()),
+            ],
+        );
+        assert!(out.status.success(), "pull back: {}", stderr(&out));
+        clean(&back, "an uploaded symlink read back");
+
+        // --- 9. deleting -----------------------------------------------------
+        // The full matrix is in `daemon_lifecycle_on_the_host_rsync`; the ones
+        // the ticket names are here so that this probe stands on its own.
+        //
+        // `--remove-sent-files` is the deprecated alias of
+        // `--remove-source-files`, and refusal matches the spelling the client
+        // sent: with only the modern name on the list a push carrying the alias
+        // came back exit 0 on both 3.5.0 and 3.4.3.
+        for option in ["--delete", "--remove-source-files", "--remove-sent-files"] {
+            let out = probe.rsync(
+                &module,
+                &[
+                    option,
+                    &format!("{}/", upload.display()),
+                    &probe.url(&module, &format!("{}/up/", module.name())),
+                ],
+            );
+            assert!(!out.status.success(), "{option} was accepted");
+            assert!(
+                stderr(&out).contains("configured to refuse"),
+                "{option} failed for the wrong reason: {}",
+                stderr(&out)
+            );
+            assert!(victim.exists(), "{option} destroyed content in the share");
+            assert!(
+                upload.join("plain.txt").exists(),
+                "{option} destroyed content on the sender's side"
+            );
+        }
+
+        // --- 9b. destroying without any delete option ------------------------
+        // `--force` is not a delete option and does not need to be one: it tells
+        // rsync to make way for an incoming entry, and a non-empty directory
+        // standing where a file is being written is what gets made way for. A
+        // peer with nothing but write access wiped `keep/precious.txt` this way
+        // — exit 0, empty stderr, no `--delete` anywhere — until `force` went on
+        // the refusal list. The counter-proof for it is in
+        // `WeakDaemon::assert_the_boundaries_can_be_broken`.
+        //
+        // Three shapes of the same attack, all measured to destroy on 3.5.0 and
+        // 3.4.3 without the refusal: a file over a non-empty directory, a file
+        // over a directory whose content sits one level deeper, and a symlink in
+        // place of the file.
+        let clobber = probe.path("clobber");
+        for (label, deep, as_symlink) in [
+            ("file over a non-empty directory", false, false),
+            ("file over a directory with nested content", true, false),
+            ("symlink over a non-empty directory", false, true),
+        ] {
+            let _ = fs::remove_dir_all(&clobber);
+            fs::create_dir_all(&clobber).unwrap();
+            let victim_dir = share.join("keep");
+            // It may be a directory from the previous shape, or — if the
+            // refusal ever regresses — the file or symlink that replaced it.
+            let _ = fs::remove_file(&victim_dir);
+            let _ = fs::remove_dir_all(&victim_dir);
+            let nested = if deep {
+                victim_dir.join("sub")
+            } else {
+                victim_dir.clone()
+            };
+            fs::create_dir_all(&nested).unwrap();
+            let precious = nested.join("precious.txt");
+            fs::write(&precious, "PRECIOUS\n").unwrap();
+            if as_symlink {
+                std::os::unix::fs::symlink("/etc/hostname", clobber.join("keep")).unwrap();
+            } else {
+                fs::write(clobber.join("keep"), "i am a file\n").unwrap();
+            }
+
+            let out = probe.rsync(
+                &module,
+                &[
+                    "--force",
+                    &format!("{}/", clobber.display()),
+                    &probe.url(&module, &format!("{}/", module.name())),
+                ],
+            );
+            assert!(
+                !out.status.success(),
+                "--force was accepted for a {label}: {}",
+                stderr(&out)
+            );
+            assert!(
+                stderr(&out).contains("configured to refuse"),
+                "--force failed for the wrong reason on a {label}: {}",
+                stderr(&out)
+            );
+            assert!(
+                precious.exists(),
+                "--force destroyed content in the share ({label}) with no delete \
+                 option in sight"
+            );
+            let _ = fs::remove_file(&victim_dir);
+            let _ = fs::remove_dir_all(&victim_dir);
+        }
+        let _ = fs::remove_dir_all(&clobber);
+
+        // The generated configuration produced no parser complaint on the way.
+        let log = probe.daemon_log();
+        assert!(
+            !log.to_lowercase().contains("unknown parameter"),
+            "the generated configuration produced parser warnings:\n{log}"
+        );
+        println!("--- hardened daemon log ---\n{log}");
+
+        // -------------------------------------------------------------------
+        // The counter-proof
+        // -------------------------------------------------------------------
+        let weak = WeakDaemon::start(&probe.base);
+        weak.assert_the_boundaries_can_be_broken(passwd.as_deref());
+
+        probe.stop();
+        drop(weak);
+        let _ = fs::remove_dir_all(&probe.base);
+    }
+
+    /// A daemon with every symlink and enumeration defence switched off.
+    ///
+    /// It exists so that "nothing escaped from the hardened daemon" is a
+    /// statement about the hardening and not about the harness. Every check the
+    /// probe above makes is aimed at this daemon as well, and has to come out
+    /// the other way round.
+    ///
+    /// It needs no user namespace: `use chroot = no` and no `uid`/`gid`, so it
+    /// runs as the invoking user — which is also why it can read `/etc/passwd`
+    /// and hand it out.
+    ///
+    /// # Why there is no container variant of this probe
+    ///
+    /// Measured in `alpine:3.22` (rsync 3.4.3, what the image ships), with the
+    /// share, the outside file and the destination all on one filesystem so
+    /// that no mount boundary could be doing the work:
+    ///
+    /// | daemon | this configuration | with `insecure links = yes` |
+    /// |---|---|---|
+    /// | 3.5.0 (host) | no leak (`Too many levels of symbolic links`) | **`/etc/passwd` delivered** |
+    /// | 3.4.3 (image) | no leak (`Cross-device link (18)`) | no leak, same message |
+    ///
+    /// So 3.4.3 refuses to follow a symlink out of a module *whatever* these
+    /// parameters say — it neither warns about `insecure links` as an unknown
+    /// parameter nor lets it re-open anything. The counter-proof can therefore
+    /// only be produced on 3.5.0, and a `Backend::Docker` variant of this probe
+    /// would fail its own counter-proof assertions for a reason that has
+    /// nothing to do with the harness. That is good news about the image and a
+    /// reason to leave the probe on the host, not a gap to be filled in.
+    struct WeakDaemon {
+        base: PathBuf,
+        share: PathBuf,
+        port: u16,
+        password: PathBuf,
+        pid_file: PathBuf,
+        daemon: Option<Child>,
+    }
+
+    impl WeakDaemon {
+        /// Secret and module name are fixed: nothing here is protecting
+        /// anything, and a generated pair would only obscure the fixture.
+        const MODULE: &'static str = "weak";
+        const SECRET: &'static str = "weak-secret-not-protecting-anything";
+
+        fn start(under: &Path) -> Self {
+            let seq = PROBE_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let base = under.join(format!("weak-{seq}"));
+            let share = base.join("share");
+            fs::create_dir_all(&share).expect("weak share");
+
+            // The same content the hardened share has, so the two runs differ
+            // in the configuration and in nothing else.
+            let outside = base.join("outside.txt");
+            fs::write(&outside, format!("{OUTSIDE_SENTINEL}\n")).unwrap();
+            fs::write(share.join("inside.txt"), format!("{INSIDE_SENTINEL}\n")).unwrap();
+            fs::write(share.join("victim.txt"), "do not delete me\n").unwrap();
+            std::os::unix::fs::symlink(&outside, share.join("escape.link")).unwrap();
+            std::os::unix::fs::symlink("../outside.txt", share.join("relative.link")).unwrap();
+            std::os::unix::fs::symlink("/etc/passwd", share.join("passwd.link")).unwrap();
+
+            let secrets = base.join("weak.secrets");
+            write_private_file(&secrets, &format!("{}:{}\n", Self::MODULE, Self::SECRET))
+                .expect("weak secrets");
+            let password = base.join("weak.pw");
+            write_private_file(&password, &format!("{}\n", Self::SECRET)).expect("weak password");
+
+            let log = base.join("weak.log");
+            let pid_file = base.join("weak.pid");
+            let conf = base.join("weak.conf");
+            fs::write(
+                &conf,
+                format!(
+                    "address = 127.0.0.1\n\
+                     log file = {log}\n\
+                     \n\
+                     [{module}]\n\
+                     \x20   path = {share}\n\
+                     \x20   auth users = {module}\n\
+                     \x20   secrets file = {secrets}\n\
+                     \x20   list = yes\n\
+                     \x20   read only = no\n\
+                     \x20   use chroot = no\n\
+                     \x20   munge symlinks = no\n\
+                     \x20   insecure links = yes\n\
+                     \x20   max connections = 4\n",
+                    log = log.display(),
+                    module = Self::MODULE,
+                    share = share.display(),
+                    secrets = secrets.display(),
+                ),
+            )
+            .expect("weak configuration");
+
+            let port = probe_port(seq);
+            let child = Command::new("rsync")
+                .args([
+                    "--daemon".to_string(),
+                    "--no-detach".to_string(),
+                    format!("--config={}", conf.display()),
+                    format!("--port={port}"),
+                    format!("--dparam=pid file={}", pid_file.display()),
+                    format!("--dparam=lock file={}", base.join("weak.lock").display()),
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("cannot start the unhardened daemon");
+
+            let mut weak = Self {
+                base,
+                share,
+                port,
+                password,
+                pid_file,
+                daemon: Some(child),
+            };
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while Instant::now() < deadline {
+                if fs::read_to_string(&log)
+                    .map(|l| l.contains("listening on port"))
+                    .unwrap_or(false)
+                {
+                    return weak;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            weak.stop();
+            panic!(
+                "the unhardened daemon did not start; log: {:?}",
+                fs::read_to_string(&log)
+            );
+        }
+
+        fn rsync(&self, args: &[&str]) -> Output {
+            Command::new("rsync")
+                .arg("-a")
+                .args(["--no-owner", "--no-group"])
+                .arg(format!("--password-file={}", self.password.display()))
+                .args(args)
+                .output()
+                .expect("cannot run rsync")
+        }
+
+        fn url(&self, path: &str) -> String {
+            format!(
+                "rsync://{module}@127.0.0.1:{port}/{path}",
+                module = Self::MODULE,
+                port = self.port
+            )
+        }
+
+        /// Every boundary the hardened daemon held, broken here.
+        ///
+        /// If any of these comes out "still safe", the matching assertion in
+        /// [`module_boundaries_on_the_real_daemon`] proves nothing and has to
+        /// be reworked or dropped — see the note in AGENTS.md about tests that
+        /// cannot fail.
+        fn assert_the_boundaries_can_be_broken(&self, passwd: Option<&str>) {
+            // 4 + 5: dereferencing the server-side symlinks now delivers the
+            // files behind them.
+            let dst = self.base.join("dst-deref");
+            fs::create_dir_all(&dst).expect("destination dir");
+            let out = self.rsync(&[
+                "-L",
+                &self.url(&format!("{}/", Self::MODULE)),
+                &format!("{}/", dst.display()),
+            ]);
+            assert!(
+                tree_holds(&dst, OUTSIDE_SENTINEL),
+                "the counter-proof did not leak the file above the share root, so \
+                 the symlink assertions in the hardened run cannot fail and are \
+                 worthless: {}",
+                stderr(&out)
+            );
+            if let Some(marker) = passwd {
+                assert!(
+                    tree_holds(&dst, marker),
+                    "the counter-proof did not leak /etc/passwd; the spike's own \
+                     escape is therefore not being reproduced: {}",
+                    stderr(&out)
+                );
+            }
+
+            // 7: the module names are handed out anonymously.
+            let listing = Command::new("rsync")
+                .arg(format!("rsync://127.0.0.1:{}/", self.port))
+                .output()
+                .expect("cannot run rsync");
+            let listed = String::from_utf8_lossy(&listing.stdout).into_owned();
+            assert!(
+                listed.contains(Self::MODULE),
+                "the counter-proof did not enumerate its modules, so the \
+                 `list = no` assertion cannot fail: {listed:?}"
+            );
+
+            // 8: an uploaded symlink is stored verbatim and can be followed.
+            let upload = self.base.join("weak-upload");
+            fs::create_dir_all(&upload).unwrap();
+            std::os::unix::fs::symlink("/etc/passwd", upload.join("evil.link")).unwrap();
+            let out = self.rsync(&[
+                &format!("{}/", upload.display()),
+                &self.url(&format!("{}/up/", Self::MODULE)),
+            ]);
+            assert!(out.status.success(), "weak upload: {}", stderr(&out));
+            let stored = fs::read_link(self.share.join("up").join("evil.link"))
+                .expect("the uploaded symlink");
+            let stored = stored.to_string_lossy().into_owned();
+            assert!(
+                !stored.starts_with("/rsyncd-munged/"),
+                "the counter-proof munged the uploaded symlink anyway, so the \
+                 munge assertion cannot fail: {stored:?}"
+            );
+            // Measured: `etc/passwd`, not `/etc/passwd`. With `munge symlinks`
+            // off and the module served without a chroot, rsync still sanitises
+            // a stored symlink value — it drops the leading slash and any
+            // leading `..` — so the value cannot name a path above the module
+            // even here. That is a *third* layer and it is worth knowing about,
+            // but it is not the one under test: it constrains where an uploaded
+            // symlink may point, while munging makes it unfollowable at all.
+            println!("counter-proof: the uploaded symlink was stored as {stored:?}");
+
+            // 9: deleting is accepted, and it deletes.
+            let victim = self.share.join("victim.txt");
+            assert!(victim.exists());
+            let source = self.base.join("weak-source");
+            fs::create_dir_all(&source).unwrap();
+            fs::write(source.join("only.txt"), "the only file\n").unwrap();
+            let out = self.rsync(&[
+                "--delete",
+                &format!("{}/", source.display()),
+                &self.url(&format!("{}/", Self::MODULE)),
+            ]);
+            assert!(
+                out.status.success() && !victim.exists(),
+                "the counter-proof did not delete anything, so the `--delete` \
+                 assertions cannot fail: {}",
+                stderr(&out)
+            );
+
+            // 9b: `--force` destroys a non-empty directory here, with no
+            // delete option involved. Without this half, the `--force`
+            // assertions in the hardened run could be passing because the
+            // attack does not work at all rather than because it is refused.
+            let victim_dir = self.share.join("keep");
+            let _ = fs::remove_dir_all(&victim_dir);
+            fs::create_dir_all(&victim_dir).unwrap();
+            let precious = victim_dir.join("precious.txt");
+            fs::write(&precious, "PRECIOUS\n").unwrap();
+            let clobber = self.base.join("weak-clobber");
+            let _ = fs::remove_dir_all(&clobber);
+            fs::create_dir_all(&clobber).unwrap();
+            fs::write(clobber.join("keep"), "i am a file\n").unwrap();
+            let out = self.rsync(&[
+                "--force",
+                &format!("{}/", clobber.display()),
+                &self.url(&format!("{}/", Self::MODULE)),
+            ]);
+            assert!(
+                out.status.success() && !precious.exists(),
+                "the counter-proof did not destroy the non-empty directory, so \
+                 the --force assertions cannot fail and prove nothing: {}",
+                stderr(&out)
+            );
+            // And the same push without `--force` leaves it alone — which is
+            // what makes the line above a statement about `--force` rather than
+            // about pushing a file named `keep`. `keep` is a plain *file* now,
+            // so it has to be unlinked before the directory can come back.
+            let _ = fs::remove_file(&victim_dir);
+            let _ = fs::remove_dir_all(&victim_dir);
+            fs::create_dir_all(&victim_dir).unwrap();
+            fs::write(&precious, "PRECIOUS\n").unwrap();
+            let out = self.rsync(&[
+                &format!("{}/", clobber.display()),
+                &self.url(&format!("{}/", Self::MODULE)),
+            ]);
+            assert!(
+                precious.exists(),
+                "the same push without --force destroyed the directory as well, \
+                 so --force is not what is being measured: {}",
+                stderr(&out)
+            );
+
+            println!(
+                "--- counter-proof: every boundary above was broken on the \
+                 unhardened daemon (port {}) ---",
+                self.port
+            );
+        }
+
+        /// SIGTERM, never SIGKILL — a hard kill is what leaves partials behind.
+        fn stop(&mut self) {
+            if let Some(mut child) = self.daemon.take() {
+                let _ = Command::new("kill")
+                    .args(["-TERM", &child.id().to_string()])
+                    .status();
+                let _ = child.wait();
+            }
+            let _ = fs::remove_file(&self.pid_file);
+        }
+    }
+
+    impl Drop for WeakDaemon {
+        fn drop(&mut self) {
+            self.stop();
+        }
     }
 }

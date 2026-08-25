@@ -628,6 +628,175 @@ pub async fn delete_user(pool: &Pool<Sqlite>, user_id: &str) -> Result<bool> {
 }
 
 // ---------------------------------------------------------------------------
+// Lockout protection
+//
+// The rule the whole application hangs on: **the last enabled administrator
+// must survive.** There are three ways to lose them — delete the row, demote
+// the role, disable the account — and all three have to be closed, because
+// `--reset-password` recovers a *forgotten* password, never a *deleted* or
+// *demoted* account. Once no enabled admin is left, nothing in the running
+// program can create one; only editing `data/tasks.db` by hand can.
+//
+// Both functions below are therefore **one statement each**, with the guard in
+// the `WHERE` clause and the row coming back through `RETURNING` — exactly the
+// shape of [`consume_share_access`] and [`consume_password_reset`], and for
+// exactly the same reason. The obvious implementation ("count the admins, then
+// write") loses: SQLite serialises writers, but nothing serialises a *read*
+// against another connection's later write. Two concurrent requests, each
+// removing the *other* of the last two admins, both read "one other admin is
+// still there" and both go through — and the instance is locked out. Inside one
+// statement the subquery is evaluated under the same write lock that performs
+// the change, so the second request sees the first request's result and its
+// `WHERE` no longer matches.
+//
+// `0` affected rows means "refused **or** no such user". That is deliberately
+// not distinguished here: the decision has already been made, atomically, and a
+// caller that wants a better error message classifies it afterwards with an
+// ordinary lookup (see `handlers::users::classify_rejection`). Reading first to
+// decide would put the race back.
+//
+// `LOWER(role) = 'admin'` and not `role = 'admin'`: SQLite's `=` on TEXT is
+// case-sensitive, and the role arrives from an HTTP body. A row that reached
+// the table as `Admin` — through this API before normalisation, through the
+// CLI, or through a hand-edited database — must still count as an
+// administrator, or the guard protects nothing.
+// ---------------------------------------------------------------------------
+
+/// Guard shared by both statements, as a `WHERE` fragment over the row being
+/// changed. True when the change is safe:
+///
+///   * the row was not an enabled admin to begin with — nothing to lose, or
+///   * some *other* enabled admin exists.
+///
+/// The "stays an enabled admin" case is not in here; it only applies to the
+/// update and is added there.
+const OTHER_ADMIN_SURVIVES: &str = "( LOWER(role) <> 'admin' \
+       OR is_active = 0 \
+       OR EXISTS (SELECT 1 FROM users AS other \
+                   WHERE other.id <> ? \
+                     AND LOWER(other.role) = 'admin' \
+                     AND other.is_active = 1) )";
+
+/// Change role, home directory and/or enabled flag — unless that would remove
+/// the last enabled administrator.
+///
+/// Every field is optional and only the ones that are `Some` appear in the
+/// `SET` list. That is not just convenience: a full-row write built from a
+/// previous `SELECT` would carry a stale `role` back into the table, so a
+/// concurrent "change the home directory" could resurrect an admin that a
+/// concurrent "demote" had just removed. With a partial `SET` there is no stale
+/// value to write, and the guard reads the *effective* new state through
+/// `COALESCE(?, <column>)` rather than a value the caller computed.
+///
+/// Returns the updated row, or `None` when the user does not exist or the
+/// change was refused. Callers must not fall back to a plain `update_user` on
+/// `None`.
+pub async fn update_user_protected(
+    pool: &Pool<Sqlite>,
+    user_id: &str,
+    role: Option<&str>,
+    home_path: Option<&str>,
+    is_active: Option<bool>,
+) -> Result<Option<User>> {
+    let mut assignments: Vec<&str> = Vec::new();
+    if role.is_some() {
+        assignments.push("role = ?");
+    }
+    if home_path.is_some() {
+        assignments.push("home_path = ?");
+    }
+    if is_active.is_some() {
+        assignments.push("is_active = ?");
+    }
+    if assignments.is_empty() {
+        anyhow::bail!("update_user_protected was called with nothing to change");
+    }
+
+    let sql = format!(
+        "UPDATE users SET {} \
+          WHERE id = ? \
+            AND ( (LOWER(COALESCE(?, role)) = 'admin' AND COALESCE(?, is_active) = 1) \
+                  OR {OTHER_ADMIN_SURVIVES} ) \
+        RETURNING {USER_COLUMNS}",
+        assignments.join(", ")
+    );
+
+    let mut query = sqlx::query_as::<_, User>(&sql);
+    // Binding order follows the `?` order in the statement above: the SET list
+    // first, then the row's id, then the two `COALESCE` probes, then the id
+    // again for the subquery's `other.id <> ?`.
+    if let Some(role) = role {
+        query = query.bind(role.to_string());
+    }
+    if let Some(home_path) = home_path {
+        query = query.bind(home_path.to_string());
+    }
+    if let Some(is_active) = is_active {
+        query = query.bind(is_active);
+    }
+    let updated = query
+        .bind(user_id.to_string())
+        .bind(role.map(str::to_string))
+        .bind(is_active)
+        .bind(user_id.to_string())
+        .fetch_optional(pool)
+        .await?;
+
+    Ok(updated)
+}
+
+/// Delete an account — unless it is the last enabled administrator.
+///
+/// Returns the deleted row (so the caller can log *what* it removed and clean
+/// up alongside it), or `None` when the user does not exist or the deletion was
+/// refused. Sessions, share links and open password resets go with the row via
+/// `ON DELETE CASCADE`.
+pub async fn delete_user_protected(pool: &Pool<Sqlite>, user_id: &str) -> Result<Option<User>> {
+    let sql = format!(
+        "DELETE FROM users \
+          WHERE id = ? \
+            AND {OTHER_ADMIN_SURVIVES} \
+        RETURNING {USER_COLUMNS}"
+    );
+
+    let deleted = sqlx::query_as::<_, User>(&sql)
+        .bind(user_id)
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+
+    Ok(deleted)
+}
+
+/// How many enabled administrators there are. Used for reporting and by the
+/// tests; **not** as a pre-check in front of a change — that is the read half
+/// of the race the two functions above exist to close.
+pub async fn count_active_admins(pool: &Pool<Sqlite>) -> Result<i64> {
+    let count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM users WHERE LOWER(role) = 'admin' AND is_active = 1")
+            .fetch_one(pool)
+            .await?;
+
+    Ok(count.0)
+}
+
+/// Whether a username is taken, ignoring ASCII case.
+///
+/// The `UNIQUE` index on `users.username` is case-*sensitive*, so `Alice` and
+/// `alice` are two accounts as far as SQLite is concerned — and one login page,
+/// one audit log and one operator away from being confused for each other. New
+/// accounts are therefore refused on a case-insensitive collision. Existing
+/// rows are left alone: renaming them is not this ticket's business.
+pub async fn username_exists_ignoring_case(pool: &Pool<Sqlite>, username: &str) -> Result<bool> {
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE LOWER(username) = ?")
+        .bind(username.to_lowercase())
+        .fetch_one(pool)
+        .await?;
+
+    Ok(count.0 > 0)
+}
+
+// ---------------------------------------------------------------------------
 // Sessions
 // ---------------------------------------------------------------------------
 
@@ -692,6 +861,58 @@ pub async fn get_sessions_for_user(pool: &Pool<Sqlite>, user_id: &str) -> Result
         .await?;
 
     Ok(sessions)
+}
+
+/// Push the idle deadline of a session forward — the write half of the sliding
+/// expiration (see [`crate::handlers::auth::refresh_session`]).
+///
+/// **One statement, on purpose.** The obvious shape — read the row, compute the
+/// new deadline, write it back — is a read-modify-write over a value every
+/// concurrent request of the same session wants to change;
+/// [`consume_share_access`] carries the same reasoning and the measurement that
+/// goes with it. Three conditions do the work here:
+///
+///   * `expires_at > now` — an expired session (or one that a logout deleted a
+///     moment ago) is never revived. This is what keeps
+///     [`delete_sessions_for_user`] final.
+///   * `expires_at <= renew_before` — nothing is written while more than the
+///     caller's threshold of the window is left. That is what keeps a polling
+///     client from producing a database write per request.
+///   * `expires_at < new_expires_at` — the deadline only moves forward, and no
+///     write happens at all once the absolute lifetime has capped it.
+///
+/// Returns the updated row when *this* call was the one that renewed, and
+/// `None` when there was nothing to renew — including the case where a
+/// concurrent request got there first.
+pub async fn renew_session(
+    pool: &Pool<Sqlite>,
+    token_hash: &str,
+    now: DateTime<Utc>,
+    new_expires_at: DateTime<Utc>,
+    renew_before: DateTime<Utc>,
+) -> Result<Option<Session>> {
+    let sql = format!(
+        r#"
+        UPDATE sessions
+           SET expires_at = ?
+         WHERE id = ?
+           AND expires_at > ?
+           AND expires_at <= ?
+           AND expires_at < ?
+        RETURNING {SESSION_COLUMNS}
+    "#
+    );
+    let expires_at = new_expires_at.to_rfc3339();
+    let session = sqlx::query_as::<_, Session>(&sql)
+        .bind(&expires_at)
+        .bind(token_hash)
+        .bind(now.to_rfc3339())
+        .bind(renew_before.to_rfc3339())
+        .bind(&expires_at)
+        .fetch_optional(pool)
+        .await?;
+
+    Ok(session)
 }
 
 pub async fn delete_session(pool: &Pool<Sqlite>, token_hash: &str) -> Result<bool> {
@@ -2202,5 +2423,403 @@ mod tests {
             .unwrap()
             .expect("row stays");
         assert!(after.used_at.is_some(), "the winner did not mark it spent");
+    }
+
+    // -----------------------------------------------------------------------
+    // Schutz des letzten Administrators
+    //
+    // Drei Wege, ihn zu verlieren — löschen, herabstufen, deaktivieren — und
+    // alle drei sind hier einzeln geprüft. Der offensichtliche ist das
+    // Löschen; die anderen zwei sind die, die man vergisst.
+    // -----------------------------------------------------------------------
+
+    fn sample_admin(id: &str, username: &str) -> User {
+        let mut user = sample_user(id, username);
+        user.role = "admin".to_string();
+        user
+    }
+
+    /// Wie viele *aktive* Administratoren es gerade gibt.
+    async fn active_admins(pool: &Pool<Sqlite>) -> i64 {
+        count_active_admins(pool).await.expect("count")
+    }
+
+    #[tokio::test]
+    async fn the_only_administrator_survives_all_three_attempts() {
+        let (pool, _dir) = temp_pool().await;
+        create_user(&pool, &sample_admin("a1", "root")).await.unwrap();
+        create_user(&pool, &sample_user("u1", "bob")).await.unwrap();
+
+        // löschen
+        assert!(
+            delete_user_protected(&pool, "a1").await.unwrap().is_none(),
+            "der letzte Administrator wurde gelöscht"
+        );
+        // herabstufen
+        assert!(
+            update_user_protected(&pool, "a1", Some("user"), None, None)
+                .await
+                .unwrap()
+                .is_none(),
+            "der letzte Administrator wurde herabgestuft"
+        );
+        // deaktivieren
+        assert!(
+            update_user_protected(&pool, "a1", None, None, Some(false))
+                .await
+                .unwrap()
+                .is_none(),
+            "der letzte Administrator wurde deaktiviert"
+        );
+        // und beides in einem Aufruf, damit die Kombination nicht durchrutscht
+        assert!(
+            update_user_protected(&pool, "a1", Some("user"), None, Some(false))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let after = get_user_by_id(&pool, "a1").await.unwrap().expect("row");
+        assert_eq!(after.role, "admin");
+        assert!(after.is_active);
+        assert_eq!(active_admins(&pool).await, 1);
+    }
+
+    /// Die Gegenprobe zum Test darüber: mit einem zweiten aktiven Admin gehen
+    /// alle drei Wege durch. Ohne diesen Nachweis könnte der Wächter auch
+    /// einfach *alles* ablehnen und der Test oben wäre trotzdem grün.
+    #[tokio::test]
+    async fn with_a_second_active_admin_all_three_ways_are_allowed() {
+        for attempt in ["delete", "demote", "disable"] {
+            let (pool, _dir) = temp_pool().await;
+            create_user(&pool, &sample_admin("a1", "root")).await.unwrap();
+            create_user(&pool, &sample_admin("a2", "carol")).await.unwrap();
+
+            match attempt {
+                "delete" => assert!(
+                    delete_user_protected(&pool, "a1").await.unwrap().is_some(),
+                    "{attempt}"
+                ),
+                "demote" => {
+                    let after = update_user_protected(&pool, "a1", Some("user"), None, None)
+                        .await
+                        .unwrap()
+                        .expect(attempt);
+                    assert_eq!(after.role, "user");
+                }
+                _ => {
+                    let after = update_user_protected(&pool, "a1", None, None, Some(false))
+                        .await
+                        .unwrap()
+                        .expect(attempt);
+                    assert!(!after.is_active);
+                }
+            }
+            assert_eq!(active_admins(&pool).await, 1, "{attempt}");
+        }
+    }
+
+    /// Ein **deaktivierter** Administrator ist kein Ersatz. Wer ihn als
+    /// Überlebenden zählt, erlaubt das Entfernen des letzten *aktiven* — und
+    /// danach kann sich niemand mehr anmelden.
+    #[tokio::test]
+    async fn a_disabled_admin_does_not_count_as_a_survivor() {
+        let (pool, _dir) = temp_pool().await;
+        create_user(&pool, &sample_admin("a1", "root")).await.unwrap();
+        let mut sleeping = sample_admin("a2", "carol");
+        sleeping.is_active = false;
+        create_user(&pool, &sleeping).await.unwrap();
+
+        assert_eq!(active_admins(&pool).await, 1);
+        assert!(delete_user_protected(&pool, "a1").await.unwrap().is_none());
+        assert!(update_user_protected(&pool, "a1", Some("user"), None, None)
+            .await
+            .unwrap()
+            .is_none());
+
+        // Der schlafende darf dagegen weg — er schützt nichts.
+        assert!(delete_user_protected(&pool, "a2").await.unwrap().is_some());
+        assert_eq!(active_admins(&pool).await, 1);
+    }
+
+    /// Ein normaler Nutzer ist nie geschützt, auch nicht als letzter Nutzer
+    /// überhaupt.
+    #[tokio::test]
+    async fn a_plain_user_is_never_protected() {
+        let (pool, _dir) = temp_pool().await;
+        create_user(&pool, &sample_user("u1", "bob")).await.unwrap();
+        assert_eq!(active_admins(&pool).await, 0);
+
+        assert!(update_user_protected(&pool, "u1", None, None, Some(false))
+            .await
+            .unwrap()
+            .is_some());
+        assert!(delete_user_protected(&pool, "u1").await.unwrap().is_some());
+        assert_eq!(count_users(&pool).await.unwrap(), 0);
+    }
+
+    /// Eine per Hand eingetragene Zeile `Admin` zählt mit. `=` ist auf TEXT
+    /// gross-/kleinschreibungsabhängig; ohne `LOWER()` schützte der Wächter
+    /// gerade diese Zeile nicht.
+    #[tokio::test]
+    async fn an_admin_spelled_in_mixed_case_still_counts() {
+        let (pool, _dir) = temp_pool().await;
+        let mut odd = sample_user("a1", "root");
+        odd.role = "Admin".to_string();
+        create_user(&pool, &odd).await.unwrap();
+
+        assert_eq!(active_admins(&pool).await, 1);
+        assert!(delete_user_protected(&pool, "a1").await.unwrap().is_none());
+
+        // Und umgekehrt: der `Admin` genügt als Überlebender für einen zweiten.
+        create_user(&pool, &sample_admin("a2", "carol")).await.unwrap();
+        assert!(delete_user_protected(&pool, "a2").await.unwrap().is_some());
+    }
+
+    /// Eine harmlose Änderung am letzten Administrator muss durchgehen. Der
+    /// Wächter darf nicht „letzter Admin = unveränderlich" bedeuten.
+    #[tokio::test]
+    async fn the_last_admin_can_still_be_edited_harmlessly() {
+        let (pool, _dir) = temp_pool().await;
+        create_user(&pool, &sample_admin("a1", "root")).await.unwrap();
+
+        let after = update_user_protected(&pool, "a1", None, Some("/srv/neu"), None)
+            .await
+            .unwrap()
+            .expect("harmlose Änderung abgelehnt");
+        assert_eq!(after.home_path, "/srv/neu");
+        assert_eq!(after.role, "admin", "die Rolle wurde nebenbei verändert");
+        assert!(after.is_active);
+
+        // Ausdrücklich „bleibt Admin, bleibt aktiv" ist ebenfalls erlaubt.
+        assert!(
+            update_user_protected(&pool, "a1", Some("admin"), None, Some(true))
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    /// Nur die gesetzten Felder werden geschrieben — sonst könnte eine
+    /// gleichzeitige Home-Änderung, die ihre Vorlage vor einer Herabstufung
+    /// gelesen hat, die Rolle `admin` wieder zurückschreiben.
+    #[tokio::test]
+    async fn a_partial_update_writes_nothing_it_was_not_asked_to() {
+        let (pool, _dir) = temp_pool().await;
+        create_user(&pool, &sample_admin("a1", "root")).await.unwrap();
+        create_user(&pool, &sample_admin("a2", "carol")).await.unwrap();
+
+        // a1 wird herabgestuft …
+        update_user_protected(&pool, "a1", Some("user"), None, None)
+            .await
+            .unwrap()
+            .expect("demote");
+        // … und danach nur sein Home geändert. Die Rolle darf nicht
+        // wiederauferstehen.
+        let after = update_user_protected(&pool, "a1", None, Some("/srv/x"), None)
+            .await
+            .unwrap()
+            .expect("home");
+        assert_eq!(after.role, "user");
+        assert_eq!(active_admins(&pool).await, 1);
+    }
+
+    /// Ein Aufruf ohne zu änderndes Feld ist ein Programmierfehler und wird
+    /// nicht zu einem `UPDATE` ohne `SET` (das wäre ein SQL-Syntaxfehler zur
+    /// Laufzeit statt einer klaren Meldung).
+    #[tokio::test]
+    async fn an_update_without_a_field_is_refused_before_sql() {
+        let (pool, _dir) = temp_pool().await;
+        create_user(&pool, &sample_admin("a1", "root")).await.unwrap();
+        assert!(update_user_protected(&pool, "a1", None, None, None)
+            .await
+            .is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Nebenläufigkeit
+    // -----------------------------------------------------------------------
+
+    /// Die naive Umsetzung, **nur im Test**: erst zählen, dann schreiben.
+    ///
+    /// Die Barriere zwischen den beiden Schritten erzwingt genau das Fenster,
+    /// das im Betrieb zufällig auftritt. Damit ist die Gegenprobe
+    /// deterministisch statt sprunghaft — sonst müsste man auf Glück hoffen,
+    /// um zu zeigen, dass die naive Fassung durchfällt.
+    async fn naive_delete_user(
+        pool: &Pool<Sqlite>,
+        user_id: &str,
+        gate: &tokio::sync::Barrier,
+    ) -> bool {
+        let others: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM users \
+              WHERE id <> ? AND LOWER(role) = 'admin' AND is_active = 1",
+        )
+        .bind(user_id)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        // Beide Aufrufer haben jetzt gelesen, keiner hat geschrieben.
+        gate.wait().await;
+
+        if others.0 == 0 {
+            return false;
+        }
+        delete_user(pool, user_id).await.unwrap()
+    }
+
+    /// **Die Gegenprobe.** Zwei gleichzeitige Anfragen, jede entfernt den
+    /// *anderen* der beiden letzten Administratoren.
+    ///
+    /// Mit der naiven Fassung lesen beide „ein anderer Admin ist noch da", und
+    /// beide löschen: die Instanz ist ausgesperrt. Dass dieser Test das
+    /// **zeigt**, ist der Beleg, dass der Aufbau die Fehlerklasse überhaupt
+    /// finden kann — ein grüner Test der geschützten Fassung allein sagt das
+    /// nicht.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_naive_read_then_write_locks_the_instance_out() {
+        let (pool, _dir) = temp_pool().await;
+        create_user(&pool, &sample_admin("a1", "root")).await.unwrap();
+        create_user(&pool, &sample_admin("a2", "carol")).await.unwrap();
+
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for id in ["a1", "a2"] {
+            let pool = pool.clone();
+            let gate = gate.clone();
+            handles.push(tokio::spawn(async move {
+                naive_delete_user(&pool, id, &gate).await
+            }));
+        }
+        let mut deleted = 0;
+        for handle in handles {
+            if handle.await.expect("join") {
+                deleted += 1;
+            }
+        }
+
+        assert_eq!(deleted, 2, "die naive Fassung hat nicht beide gelöscht");
+        assert_eq!(
+            active_admins(&pool).await,
+            0,
+            "die naive Fassung hat sich hier NICHT ausgesperrt — dann taugt \
+             die Gegenprobe nicht und der Test darunter beweist nichts"
+        );
+    }
+
+    /// Derselbe Angriff gegen die geschützte Fassung: genau einer kommt durch,
+    /// ein Administrator bleibt stehen.
+    ///
+    /// Die Barriere steht hier **vor** dem Aufruf, weil es in der geschützten
+    /// Fassung kein Fenster *innerhalb* gibt, in das man zielen könnte — genau
+    /// das ist der Punkt. Beide Aufrufe starten im selben Augenblick und
+    /// treffen sich unter SQLites Schreibsperre.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_removal_of_the_last_two_admins_leaves_one_standing() {
+        let (pool, _dir) = temp_pool().await;
+        create_user(&pool, &sample_admin("a1", "root")).await.unwrap();
+        create_user(&pool, &sample_admin("a2", "carol")).await.unwrap();
+
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for id in ["a1", "a2"] {
+            let pool = pool.clone();
+            let gate = gate.clone();
+            handles.push(tokio::spawn(async move {
+                gate.wait().await;
+                delete_user_protected(&pool, id).await.unwrap().is_some()
+            }));
+        }
+        let deleted = {
+            let mut n = 0;
+            for handle in handles {
+                if handle.await.expect("join") {
+                    n += 1;
+                }
+            }
+            n
+        };
+
+        assert_eq!(deleted, 1, "es sind {deleted} von 2 Löschungen durchgegangen");
+        assert_eq!(active_admins(&pool).await, 1);
+    }
+
+    /// Und derselbe Angriff feindselig aufgesetzt: mehr Aufgaben als der Pool
+    /// Verbindungen hat (Standard 10), auf echten Threads, über alle drei Wege
+    /// gemischt. Was auch geschieht — mindestens ein aktiver Administrator
+    /// muss übrig sein.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn no_mix_of_concurrent_attempts_can_empty_the_admin_set() {
+        let (pool, _dir) = temp_pool().await;
+        create_user(&pool, &sample_admin("a1", "root")).await.unwrap();
+        create_user(&pool, &sample_admin("a2", "carol")).await.unwrap();
+        create_user(&pool, &sample_admin("a3", "dave")).await.unwrap();
+
+        const ATTEMPTS: usize = 24;
+        let gate = std::sync::Arc::new(tokio::sync::Barrier::new(ATTEMPTS));
+        let ids = ["a1", "a2", "a3"];
+
+        let mut handles = Vec::new();
+        for i in 0..ATTEMPTS {
+            let pool = pool.clone();
+            let gate = gate.clone();
+            let id = ids[i % ids.len()].to_string();
+            let way = i % 3;
+            handles.push(tokio::spawn(async move {
+                gate.wait().await;
+                match way {
+                    0 => delete_user_protected(&pool, &id).await.map(|r| r.is_some()),
+                    1 => update_user_protected(&pool, &id, Some("user"), None, None)
+                        .await
+                        .map(|r| r.is_some()),
+                    _ => update_user_protected(&pool, &id, None, None, Some(false))
+                        .await
+                        .map(|r| r.is_some()),
+                }
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("join").expect("query");
+        }
+
+        let left = active_admins(&pool).await;
+        assert!(
+            left >= 1,
+            "nach {ATTEMPTS} gleichzeitigen Versuchen ist kein aktiver \
+             Administrator übrig — die Instanz wäre ausgesperrt"
+        );
+    }
+
+    #[tokio::test]
+    async fn username_collisions_are_found_regardless_of_case() {
+        let (pool, _dir) = temp_pool().await;
+        create_user(&pool, &sample_user("u1", "Alice")).await.unwrap();
+
+        assert!(username_exists_ignoring_case(&pool, "alice").await.unwrap());
+        assert!(username_exists_ignoring_case(&pool, "ALICE").await.unwrap());
+        assert!(username_exists_ignoring_case(&pool, "Alice").await.unwrap());
+        assert!(!username_exists_ignoring_case(&pool, "alic").await.unwrap());
+        assert!(!username_exists_ignoring_case(&pool, "alicee").await.unwrap());
+        // Die gross-/kleinschreibungsabhängige Fassung sieht das nicht — das
+        // ist der Grund, warum es die neue gibt.
+        assert!(!username_exists(&pool, "alice").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn counting_active_admins_ignores_plain_users_and_disabled_ones() {
+        let (pool, _dir) = temp_pool().await;
+        assert_eq!(active_admins(&pool).await, 0);
+
+        create_user(&pool, &sample_user("u1", "bob")).await.unwrap();
+        assert_eq!(active_admins(&pool).await, 0);
+
+        create_user(&pool, &sample_admin("a1", "root")).await.unwrap();
+        assert_eq!(active_admins(&pool).await, 1);
+
+        let mut sleeping = sample_admin("a2", "carol");
+        sleeping.is_active = false;
+        create_user(&pool, &sleeping).await.unwrap();
+        assert_eq!(active_admins(&pool).await, 1);
     }
 }

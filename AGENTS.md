@@ -82,6 +82,19 @@ static/
   Die Endung `.mjs` ist der ganze Unterschied. Und selbst das ersetzt nicht, die Seite
   einmal wirklich zu öffnen und die Browser-Konsole anzusehen.
 
+- **Auch die ESM-Prüfung findet nicht alles.** Ein Agent hat einen Kommentar mit
+  **Backticks** in ein Template-Literal geschrieben (`BAR_CSS = \`…\``). Das Ergebnis war
+  syntaktisch **gültiges** JavaScript — `node --check` grün, auch als Modul — und beim
+  Laden ein `TypeError`, der wieder den **gesamten Modulgraph** von `main.js` riss.
+
+  Damit ist es der **dritte** Fall derselben Klasse: ein Frontend-Totalausfall, den kein
+  Werkzeuglauf sah. Die Lehre ist inzwischen keine Empfehlung mehr, sondern eine Regel:
+
+  **Wer `static/js/**` anfasst, öffnet die Seite und liest die Browser-Konsole.**
+  Kein `node --check`, kein `cargo test` und kein Codebefund ersetzt das. Ein
+  Frontend-Fehler dieser Art erzeugt **keine sichtbare Meldung** — die Oberfläche ist
+  einfach leer.
+
 ### Wie der Sync heute funktioniert
 
 `src/handlers/sync.rs` startet `rclone copy` als Subprozess mit
@@ -111,8 +124,14 @@ Zwei Einschränkungen bleiben:
 - **Die Version auf dem Host ist nicht die des Images** (Container: 1.70.1). Was
   versionsabhängig ist — Ausgabeformate, verfügbare Unterbefehle, Verhalten von
   `obscure`/`reveal` — gehört gegen **beide** geprüft.
-- `rsync` gibt es weiterhin **nur im Container**. Alles, was ein echtes rsync-Binary
-  braucht, läuft über Docker.
+- **`rsync` liegt inzwischen ebenfalls auf dem Host** (3.5.0). Auch das behauptete diese
+  Datei zweimal anders, und beide Male hat ein Tester es beim Messen widerlegt. Die
+  Container-Version ist 3.4.3 — versionsabhängiges Verhalten gegen **beide** prüfen.
+
+  Was dem Host trotzdem fehlt: **Port 873 ist nicht bindbar**
+  (`net.ipv4.ip_unprivileged_port_start = 1024`). Ein Daemon-Test läuft deshalb im
+  Container oder in einem `unshare -rn`-Netzwerknamensraum — nicht, weil das Binary
+  fehlt, sondern wegen des Ports.
 
 Für Nachweise über `argv` ist ein **Stub** ohnehin besser als das echte Binary: er
 kontrolliert das Zeitfenster, in dem man `/proc/<pid>/cmdline` lesen kann.
@@ -353,6 +372,47 @@ geändert. Wird eine fremde Datei zwingend gebraucht, zurückmelden statt anfass
 - Jeder vom Client kommende Pfad wird serverseitig kanonisiert und gegen den erlaubten
   Wurzelpfad geprüft — auch über aufgelöste Symlinks. Das ist nicht verhandelbar.
 - Keine Secrets in `argv` (systemweit lesbar), nicht in Logs, nicht in die UI.
+
+### `derive(Debug)` über einem Geheimnis — was dich fängt und was nicht
+
+Dieses Muster wurde hier **achtmal** gefunden (Session-Cookie, Argon2-Hash,
+Remote-Passwort, `secret_access_key`, PHC-String, lebendes Sitzungstoken,
+Passwort-Reset-Token, Userinfo einer Nutzer-URL). Fünf sorgfältige Handsuchen haben die
+letzten beiden übersehen; gefunden hat sie eine **maschinelle Auflistung** aller
+`derive`-Stellen. Ein Log-Leak erzeugt keine Fehlermeldung, es fällt also niemandem auf.
+
+Seit Ticket `1e6aa483` hängt das nicht mehr an deiner Aufmerksamkeit:
+**`tests/no_debug_leaks.rs`** liest `src/**/*.rs` als Text, sammelt jeden Typ mit
+abgeleitetem `Debug` und meldet jedes Feld, dessen Name einen verdächtigen Wortstamm
+enthält (`pass`, `secret`, `token`, `cookie`, `hash`, `key`, `auth`, `session`, `url`,
+`uri`, `bearer`, `credential`, `signature`). Das läuft in `cargo test`.
+
+**Was er fängt:** einen neu angelegten Typ mit `derive(Debug)` und einem so benannten
+Feld — auch bei mehrzeiligem `derive`, in Enum-Struct-Varianten, hinter `pub(crate)`
+und bei Generics.
+
+**Was er *nicht* fängt:** er kennt **nur Namen**. Ein Feld `payload: String`, das ein
+Token trägt, geht durch (steht als Test `known_gap_…` ausdrücklich drin). Ebenso
+ungeprüft bleiben `Display`, `Serialize` und Panic-Meldungen. **Der Test ist eine
+Bremse, keine Garantie.**
+
+Wenn er anspringt, gibt es genau drei richtige Antworten:
+
+1. `Debug` **von Hand** implementieren und den Wert **redigieren, nicht entfernen** —
+   eine `Debug`-Ausgabe ohne Bezug ist zum Debuggen wertlos. Vorlagen: `User` und
+   `Session` (`src/database.rs`), `SessionRefresh` (`src/handlers/auth.rs`),
+   `ResetPageQuery` (`src/handlers/auth_web.rs`). Bei einer URL nur die Userinfo
+   maskieren (`redact_userinfo`, `src/handlers/downloader.rs`).
+2. Das Geheimnis in einen **redigierenden Newtype** stecken (`SessionToken`,
+   `ResetToken`, `ShareToken`) — dann ist das `derive(Debug)` aussenrum harmlos. Das ist
+   der einzige Weg, der den Fehler *unmöglich* macht statt ihn zu melden; die Liste der
+   Felder, die noch einen bräuchten, steht als `_NEWTYPE_CANDIDATES` im Testmodul.
+3. Ist es **kein** Geheimnis: mit **Begründung** in `ACKNOWLEDGED` eintragen. Ein
+   Eintrag ohne Begründung lässt einen eigenen Test durchfallen.
+
+Die Ausnahmeliste darf nicht verrotten: **ein verschwundener Treffer bricht den Test
+ebenfalls**. Wer ein Feld umbenennt oder entfernt, räumt seinen Eintrag mit weg.
+
 
 ### Seit der Auth-Middleware: der Start legt ein Admin-Konto an
 Ist die Tabelle `users` leer, erzeugt der Start einen Admin (`RCLONE_GUI_ADMIN_USER` /

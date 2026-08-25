@@ -18,6 +18,89 @@
         .progress-animate {
             transition: width 0.5s ease-in-out;
         }
+        /* Progress dialog: outcome of a terminal job (de99d78b).
+
+           `partial` — rsync exit 23 (some files were not transferred) or 24
+           (source files vanished mid-run) — is terminal but not a success.
+           Amber, and a half-filled circle in the heading: not green, because
+           nothing succeeded fully, and not red, because a file disappearing
+           from a live directory is everyday life and a red alarm over it would
+           be ignored within a week.
+
+           Written as own classes and not as Tailwind utilities: the browser
+           build only generates what it finds in the DOM while scanning, so a
+           class first attached from JS has no rule behind it. The id in the
+           selector is what outranks `bg-primary` on the bar. */
+        #progress-fill.is-partial {
+            background-color: #b45309;
+        }
+        #progress-fill.is-failed {
+            background-color: #b91c1c;
+        }
+        .sync-progress-partial-icon {
+            color: #b45309;
+        }
+        .sync-progress-reason {
+            margin-bottom: 0.75rem;
+            font-weight: 600;
+            overflow-wrap: anywhere;
+        }
+        .sync-progress-reason.is-partial {
+            color: #b45309;
+        }
+        .sync-progress-reason.is-failed {
+            color: #b91c1c;
+        }
+        html[data-theme="dark"] .sync-progress-partial-icon,
+        html[data-theme="dark"] .sync-progress-reason.is-partial {
+            color: #fbbf24;
+        }
+        html[data-theme="dark"] .sync-progress-reason.is-failed {
+            color: #f87171;
+        }
+        /* Rows of the file browser that belong to a running job (98379f17).
+           Own classes for the same reason as above; the marker itself is built
+           in static/js/ui/jobmarks.js. */
+        .fb-row.fb-job-active {
+            background-color: rgba(180, 83, 9, 0.10);
+            box-shadow: inset 3px 0 0 0 #b45309;
+        }
+        .fb-job-mark {
+            flex: 0 0 auto;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.25rem;
+            padding: 0 0.4rem;
+            border-radius: 9999px;
+            background-color: #b45309;
+            color: #ffffff;
+            font-size: 0.7rem;
+            font-weight: 600;
+            font-variant-numeric: tabular-nums;
+            white-space: nowrap;
+        }
+        /* The name cell ellipsises its text, so a marker appended into it would
+           be cut off. Only marked rows become a flex row; the name then clips
+           instead of ellipsising, which is the smaller loss. */
+        .fb-row.fb-job-active .fb-name {
+            display: flex;
+            align-items: center;
+            gap: 0.4rem;
+        }
+        .fb-job-spin {
+            display: inline-block;
+            animation: fb-job-spin 1.4s linear infinite;
+        }
+        @keyframes fb-job-spin {
+            to { transform: rotate(360deg); }
+        }
+        /* A user who asked for less motion gets a static marker; the text next
+           to it carries the same information. */
+        @media (prefers-reduced-motion: reduce) {
+            .fb-job-spin {
+                animation: none;
+            }
+        }
         /* Main menu dropdown, menu panel and its sections are toggled from app.js.
            Own CSS instead of utility classes, so the state does not depend on
            dynamically generated Tailwind classes. */
@@ -267,6 +350,39 @@
         }
         .fb-selbar.is-visible {
             display: flex;
+        }
+        /* Message box of the "Fetch from URL" dialog. Hidden until there is
+           something to say, and shown through its own class for the same reason
+           as .fb-selbar above. Amber rather than red: most of what lands here
+           is a deliberate limit ("that address is in a blocked range"), not a
+           failure of the application. */
+        .url-fetch-msg {
+            display: none;
+            margin-bottom: 1rem;
+            padding: 0.65rem 0.8rem;
+            border-radius: 0.5rem;
+            border-left: 3px solid #b45309;
+            background-color: rgba(180, 83, 9, 0.12);
+        }
+        .url-fetch-msg.is-visible {
+            display: block;
+        }
+        .url-fetch-hint {
+            font-size: 0.875rem;
+            line-height: 1.4;
+            overflow-wrap: anywhere;
+        }
+        .url-fetch-hint:empty {
+            display: none;
+        }
+        .url-fetch-detail {
+            margin-top: 0.35rem;
+            font-size: 0.78rem;
+            opacity: 0.75;
+            overflow-wrap: anywhere;
+        }
+        .url-fetch-detail:empty {
+            display: none;
         }
         .fb-head {
             font-size: 0.75rem;
@@ -762,6 +878,13 @@
                             <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                             </svg>
+                        </button>
+                        <!-- Fetch a file from a URL into a folder of this user's
+                             home. The *server* fetches it — see
+                             static/js/ui/urlfetch.js and src/handlers/downloader.rs. -->
+                        <button id="file-url-fetch" type="button" class="btn btn-sm"
+                                title="Let the server fetch a file from a URL into a folder">
+                            <span aria-hidden="true" class="mr-1">🌐</span>From URL
                         </button>
                         <!-- Sync of the current selection to the folder shown in
                              the right pane. Disabled until both halves exist; the
@@ -1285,6 +1408,75 @@
                     </svg>
                     Create Task
                 </button>
+            </div>
+        </div>
+    </dialog>
+
+    <!-- Fetch from URL
+         The server fetches, not the browser. Everything that can be refused is
+         refused server-side and before any side effect (scheme, address,
+         redirect chain, target folder, file name); ui/urlfetch.js turns the
+         refusal into something that says what to change.
+
+         The message box hangs on its own class `is-visible`, not on a Tailwind
+         utility: the browser build only generates what it finds in the static
+         DOM, so a class first attached from JS has no rule behind it. -->
+    <dialog id="url-fetch-modal" class="modal" aria-labelledby="url-fetch-title">
+        <div class="modal-box">
+            <form method="dialog">
+                <button class="btn btn-sm btn-circle btn-ghost absolute right-2 top-2"
+                        aria-label="Close">✕</button>
+            </form>
+            <h3 id="url-fetch-title" class="font-bold text-xl mb-4">
+                <span aria-hidden="true" class="mr-2">🌐</span>Fetch from URL
+            </h3>
+
+            <div class="text-sm text-base-content/70 mb-4">
+                The server downloads the file and puts it into the folder you
+                pick. It appears in the job bar and can be cancelled there.
+            </div>
+
+            <div id="url-fetch-message" class="url-fetch-msg" role="status" aria-live="polite">
+                <div id="url-fetch-hint" class="url-fetch-hint"></div>
+                <div id="url-fetch-detail" class="url-fetch-detail"></div>
+            </div>
+
+            <div class="space-y-4">
+                <div class="form-control">
+                    <label class="label" for="url-fetch-url">
+                        <span class="label-text font-semibold">Address</span>
+                        <span class="label-text-alt">http:// or https:// only</span>
+                    </label>
+                    <input type="url" id="url-fetch-url" class="input input-bordered w-full"
+                           placeholder="https://example.com/archive.zip" autocomplete="off">
+                </div>
+
+                <div class="form-control">
+                    <label class="label" for="url-fetch-target">
+                        <span class="label-text font-semibold">Target folder</span>
+                    </label>
+                    <select id="url-fetch-target" class="select select-bordered w-full"></select>
+                </div>
+
+                <div class="form-control">
+                    <label class="label" for="url-fetch-name">
+                        <span class="label-text font-semibold">File name</span>
+                        <span class="label-text-alt">optional</span>
+                    </label>
+                    <input type="text" id="url-fetch-name" class="input input-bordered w-full"
+                           placeholder="taken from the response or the URL" autocomplete="off">
+                    <div class="text-sm text-base-content/70 mt-1">
+                        Leave empty to keep the name the source sends. An existing
+                        file is never overwritten — a suffix is added instead.
+                    </div>
+                </div>
+            </div>
+
+            <div class="modal-action">
+                <form method="dialog">
+                    <button class="btn btn-ghost">Cancel</button>
+                </form>
+                <button id="url-fetch-start" type="button" class="btn btn-primary">Fetch</button>
             </div>
         </div>
     </dialog>

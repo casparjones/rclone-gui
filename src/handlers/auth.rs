@@ -809,8 +809,21 @@ pub const SESSION_TOKEN_HEX_LENGTH: usize = SESSION_TOKEN_BYTES * 2;
 /// a cookie of a different app on the same host.
 pub const DEFAULT_SESSION_COOKIE_NAME: &str = "rclone_gui_session";
 
-/// Default session lifetime.
+/// Default **idle** lifetime of a session: how long it survives without a
+/// single request. Renewed on activity, see [`refresh_session`].
 pub const DEFAULT_SESSION_TTL_HOURS: i64 = 24;
+
+/// Default **absolute** lifetime of a session, counted from its creation and
+/// never renewed.
+///
+/// Seven days. The reasoning for having the second limit at all is the one that
+/// already cost this project a finding elsewhere: a share link that renewed its
+/// own budget on every access stayed usable for 200 accesses over 16 simulated
+/// hours because somebody knocked every five minutes. A sliding window without
+/// a hard cap is not an expiry, it is a keep-alive — a stolen cookie in an open
+/// tab would live forever. Seven days keeps a working week free of logins and
+/// still forces a re-authentication that no amount of activity can defer.
+pub const DEFAULT_SESSION_MAX_LIFETIME_HOURS: i64 = 24 * 7;
 
 /// Bounds for the configured lifetime. A value outside this range is a typo,
 /// not an intent, and is clamped rather than honoured.
@@ -1059,9 +1072,13 @@ fn to_hex(bytes: &[u8]) -> String {
 pub struct SessionConfig {
     /// Cookie name.
     pub cookie_name: String,
-    /// Lifetime in hours; also the `expires_at` of the database row, so an
-    /// attacker who keeps the cookie past its `Max-Age` gains nothing.
+    /// **Idle** lifetime in hours; also the `expires_at` of the database row,
+    /// so an attacker who keeps the cookie past its `Max-Age` gains nothing.
+    /// Activity pushes it forward (see [`refresh_session`]).
     pub ttl_hours: i64,
+    /// **Absolute** lifetime in hours, counted from `sessions.created_at` and
+    /// never renewed. The ceiling the sliding window is clamped to.
+    pub max_lifetime_hours: i64,
     /// Whether to set `Secure`. Defaults to `true`; only a deployment that
     /// deliberately serves plain HTTP on a trusted network turns it off.
     pub secure: bool,
@@ -1072,6 +1089,7 @@ impl Default for SessionConfig {
         Self {
             cookie_name: DEFAULT_SESSION_COOKIE_NAME.to_string(),
             ttl_hours: DEFAULT_SESSION_TTL_HOURS,
+            max_lifetime_hours: DEFAULT_SESSION_MAX_LIFETIME_HOURS,
             secure: true,
         }
     }
@@ -1105,6 +1123,38 @@ impl SessionConfig {
                     );
                 }
             }
+        }
+
+        if let Ok(raw) = std::env::var("RCLONE_GUI_SESSION_MAX_LIFETIME_HOURS") {
+            match raw.trim().parse::<i64>() {
+                Ok(hours) if (MIN_SESSION_TTL_HOURS..=MAX_SESSION_TTL_HOURS).contains(&hours) => {
+                    config.max_lifetime_hours = hours;
+                }
+                Ok(hours) => {
+                    tracing::warn!(
+                        "RCLONE_GUI_SESSION_MAX_LIFETIME_HOURS={hours} is outside {MIN_SESSION_TTL_HOURS}..={MAX_SESSION_TTL_HOURS}, using {}",
+                        config.max_lifetime_hours
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "RCLONE_GUI_SESSION_MAX_LIFETIME_HOURS is not a number ({e}), using {}",
+                        config.max_lifetime_hours
+                    );
+                }
+            }
+        }
+
+        // An absolute lifetime below the idle window would be the idle window,
+        // only harder to read. Raise it rather than let the two contradict.
+        if config.max_lifetime_hours < config.ttl_hours {
+            tracing::warn!(
+                "RCLONE_GUI_SESSION_MAX_LIFETIME_HOURS={} is below the idle lifetime of {} h, using {} h",
+                config.max_lifetime_hours,
+                config.ttl_hours,
+                config.ttl_hours
+            );
+            config.max_lifetime_hours = config.ttl_hours;
         }
 
         if let Ok(raw) = std::env::var("RCLONE_GUI_SESSION_COOKIE_SECURE") {
@@ -1145,6 +1195,41 @@ impl SessionConfig {
         ChronoDuration::hours(self.ttl_hours)
     }
 
+    /// The absolute lifetime as a `chrono` duration.
+    pub fn max_lifetime(&self) -> ChronoDuration {
+        ChronoDuration::hours(self.max_lifetime_hours)
+    }
+
+    /// The instant a session dies no matter what, counted from its creation.
+    ///
+    /// Derived from `created_at` instead of stored in a column of its own: the
+    /// creation time is already in the row, so there is nothing to migrate and
+    /// nothing that can drift out of step with `expires_at`.
+    pub fn absolute_deadline(&self, session: &Session) -> DateTime<Utc> {
+        session.created_at + self.max_lifetime()
+    }
+
+    /// The idle deadline a session gets when it is renewed at `now` — the
+    /// sliding window, clamped to the absolute one. Never beyond
+    /// [`Self::absolute_deadline`].
+    pub fn slid_expiry(&self, session: &Session, now: DateTime<Utc>) -> DateTime<Utc> {
+        (now + self.ttl()).min(self.absolute_deadline(session))
+    }
+
+    /// Sessions whose idle deadline is at or before this instant are renewed;
+    /// anything later is left alone.
+    ///
+    /// Half of the idle window. With the default 24 h that is one write per
+    /// session every twelve hours instead of one per request — and the job
+    /// poller alone would otherwise produce 43 200 writes a day. The
+    /// counter-argument to renewing on every request is only cost, but the cost
+    /// is a `UPDATE` on every poll of every open tab, and the benefit over a
+    /// half-window threshold is nil: a client that is active at all is active
+    /// somewhere in the second half of the window too.
+    pub fn renewal_deadline(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        now + ChronoDuration::seconds(self.ttl_hours.saturating_mul(3600) / 2)
+    }
+
     /// `Max-Age` in seconds.
     pub fn max_age_seconds(&self) -> i64 {
         self.ttl_hours.saturating_mul(3600)
@@ -1173,6 +1258,24 @@ impl SessionConfig {
     /// name, path and domain match — with an empty value and `Max-Age=0`.
     pub fn build_clearing_cookie(&self) -> String {
         self.build_cookie("", 0)
+    }
+
+    /// The `Set-Cookie` value that gives the browser a longer `Max-Age` for the
+    /// token it already holds.
+    ///
+    /// **The token is not rotated.** Handing out a new one on a sliding renewal
+    /// would mean that any request racing the rotation carries the old cookie,
+    /// and losing that race logs the user out — the exact failure this ticket
+    /// is about. Only the deadline moves; the credential stays.
+    ///
+    /// `raw_token` comes from the request cookie and is re-checked here, so a
+    /// malformed value can never be echoed back into a header.
+    pub fn refresh_session_cookie(&self, raw_token: &str, max_age: i64) -> Option<String> {
+        if !is_well_formed_token(raw_token) {
+            tracing::warn!("refusing to refresh a cookie for a malformed token");
+            return None;
+        }
+        Some(self.build_cookie(raw_token, max_age.max(0)))
     }
 
     fn build_cookie(&self, value: &str, max_age: i64) -> String {
@@ -1356,7 +1459,10 @@ pub async fn login(
         id: token.hash(),
         user_id: user.id.clone(),
         created_at: now,
-        expires_at: now + config.ttl(),
+        // The idle window, but never past the absolute one — with a sane
+        // configuration the first term wins; a configuration that sets the cap
+        // below the idle window gets the cap.
+        expires_at: now + config.ttl().min(config.max_lifetime()),
         user_agent: user_agent.map(truncate_metadata),
         ip: ip.map(truncate_metadata),
     };
@@ -1427,6 +1533,136 @@ pub async fn authenticate_session(
     }
 
     Ok(Some((session, user)))
+}
+
+/// What an authenticated request did to its session.
+///
+/// `Debug` is hand-written, and must stay that way: the `Renewed` arm carries
+/// the complete `Set-Cookie` header, i.e. the **live session token** of a
+/// request that has just authenticated. A derived `Debug` renders it in clear
+/// text into the first `tracing` line or bug report that touches this value —
+/// which is the sixth time that pattern has appeared in this project, and it
+/// slipped through here precisely because the [`Session`] next to it *is*
+/// correctly redacted, so the output looked clean.
+///
+/// The value is redacted, not dropped: knowing that a cookie was rebuilt (and
+/// that it was not) is the useful part when debugging a renewal, and
+/// `session_refresh_debug_is_redacted` keeps both properties.
+pub enum SessionRefresh {
+    /// Enough of the idle window is left — no database write at all. This is
+    /// the case for the overwhelming majority of requests.
+    Unchanged,
+    /// The idle deadline was pushed forward. Carries the updated row and the
+    /// `Set-Cookie` value that keeps the browser's `Max-Age` in step (the token
+    /// itself is unchanged).
+    Renewed {
+        session: Session,
+        set_cookie: Option<String>,
+    },
+    /// The absolute lifetime is up. The row has been deleted; the caller must
+    /// reject the request as unauthenticated.
+    Expired,
+}
+
+impl std::fmt::Debug for SessionRefresh {
+    /// Shows which branch was taken and, for `Renewed`, the renewed row (whose
+    /// own `Debug` already redacts the session key) — but never the
+    /// `Set-Cookie` value, only whether one was built.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionRefresh::Unchanged => f.write_str("Unchanged"),
+            SessionRefresh::Renewed {
+                session,
+                set_cookie,
+            } => f
+                .debug_struct("Renewed")
+                .field("session", session)
+                .field(
+                    "set_cookie",
+                    &match set_cookie {
+                        Some(_) => "Some(<redacted>)",
+                        None => "None",
+                    },
+                )
+                .finish(),
+            SessionRefresh::Expired => f.write_str("Expired"),
+        }
+    }
+}
+
+/// Apply the sliding expiration to a session that has just authenticated.
+///
+/// Two limits, and they do different jobs:
+///
+///   * the **idle** window ([`SessionConfig::ttl`]) is renewed on activity, so
+///     somebody who works through the night is not thrown out mid-transfer;
+///   * the **absolute** lifetime ([`SessionConfig::absolute_deadline`]) is
+///     never renewed, so a session cannot be kept alive indefinitely by an open
+///     tab that polls.
+///
+/// The absolute limit is enforced on both sides: the renewed deadline is
+/// clamped to it (so `expires_at` alone stays a correct validity test for
+/// `get_valid_session` and a correct deletion test for the cleanup), *and* it is
+/// checked here on the read path. The second check is not redundant — lowering
+/// `RCLONE_GUI_SESSION_MAX_LIFETIME_HOURS` on an existing database leaves rows
+/// whose stored deadline is beyond the new cap, and those must stop working
+/// immediately rather than at their old deadline.
+///
+/// `raw_token` is only used to rebuild the cookie; the row is addressed by
+/// `session.id`, which is already the token digest.
+pub async fn refresh_session(
+    pool: &Pool<Sqlite>,
+    config: &SessionConfig,
+    raw_token: &str,
+    session: &Session,
+    now: DateTime<Utc>,
+) -> Result<SessionRefresh> {
+    let hard_deadline = config.absolute_deadline(session);
+
+    if now >= hard_deadline {
+        tracing::info!(
+            user_id = %session.user_id,
+            "session dropped: absolute lifetime reached"
+        );
+        // Best effort: the request is refused either way, and a failed delete
+        // only means the row waits for the cleanup.
+        if let Err(e) = database::delete_session(pool, &session.id).await {
+            tracing::warn!("could not delete a session past its absolute lifetime: {e}");
+        }
+        return Ok(SessionRefresh::Expired);
+    }
+
+    // The cheap path, and the one nearly every request takes: more than the
+    // threshold is left, so nothing is written and no statement is issued.
+    if session.expires_at > config.renewal_deadline(now) {
+        return Ok(SessionRefresh::Unchanged);
+    }
+
+    let renewed = database::renew_session(
+        pool,
+        &session.id,
+        now,
+        config.slid_expiry(session, now),
+        config.renewal_deadline(now),
+    )
+    .await
+    .context("failed to renew the session")?;
+
+    // `None` means there was nothing left to do: a concurrent request renewed
+    // it first, the absolute cap has already been reached, or the row is gone
+    // because somebody logged out everywhere in the meantime. None of those is
+    // an error for *this* request, which was already authenticated above.
+    let Some(renewed) = renewed else {
+        return Ok(SessionRefresh::Unchanged);
+    };
+
+    let set_cookie =
+        config.refresh_session_cookie(raw_token, (renewed.expires_at - now).num_seconds());
+
+    Ok(SessionRefresh::Renewed {
+        session: renewed,
+        set_cookie,
+    })
 }
 
 /// Invalidate a single session server-side.
@@ -2355,6 +2591,62 @@ mod tests {
         assert_eq!(rendered, "SessionToken(<redacted>)");
     }
 
+    /// The `Renewed` arm carries the whole `Set-Cookie` header, token included.
+    /// A derived `Debug` printed it in clear text once; this test is what keeps
+    /// somebody from re-deriving it.
+    #[test]
+    fn session_refresh_debug_is_redacted() {
+        let config = SessionConfig::default();
+        let token = generate_session_token().expect("RNG must work");
+        let raw = token.expose().to_string();
+        let set_cookie = config.build_session_cookie(&token);
+        assert!(
+            set_cookie.contains(&raw),
+            "precondition: the cookie must actually carry the token"
+        );
+
+        let now = Utc::now();
+        let session = database::Session {
+            id: token.hash(),
+            user_id: "user-1".to_string(),
+            created_at: now,
+            expires_at: now + ChronoDuration::hours(1),
+            user_agent: None,
+            ip: None,
+        };
+
+        let renewed = SessionRefresh::Renewed {
+            session: session.clone(),
+            set_cookie: Some(set_cookie.clone()),
+        };
+        let rendered = format!("{renewed:?}");
+
+        assert!(!rendered.contains(&raw), "the token leaked: {rendered}");
+        // Not even a prefix — a truncated token still identifies the session.
+        assert!(!rendered.contains(&raw[..8]), "a token prefix leaked");
+        // The session key (the digest) must not appear either.
+        assert!(
+            !rendered.contains(&session.id),
+            "the session id leaked: {rendered}"
+        );
+        // Redacted, not dropped: whether a cookie was rebuilt is the part that
+        // makes this output worth reading.
+        assert!(
+            rendered.contains("set_cookie: \"Some(<redacted>)\""),
+            "the field must still be visible as redacted: {rendered}"
+        );
+        assert!(rendered.contains("user_id: \"user-1\""));
+
+        // The other two arms are plain, and `None` must be distinguishable.
+        let no_cookie = SessionRefresh::Renewed {
+            session,
+            set_cookie: None,
+        };
+        assert!(format!("{no_cookie:?}").contains("set_cookie: \"None\""));
+        assert_eq!(format!("{:?}", SessionRefresh::Unchanged), "Unchanged");
+        assert_eq!(format!("{:?}", SessionRefresh::Expired), "Expired");
+    }
+
     #[test]
     fn token_hash_is_stable_one_way_and_distinct() {
         let a = generate_session_token().expect("RNG must work");
@@ -2810,6 +3102,352 @@ mod tests {
             .await
             .expect("lookup")
             .is_some());
+    }
+
+    /// A session that is used all the way through the old hard limit stays
+    /// alive — the point of the ticket. Twelve simulated hops of two hours each
+    /// carry it past 24 h without a single re-login.
+    #[tokio::test]
+    async fn continuous_activity_carries_a_session_past_the_old_hard_limit() {
+        let (pool, _dir) = temp_pool().await;
+        seed_user(&pool, "u1", "alice", GOOD_PASSWORD).await;
+        let config = SessionConfig::default();
+
+        let outcome = login(&pool, &config, "alice", GOOD_PASSWORD, None, None)
+            .await
+            .expect("login");
+        let raw = outcome.token.expose().to_string();
+        let created_at = outcome.session.created_at;
+
+        let mut renewals = 0;
+        for hop in 1..=12 {
+            let now = created_at + ChronoDuration::hours(hop * 2);
+            let session = database::get_valid_session(&pool, &outcome.token.hash(), now)
+                .await
+                .expect("lookup")
+                .unwrap_or_else(|| panic!("session already gone after {} h", hop * 2));
+
+            match refresh_session(&pool, &config, &raw, &session, now)
+                .await
+                .expect("refresh")
+            {
+                SessionRefresh::Renewed { session, .. } => {
+                    renewals += 1;
+                    assert!(session.expires_at > now);
+                }
+                SessionRefresh::Unchanged => {}
+                SessionRefresh::Expired => panic!("expired after {} h of activity", hop * 2),
+            }
+        }
+
+        // Still valid 26 hours in — the old behaviour logged out at 24.
+        let after = created_at + ChronoDuration::hours(26);
+        assert!(database::get_valid_session(&pool, &outcome.token.hash(), after)
+            .await
+            .expect("lookup")
+            .is_some());
+
+        // And it cost a handful of writes, not one per request: with a 24 h
+        // window renewed at half, twelve two-hour hops touch the row twice.
+        assert!(
+            renewals <= 2,
+            "{renewals} writes for 12 requests — the threshold is not holding"
+        );
+    }
+
+    /// The cheap path really is cheap: while more than half the window is left,
+    /// no statement is issued and nothing changes.
+    #[tokio::test]
+    async fn an_early_request_does_not_write() {
+        let (pool, _dir) = temp_pool().await;
+        seed_user(&pool, "u1", "alice", GOOD_PASSWORD).await;
+        let config = SessionConfig::default();
+
+        let outcome = login(&pool, &config, "alice", GOOD_PASSWORD, None, None)
+            .await
+            .expect("login");
+        let raw = outcome.token.expose().to_string();
+
+        for minutes in [0, 1, 60, 11 * 60] {
+            let now = outcome.session.created_at + ChronoDuration::minutes(minutes);
+            assert!(
+                matches!(
+                    refresh_session(&pool, &config, &raw, &outcome.session, now)
+                        .await
+                        .expect("refresh"),
+                    SessionRefresh::Unchanged
+                ),
+                "a request {minutes} min into a 24 h window must not renew"
+            );
+        }
+
+        let stored = database::get_session_by_hash(&pool, &outcome.token.hash())
+            .await
+            .expect("lookup")
+            .expect("session");
+        assert_eq!(stored.expires_at, outcome.session.expires_at);
+    }
+
+    /// The other half of the pair: without activity the session still dies.
+    #[tokio::test]
+    async fn an_idle_session_still_expires() {
+        let (pool, _dir) = temp_pool().await;
+        seed_user(&pool, "u1", "alice", GOOD_PASSWORD).await;
+        let config = SessionConfig::default();
+
+        let outcome = login(&pool, &config, "alice", GOOD_PASSWORD, None, None)
+            .await
+            .expect("login");
+
+        let after = outcome.session.created_at + ChronoDuration::hours(25);
+        assert!(database::get_valid_session(&pool, &outcome.token.hash(), after)
+            .await
+            .expect("lookup")
+            .is_none());
+        // And the renewal path cannot bring it back.
+        assert!(database::renew_session(
+            &pool,
+            &outcome.token.hash(),
+            after,
+            after + config.ttl(),
+            config.renewal_deadline(after),
+        )
+        .await
+        .expect("renew")
+        .is_none());
+    }
+
+    /// The limit that makes the sliding window safe: no amount of activity gets
+    /// a session past its absolute lifetime.
+    #[tokio::test]
+    async fn activity_cannot_push_a_session_past_its_absolute_lifetime() {
+        let (pool, _dir) = temp_pool().await;
+        seed_user(&pool, "u1", "alice", GOOD_PASSWORD).await;
+        // Short windows so the arithmetic is readable; the shape is the same.
+        let config = SessionConfig {
+            ttl_hours: 2,
+            max_lifetime_hours: 5,
+            ..SessionConfig::default()
+        };
+
+        let outcome = login(&pool, &config, "alice", GOOD_PASSWORD, None, None)
+            .await
+            .expect("login");
+        let raw = outcome.token.expose().to_string();
+        let created_at = outcome.session.created_at;
+        let cap = created_at + ChronoDuration::hours(5);
+
+        // Knock every half hour, the way an open tab with a poller would.
+        let mut minutes = 30;
+        let mut last_seen = outcome.session.expires_at;
+        while minutes <= 4 * 60 + 30 {
+            let now = created_at + ChronoDuration::minutes(minutes);
+            let session = database::get_valid_session(&pool, &outcome.token.hash(), now)
+                .await
+                .expect("lookup")
+                .unwrap_or_else(|| panic!("session gone after {minutes} min"));
+
+            if let SessionRefresh::Renewed { session, .. } = refresh_session(
+                &pool, &config, &raw, &session, now,
+            )
+            .await
+            .expect("refresh")
+            {
+                last_seen = session.expires_at;
+            }
+            assert!(
+                last_seen <= cap,
+                "renewal pushed the deadline past the absolute cap"
+            );
+            minutes += 30;
+        }
+
+        // Five hours in it is over, however busy the client was.
+        let past_cap = created_at + ChronoDuration::hours(5) + ChronoDuration::minutes(1);
+        assert!(
+            database::get_valid_session(&pool, &outcome.token.hash(), past_cap)
+                .await
+                .expect("lookup")
+                .is_none(),
+            "a continuously used session outlived its absolute lifetime"
+        );
+    }
+
+    /// Lowering the cap on a running database must take effect at once, not at
+    /// the deadline the row was written with. This is the read-path check.
+    #[tokio::test]
+    async fn a_lowered_absolute_lifetime_ends_a_running_session() {
+        let (pool, _dir) = temp_pool().await;
+        seed_user(&pool, "u1", "alice", GOOD_PASSWORD).await;
+
+        let generous = SessionConfig::default();
+        let outcome = login(&pool, &generous, "alice", GOOD_PASSWORD, None, None)
+            .await
+            .expect("login");
+        let raw = outcome.token.expose().to_string();
+
+        let strict = SessionConfig {
+            ttl_hours: 1,
+            max_lifetime_hours: 1,
+            ..SessionConfig::default()
+        };
+        let now = outcome.session.created_at + ChronoDuration::hours(2);
+
+        assert!(matches!(
+            refresh_session(&pool, &strict, &raw, &outcome.session, now)
+                .await
+                .expect("refresh"),
+            SessionRefresh::Expired
+        ));
+        // Expiring it here also removes the row, so the stale deadline cannot
+        // be found by anybody else either.
+        assert!(database::get_session_by_hash(&pool, &outcome.token.hash())
+            .await
+            .expect("lookup")
+            .is_none());
+    }
+
+    /// The security-relevant one: a renewable session must not survive
+    /// `logout_all_sessions` — that call is what a password reset relies on.
+    #[tokio::test]
+    async fn logout_all_sessions_beats_a_pending_renewal() {
+        let (pool, _dir) = temp_pool().await;
+        seed_user(&pool, "u1", "alice", GOOD_PASSWORD).await;
+        let config = SessionConfig::default();
+
+        let outcome = login(&pool, &config, "alice", GOOD_PASSWORD, None, None)
+            .await
+            .expect("login");
+        let raw = outcome.token.expose().to_string();
+
+        // A moment at which the session is due for renewal.
+        let now = outcome.session.created_at + ChronoDuration::hours(13);
+        let due = database::get_valid_session(&pool, &outcome.token.hash(), now)
+            .await
+            .expect("lookup")
+            .expect("session");
+
+        assert_eq!(logout_all_sessions(&pool, "u1").await.expect("logout"), 1);
+
+        // The renewal now has nothing to renew, and above all it must not
+        // recreate what the logout deleted.
+        assert!(matches!(
+            refresh_session(&pool, &config, &raw, &due, now)
+                .await
+                .expect("refresh"),
+            SessionRefresh::Unchanged
+        ));
+        assert!(database::get_session_by_hash(&pool, &outcome.token.hash())
+            .await
+            .expect("lookup")
+            .is_none());
+        assert!(authenticate_session(&pool, &raw)
+            .await
+            .expect("lookup")
+            .is_none());
+    }
+
+    /// The criterion the single-statement renewal exists for. Read-then-write
+    /// passes every sequential test above and fails this one: it would produce
+    /// one write per racing request instead of one in total.
+    ///
+    /// Built to actually race — several OS threads, a barrier so every task
+    /// reaches the renewal at the same moment, and more tasks than the pool has
+    /// connections, so they queue on SQLite's write lock.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_requests_renew_a_session_exactly_once() {
+        let (pool, _dir) = temp_pool().await;
+        seed_user(&pool, "u1", "alice", GOOD_PASSWORD).await;
+        let config = std::sync::Arc::new(SessionConfig::default());
+
+        let outcome = login(&pool, &config, "alice", GOOD_PASSWORD, None, None)
+            .await
+            .expect("login");
+        let raw = outcome.token.expose().to_string();
+        let hash = outcome.token.hash();
+        // Due for renewal: more than half the window has gone.
+        let now = outcome.session.created_at + ChronoDuration::hours(13);
+        let session = database::get_valid_session(&pool, &hash, now)
+            .await
+            .expect("lookup")
+            .expect("session");
+
+        const REQUESTS: usize = 24;
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(REQUESTS));
+
+        let mut handles = Vec::new();
+        for _ in 0..REQUESTS {
+            let pool = pool.clone();
+            let config = config.clone();
+            let raw = raw.clone();
+            let session = session.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                matches!(
+                    refresh_session(&pool, &config, &raw, &session, now).await,
+                    Ok(SessionRefresh::Renewed { .. })
+                )
+            }));
+        }
+
+        let mut renewed = 0;
+        for handle in handles {
+            if handle.await.expect("join") {
+                renewed += 1;
+            }
+        }
+
+        assert_eq!(
+            renewed, 1,
+            "{REQUESTS} simultaneous requests produced {renewed} writes instead of one"
+        );
+        let stored = database::get_session_by_hash(&pool, &hash)
+            .await
+            .expect("lookup")
+            .expect("session");
+        assert_eq!(stored.expires_at, config.slid_expiry(&session, now));
+        assert!(stored.expires_at <= config.absolute_deadline(&session));
+    }
+
+    /// The renewal hands the browser a fresh `Max-Age` for the token it already
+    /// holds — and never a different token. Rotating on a sliding renewal would
+    /// log out whichever parallel request still carried the old cookie.
+    #[tokio::test]
+    async fn a_renewal_refreshes_the_cookie_without_rotating_the_token() {
+        let (pool, _dir) = temp_pool().await;
+        seed_user(&pool, "u1", "alice", GOOD_PASSWORD).await;
+        let config = SessionConfig::default();
+
+        let outcome = login(&pool, &config, "alice", GOOD_PASSWORD, None, None)
+            .await
+            .expect("login");
+        let raw = outcome.token.expose().to_string();
+        let now = outcome.session.created_at + ChronoDuration::hours(13);
+        let session = database::get_valid_session(&pool, &outcome.token.hash(), now)
+            .await
+            .expect("lookup")
+            .expect("session");
+
+        let SessionRefresh::Renewed { set_cookie, .. } =
+            refresh_session(&pool, &config, &raw, &session, now)
+                .await
+                .expect("refresh")
+        else {
+            panic!("a session past half its window must be renewed");
+        };
+        let cookie = set_cookie.expect("a renewal must refresh the cookie");
+
+        assert!(cookie.contains(&raw), "the cookie must carry the same token");
+        assert!(cookie.contains("HttpOnly"));
+        assert!(cookie.contains("SameSite=Lax"));
+        assert!(cookie.contains("Secure"));
+        // Roughly the full window again — computed from the stored deadline, so
+        // the browser copy cannot outlive the server one.
+        assert!(cookie.contains(&format!("Max-Age={}", 24 * 3600)));
+
+        // A malformed token is never echoed back into a header.
+        assert!(config.refresh_session_cookie("nope", 60).is_none());
     }
 
     #[tokio::test]

@@ -5,6 +5,7 @@ import { state } from '../state.js';
 import { escapeHtml } from '../util/dom.js';
 import { fileIcon, formatBytes, formatTimestamp } from '../util/format.js';
 import { isSelected, updateSelectionUi } from './selection.js';
+import { applyJobMarks } from './jobmarks.js';
 
 // How many entries are added to the DOM per step. A folder with 5000 files
 // stays responsive because only the visible part exists as elements.
@@ -103,6 +104,10 @@ function appendNextChunk() {
 
     items.insertAdjacentHTML('beforeend', slice.map(entryMarkup).join(''));
     observeNewThumbs(items);
+    // Rows for a running job carry a marker. It is applied here and not in
+    // `entryMarkup`, because a chunk that scrolls into view minutes later must
+    // show the job state of *now*, not the one the markup was built with.
+    applyJobMarks(items);
 
     return state.renderCursor.index < state.renderCursor.entries.length;
 }

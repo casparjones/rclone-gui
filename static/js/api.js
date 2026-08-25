@@ -372,6 +372,41 @@ export function deleteSyncJob(jobId) {
     return request(`/api/sync-delete/${jobId}`, { method: 'DELETE' });
 }
 
+// Fetch from a URL ------------------------------------------------------------
+//
+// The **server** fetches the URL and puts the result into the user's home; the
+// browser only asks for it. That is what makes the SSRF guard possible at all
+// (`src/handlers/urlguard.rs`): the address is vetted, and vetted again after
+// every redirect, in one place that the client cannot switch off.
+//
+// `{ url, target_path?, filename? }` — `target_path` is relative to the user's
+// home or an absolute path inside it, and is checked server-side *before* any
+// side effect. Omitting it means the home folder itself. `filename` is a wish;
+// without it the server takes the name from `Content-Disposition` or from the
+// URL, and either way it is stripped of path parts.
+//
+// The answer carries the job id. The fetch is a regular job from there on: it
+// shows up in `GET /api/sync` next to the sync jobs, its log is at
+// `/api/sync/<id>/log`, and it is announced like any other start so the job
+// list refreshes at once instead of waiting for its idle tick.
+export function startUrlFetch(fetchRequest) {
+    return postJson('/api/download-url', fetchRequest).then(announceSyncStarted);
+}
+
+// Asks the server to stop a running fetch. The partial file is removed
+// server-side and the job ends as `cancelled` — there is nothing to clean up
+// here.
+//
+// Only the downloader knows these ids; a sync job id answers "Job not found".
+// `ui/urlfetch.js` keeps track of which ids belong here, and why it has to.
+//
+// Announced like a start: what changed has to become visible without waiting
+// for the ten-second idle tick.
+export function cancelUrlFetch(jobId) {
+    return request(`/api/download-url/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' })
+        .then(announceSyncStarted);
+}
+
 // Tasks ----------------------------------------------------------------------
 
 export function fetchTasks() {

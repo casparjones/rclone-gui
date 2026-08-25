@@ -16,6 +16,7 @@ import { loadConfigs, saveConfig, deleteConfig, persistConfigs } from './ui/conf
 import { initFileBrowser } from './ui/browser.js';
 import {
     closeMenuPanel,
+    getCurrentUser,
     handleDocumentClickForMenu,
     handleMenuKeydown,
     loadCurrentUser,
@@ -39,6 +40,8 @@ import { closeProgressModal, closeSyncModal, startSync } from './ui/sync.js';
 import { createTask, deleteTask, loadTasks, openCreateTaskModal, startTaskFromList } from './ui/tasks.js';
 import { initSyncMode } from './ui/syncmode.js';
 import { initRemotePane } from './ui/remotepane.js';
+import { initUrlFetch } from './ui/urlfetch.js';
+import { initSessionNotice } from './ui/sessionnotice.js';
 import { removeToast } from './util/dom.js';
 
 // The panel sections reload themselves when they become visible. Registering
@@ -54,7 +57,9 @@ document.addEventListener('DOMContentLoaded', function () {
     // Who is signed in. Deliberately first: it is the cheapest request in the
     // startup burst, and if the session is gone it is the one that sends the
     // page to /login before the rest of the UI has drawn anything.
-    loadCurrentUser();
+    // The answer already carries both session deadlines, so the expiry notice
+    // needs no request of its own — it hangs on this one.
+    loadCurrentUser().then(() => initSessionNotice(getCurrentUser()));
 
     // Load initial data
     loadConfigs().then(() => {
@@ -68,6 +73,10 @@ document.addEventListener('DOMContentLoaded', function () {
     // away when the restored mode is already 'sync'.
     initRemotePane();
     initFileBrowser();
+    // The "From URL" button in the file browser toolbar. After
+    // initFileBrowser(), so the first listing is there when the dialog offers
+    // the subfolders of the current folder as targets.
+    initUrlFetch();
     loadSyncJobs();
     loadTasks();
 

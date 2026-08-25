@@ -10,6 +10,12 @@ import * as api from '../api.js';
 import { escapeHtml, showToast } from '../util/dom.js';
 import { formatBytes, formatDuration } from '../util/format.js';
 import { updateActiveJobBadge } from './menu.js';
+import { updateJobMarks } from './jobmarks.js';
+// One direction only: this module asks urlfetch.js whether a job can be
+// cancelled, urlfetch.js never calls back in here. It announces a start and a
+// cancel through `api.js` instead, and the listener at the bottom of this file
+// picks that up — no import cycle, and still no second poller.
+import { cancelUrlFetch, isUrlFetchJob } from './urlfetch.js';
 
 // How often the server is actually asked, in milliseconds.
 //
@@ -61,6 +67,10 @@ export async function loadSyncJobs() {
             displaySyncJobs(result.data);
             updateActiveJobBadge(result.data);
             renderJobBar(result.data);
+            // Same answer, fourth consumer: the markers on the rows of the
+            // file browser. A poller of its own would ask the same route
+            // twice — see the header of jobmarks.js.
+            updateJobMarks(result.data);
         }
     } catch (error) {
         // A failed request must not leave the poller convinced that everything
@@ -195,6 +205,12 @@ function displaySyncJobs(jobs) {
             actions.appendChild(iconButton('btn btn-info btn-sm', LOG_ICON, 'View Log', () => viewSyncLog(job.id)));
             actions.appendChild(iconButton('btn btn-error btn-sm', TRASH_ICON, 'Delete', () => deleteSyncJob(job.id)));
             body.appendChild(actions);
+        } else if (isUrlFetchJob(job.id)) {
+            // Same button as in the bar, and for the same reason it exists only
+            // for a URL fetch: there is no cancel route for a sync job.
+            const actions = el('div', 'flex items-center space-x-2 mt-3');
+            actions.appendChild(cancelButton(job, 'btn btn-warning btn-sm'));
+            body.appendChild(actions);
         }
 
         card.appendChild(body);
@@ -313,13 +329,18 @@ function showLogModal(jobId, logContent) {
 //      other states — its reason is printed next to it, because the reason is
 //      the whole content of the state.
 //
-// Not implemented, deliberately: **cancelling a job from the bar**. The ticket
-// asks for it, but there is no endpoint to call — `src/main.rs` has no cancel
-// route, and `JobStatus::Cancelled` in `src/handlers/sync.rs` is marked
-// `#[allow(dead_code)]` with the note that the cancel button is a ticket of its
-// own. A button that cannot do anything is worse than no button, so there is
-// none. The ✕ on a row hides that row from the bar and nothing else — the job
-// itself stays in the panel with its log.
+// Cancelling from the bar: **only for URL fetches**, and only for those this
+// browser started. When the bar was built there was no cancel route at all;
+// there is one now, but it belongs to the downloader alone
+// (`POST /api/download-url/<id>/cancel`) — a sync job still has nothing to
+// call. And `SyncProgress` carries no field saying which of the two a job is,
+// so the question is put to `ui/urlfetch.js`, which remembers the ids it
+// started; see the header there for why that is a stopgap and what would
+// replace it. A button that cannot do anything is worse than no button, so a
+// row that is not a known URL fetch does not get one.
+//
+// The ✕ on a row is unchanged: it hides that row from the bar and nothing else —
+// the job itself stays in the panel with its log.
 
 const BAR_ID = 'job-bar';
 const BAR_STYLE_ID = 'job-bar-style';
@@ -448,6 +469,20 @@ html[data-theme="dark"] #${BAR_ID} {
     padding: 0 0.25rem;
 }
 #${BAR_ID} .job-bar-hide:hover { opacity: 1; }
+#${BAR_ID} .job-bar-cancel {
+    background: none;
+    border: 1px solid currentColor;
+    border-radius: 0.3rem;
+    color: inherit;
+    opacity: 0.7;
+    cursor: pointer;
+    font: inherit;
+    font-size: 0.72rem;
+    line-height: 1.2;
+    padding: 0.05rem 0.35rem;
+}
+#${BAR_ID} .job-bar-cancel:hover:not(:disabled) { opacity: 1; }
+#${BAR_ID} .job-bar-cancel:disabled { opacity: 0.4; cursor: default; }
 #${BAR_ID} .job-bar-track {
     grid-column: 1 / -1;
     height: 4px;
@@ -498,8 +533,20 @@ html[data-theme="dark"] #${BAR_ID} {
 html[data-theme="dark"] #${BAR_ID} .job-bar-row.is-partial .job-bar-reason { color: #fbbf24; }
 html[data-theme="dark"] #${BAR_ID} .job-bar-row.is-failed  .job-bar-reason { color: #f87171; }
 
-/* The panel list had no colour for 'partial' and fell through to blue. */
-.badge-job-partial {
+/* The panel list had no colour for 'partial' and fell through to blue.
+
+   Two classes in the selector, not one: daisyUI's own .badge sets a background
+   too, this <style> is appended to <head> at runtime and the Tailwind browser
+   build injects its sheet dynamically as well — with equal specificity the
+   winner would come down to whichever landed in the head last. Doubling the
+   class (0,2,0) does not depend on that order. The rule was read in review
+   before and never measured in the panel; this is what made it a coin flip.
+
+   No backticks in this block, ever: it is inside a template literal, and one
+   closes the string. The result stays syntactically valid JavaScript, so
+   node --check says nothing — the page just dies on load. Cost one test run
+   to find. */
+.badge.badge-job-partial {
     background-color: #b45309;
     border-color: #b45309;
     color: #ffffff;
@@ -692,6 +739,24 @@ function transferRate(job) {
     return rate;
 }
 
+// Stop button for a running URL fetch. Used by the bar and by the panel list,
+// so the two cannot drift apart.
+//
+// Disabled the moment it is pressed: the answer only says "cancellation
+// requested" — the writer notices the flag after the current chunk — and a
+// second click would ask again for something already asked.
+function cancelButton(job, className) {
+    const button = el('button', className, 'Stop');
+    button.type = 'button';
+    button.title = 'Stop this download (the partial file is removed)';
+    button.setAttribute('aria-label', `Stop the download of ${job.source_name || 'this file'}`);
+    button.addEventListener('click', () => {
+        button.disabled = true;
+        cancelUrlFetch(job.id);
+    });
+    return button;
+}
+
 function chip(state) {
     const look = STATE_LOOK[state];
     const node = el('span', `job-chip is-${state}`);
@@ -729,6 +794,12 @@ function jobRow(job) {
     // `status` is only the state spelled out and would say nothing twice.
     if (state === 'partial' || state === 'failed') {
         row.appendChild(el('span', 'job-bar-reason', job.status || ''));
+    }
+
+    // A running URL fetch can be stopped. The server removes the partial file
+    // and the job ends as `cancelled`; nothing here has to clean up.
+    if (job.terminal !== true && isUrlFetchJob(job.id)) {
+        right.appendChild(cancelButton(job, 'job-bar-cancel'));
     }
 
     if (job.terminal === true) {

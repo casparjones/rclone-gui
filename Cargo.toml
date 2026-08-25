@@ -32,3 +32,25 @@ argon2 = { version = "0.5.3", features = ["std"] }
 # declare no `rust-version`, so they do not move the MSRV (builder: rust 1.88).
 sha2 = "0.10"
 subtle = "2.6"
+# TLS für den Downloader („Von URL holen"). Bewusst `tokio-rustls` statt eines
+# vollständigen HTTP-Clients: der Transport in `src/handlers/urlguard.rs`
+# bekommt die *geprüfte* Socket-Adresse aus `vet_url` und verbindet selbst —
+# ein Client mit eigener Namensauflösung (oder eigener Redirect-Verfolgung)
+# würde den Rebinding-Schutz aushängen. `tokio-rustls` sieht nur den fertigen
+# `TcpStream` und kann deshalb nicht auflösen.
+#
+# Kosten: **eine** neue Kiste. `rustls` (0.23.32, ring), `rustls-pki-types`,
+# `ring` und `webpki-roots` liegen über `sqlx/runtime-tokio-rustls` längst im
+# Baum. `reqwest 0.12` wären 20 zusätzliche Kisten gewesen (inkl. quinn und
+# einer zweiten `tower-http`-Version).
+#
+# MSRV: tokio-rustls 0.26.4 = 1.71, rustls 0.23.32 = 1.71, ring = 1.66,
+# webpki-roots = keine Angabe. Builder im Dockerfile: rust 1.88.
+#
+# `default-features = false` ist Absicht: die Standardauswahl zieht
+# `aws-lc-rs` herein (C-Toolchain im Builder) und würde neben dem bereits
+# aktiven `ring` zu zwei Krypto-Anbietern führen. Der Anbieter wird zusätzlich
+# ausdrücklich übergeben (`builder_with_provider`), damit nichts an einer
+# prozessweiten Vorbelegung hängt.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+webpki-roots = "0.26"

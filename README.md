@@ -101,6 +101,39 @@ Execute pre-configured sync tasks from the command line:
 # Perfect for cron jobs, scripts, and automation
 ```
 
+#### Exit codes
+
+`--start-task` exits with a code that a script can branch on. The code is a
+stable interface — treat anything not listed here as a failure.
+
+| Code | Meaning | Where it is reported |
+|---|---|---|
+| `0` | The task completed. Everything was transferred. | stdout, `✅ … completed successfully!` |
+| `1` | The task failed, or it could not be started at all (unknown task name, unresolvable account, rejected sync request). Nothing can be assumed about the target. | stderr, `❌ …` |
+| `2` | Bad invocation — an unknown flag or a missing argument value. Emitted by the argument parser, before any task runs. | stderr |
+| `4` | The task finished **partially**: some of the data arrived, some did not. Not an error, so it goes to stdout. | stdout, `◑ … finished partially: <reason>` |
+
+Code `4` exists because "some files could not be read" and "a source file
+vanished mid-run" (rsync exit 23 and 24) are everyday events in a directory
+that is being used, not outages. Reporting them as `1` would make a monitoring
+script cry wolf; reporting them as `0` would hide real data loss. The
+individual rsync code is deliberately **not** passed through — a partial run is
+one outcome, and a numeric passthrough would imply a script can tell 23 from
+24. The human-readable reason is on stdout, the affected files are in the job
+log.
+
+A script that only cares whether everything arrived checks for `0`. One that
+tolerates gaps treats `0` and `4` as acceptable and retries on `4`:
+
+```bash
+./rclone-gui --start-task my-backup-task
+case $? in
+  0) echo "complete" ;;
+  4) echo "partial - retrying later" ;;
+  *) echo "failed" >&2; exit 1 ;;
+esac
+```
+
 ## Web Interface
 
 Open your browser to `http://127.0.0.1:8080` (or your custom bind address) to access the modern GUI.

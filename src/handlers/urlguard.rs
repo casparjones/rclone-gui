@@ -853,11 +853,44 @@ where
         .map_err(|_| GuardError::Timeout)
 }
 
-async fn read_response<R>(
+/// Der Kopfteil einer Antwort, Körper noch ungelesen.
+///
+/// Getrennt vom Körper, weil der streamende Weg (siehe [`BodySource`]) genau
+/// diese Trennung braucht: erst entscheiden, ob es eine Weiterleitung ist und
+/// wie die Datei heissen soll, dann die Nutzdaten laufen lassen — ohne sie
+/// vorher im Speicher zu haben.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HopHead {
+    pub status: u16,
+    pub location: Option<String>,
+    pub content_type: Option<String>,
+    /// Roher `Content-Disposition`-Wert. **Ungeprüfte Fremdeingabe** — wer
+    /// daraus einen Dateinamen macht, säubert ihn (siehe
+    /// `handlers::downloader::sanitize_filename`).
+    pub content_disposition: Option<String>,
+    pub content_length: Option<u64>,
+    /// `Transfer-Encoding: chunked`. Privat, weil es reine Rahmung ist und den
+    /// Aufrufer nichts angeht.
+    chunked: bool,
+}
+
+impl HopHead {
+    /// Eine Weiterleitung, der auch gefolgt werden kann.
+    fn is_redirect(&self) -> bool {
+        matches!(self.status, 301 | 302 | 303 | 307 | 308) && self.location.is_some()
+    }
+}
+
+/// Liest Statuszeile und Kopfzeilen — der einzige Header-Parser dieses Moduls.
+///
+/// Beide Wege (gepuffert und streamend) hängen daran, damit eine Regel wie die
+/// frühe Ablehnung einer zu grossen `Content-Length` nicht an einer von zwei
+/// Stellen fehlt.
+async fn read_head<R>(
     reader: &mut R,
     policy: &GuardPolicy,
     deadline: Instant,
-) -> Result<HopResponse, GuardError>
+) -> Result<HopHead, GuardError>
 where
     R: AsyncBufRead + Unpin,
 {
@@ -867,6 +900,7 @@ where
 
     let mut location = None;
     let mut content_type = None;
+    let mut content_disposition = None;
     let mut content_length: Option<u64> = None;
     let mut chunked = false;
 
@@ -884,6 +918,9 @@ where
         match name.as_str() {
             "location" if location.is_none() => location = Some(value.to_string()),
             "content-type" if content_type.is_none() => content_type = Some(value.to_string()),
+            "content-disposition" if content_disposition.is_none() => {
+                content_disposition = Some(value.to_string())
+            }
             "content-length" => {
                 let n: u64 = value
                     .parse()
@@ -904,20 +941,42 @@ where
         }
     }
 
-    // Bei einer Weiterleitung interessiert der Körper nicht — er wird gar
-    // nicht erst gelesen.
-    let body = if (300..400).contains(&status) && location.is_some() {
-        Vec::new()
-    } else if chunked {
-        read_chunked(reader, policy, deadline).await?
-    } else {
-        read_fixed(reader, policy, deadline, content_length).await?
-    };
-
-    Ok(HopResponse {
+    Ok(HopHead {
         status,
         location,
         content_type,
+        content_disposition,
+        content_length,
+        chunked,
+    })
+}
+
+/// Kopfteil **und** Körper, vollständig im Speicher. Der gepufferte Weg für
+/// [`TcpTransport`] und die Tests dieses Moduls.
+async fn read_response<R>(
+    reader: &mut R,
+    policy: &GuardPolicy,
+    deadline: Instant,
+) -> Result<HopResponse, GuardError>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let head = read_head(reader, policy, deadline).await?;
+
+    // Bei einer Weiterleitung interessiert der Körper nicht — er wird gar
+    // nicht erst gelesen.
+    let body = if head.is_redirect() {
+        Vec::new()
+    } else if head.chunked {
+        read_chunked(reader, policy, deadline).await?
+    } else {
+        read_fixed(reader, policy, deadline, head.content_length).await?
+    };
+
+    Ok(HopResponse {
+        status: head.status,
+        location: head.location,
+        content_type: head.content_type,
         body,
     })
 }
@@ -1148,6 +1207,371 @@ pub async fn fetch_guarded(
                     content_type: response.content_type,
                     body: response.body,
                 });
+            }
+        }
+    }
+
+    Err(GuardError::TooManyRedirects(policy.max_redirects))
+}
+
+// ---------------------------------------------------------------------------
+// Streamender Transport (der produktive Weg)
+//
+// Warum nicht einfach ein fertiger HTTP-Client?
+//
+// Weil jeder fertige Client zwei Dinge selbst tut, die er hier nicht tun darf:
+// **auflösen** und **Weiterleitungen folgen**. Beides hängt den Schutz dieses
+// Moduls aus — eine eigene Auflösung ersetzt die geprüfte Adresse durch eine
+// ungeprüfte (Rebinding), und eine eigene Redirect-Verfolgung springt zu einem
+// Ziel, das `vet_url` nie gesehen hat.
+//
+// Deshalb: TLS kommt aus `tokio-rustls`, HTTP/1.1 bleibt hier. `tokio-rustls`
+// bekommt einen fertig verbundenen `TcpStream` und hat gar keine Möglichkeit,
+// einen Namen aufzulösen; die Redirect-Schleife führt weiterhin
+// [`fetch_guarded_stream`], und zwar mit demselben `vet_url` je Sprung wie der
+// gepufferte Weg.
+//
+// Der Unterschied zu [`TcpTransport`] ist genau zweierlei: `https`, und der
+// Körper wird **nicht** im Speicher gehalten. Ohne das zweite wäre `max_bytes`
+// (512 MiB) eine Speichergrenze und keine Downloadgrenze.
+// ---------------------------------------------------------------------------
+
+/// Grösse eines gelesenen Stücks. 64 KiB ist die Grösse, die auch der
+/// Datei-Download in `handlers::download` benutzt.
+const STREAM_CHUNK: usize = 64 * 1024;
+
+/// Der Körper einer Antwort, stückweise abrufbar.
+///
+/// Ein leeres Stück heisst „fertig". Die Grössengrenze wird hier ein zweites
+/// Mal geprüft, nicht nur am `Content-Length`: eine gelogene oder fehlende
+/// Längenangabe darf nicht mehr Bytes durchlassen als erlaubt.
+pub trait BodySource: Send {
+    fn next_chunk<'a>(
+        &'a mut self,
+        deadline: Instant,
+    ) -> BoxFuture<'a, Result<Vec<u8>, GuardError>>;
+}
+
+/// Wie das Ende des Körpers erkannt wird.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Framing {
+    /// `Content-Length`: so viele Bytes, dann fertig.
+    Length(u64),
+    /// `Transfer-Encoding: chunked`.
+    Chunked,
+    /// Weder noch — der Körper endet mit der Verbindung.
+    Eof,
+}
+
+/// Streamender Leser über einer bereits gelesenen Kopfzeile.
+struct BodyReader<R> {
+    reader: R,
+    framing: Framing,
+    /// Rest des laufenden Chunks (nur `Chunked`).
+    chunk_left: u64,
+    /// Rest des Körpers (nur `Length`).
+    body_left: u64,
+    /// Bereits gelesene Nutzbytes — die Grenze gilt für die Summe.
+    read_total: u64,
+    max_bytes: u64,
+    finished: bool,
+}
+
+impl<R> BodyReader<R>
+where
+    R: AsyncBufRead + Unpin + Send,
+{
+    fn new(reader: R, head: &HopHead, policy: &GuardPolicy) -> Self {
+        let framing = if head.chunked {
+            Framing::Chunked
+        } else {
+            match head.content_length {
+                Some(n) => Framing::Length(n),
+                None => Framing::Eof,
+            }
+        };
+        Self {
+            reader,
+            framing,
+            chunk_left: 0,
+            body_left: match framing {
+                Framing::Length(n) => n,
+                _ => 0,
+            },
+            read_total: 0,
+            max_bytes: policy.max_bytes,
+            finished: false,
+        }
+    }
+
+    /// Liest höchstens `want` Bytes und zählt sie gegen die Grenze.
+    async fn read_up_to(&mut self, want: usize, deadline: Instant) -> Result<Vec<u8>, GuardError> {
+        let mut buf = vec![0u8; want.min(STREAM_CHUNK)];
+        let n = with_deadline(deadline, self.reader.read(&mut buf))
+            .await?
+            .map_err(|e| GuardError::Io(e.to_string()))?;
+        buf.truncate(n);
+        self.read_total = self.read_total.saturating_add(n as u64);
+        if self.read_total > self.max_bytes {
+            return Err(GuardError::TooLarge {
+                limit: self.max_bytes,
+            });
+        }
+        Ok(buf)
+    }
+
+    async fn next(&mut self, deadline: Instant) -> Result<Vec<u8>, GuardError> {
+        if self.finished {
+            return Ok(Vec::new());
+        }
+        match self.framing {
+            Framing::Length(_) => {
+                if self.body_left == 0 {
+                    self.finished = true;
+                    return Ok(Vec::new());
+                }
+                let want = self.body_left.min(STREAM_CHUNK as u64) as usize;
+                let chunk = self.read_up_to(want, deadline).await?;
+                if chunk.is_empty() {
+                    // Angekündigte Länge nicht erreicht: die Datei wäre
+                    // abgeschnitten. Das ist ein Fehler, kein Ende.
+                    return Err(GuardError::Io(
+                        "Verbindung vor dem angekündigten Ende des Körpers geschlossen".into(),
+                    ));
+                }
+                self.body_left -= chunk.len() as u64;
+                if self.body_left == 0 {
+                    self.finished = true;
+                }
+                Ok(chunk)
+            }
+            Framing::Eof => {
+                let chunk = self.read_up_to(STREAM_CHUNK, deadline).await?;
+                if chunk.is_empty() {
+                    self.finished = true;
+                }
+                Ok(chunk)
+            }
+            Framing::Chunked => {
+                if self.chunk_left == 0 {
+                    let mut header_bytes = 0usize;
+                    let line =
+                        read_line_limited(&mut self.reader, deadline, &mut header_bytes).await?;
+                    let size_field = line.trim_end_matches(['\r', '\n']);
+                    let size_hex = size_field.split(';').next().unwrap_or("").trim();
+                    let size = u64::from_str_radix(size_hex, 16)
+                        .map_err(|_| GuardError::BadResponse("Chunk-Grösse ungültig".into()))?;
+                    if size == 0 {
+                        // Trailer bis zur Leerzeile schlucken.
+                        loop {
+                            let mut hb = 0usize;
+                            let t = read_line_limited(&mut self.reader, deadline, &mut hb).await?;
+                            if t.trim_end_matches(['\r', '\n']).is_empty() {
+                                break;
+                            }
+                        }
+                        self.finished = true;
+                        return Ok(Vec::new());
+                    }
+                    // Die angekündigte Chunk-Grösse zählt sofort gegen die
+                    // Grenze — ein Chunk-Header mit 4 GiB wird abgewiesen,
+                    // bevor ein Byte davon gelesen wird.
+                    if self.read_total.saturating_add(size) > self.max_bytes {
+                        return Err(GuardError::TooLarge {
+                            limit: self.max_bytes,
+                        });
+                    }
+                    self.chunk_left = size;
+                }
+                let want = self.chunk_left.min(STREAM_CHUNK as u64) as usize;
+                let chunk = self.read_up_to(want, deadline).await?;
+                if chunk.is_empty() {
+                    return Err(GuardError::Io("Verbindung mitten im Chunk zu".into()));
+                }
+                self.chunk_left -= chunk.len() as u64;
+                if self.chunk_left == 0 {
+                    // Das CRLF hinter den Nutzdaten.
+                    let mut hb = 0usize;
+                    read_line_limited(&mut self.reader, deadline, &mut hb).await?;
+                }
+                Ok(chunk)
+            }
+        }
+    }
+}
+
+impl<R> BodySource for BodyReader<R>
+where
+    R: AsyncBufRead + Unpin + Send,
+{
+    fn next_chunk<'a>(
+        &'a mut self,
+        deadline: Instant,
+    ) -> BoxFuture<'a, Result<Vec<u8>, GuardError>> {
+        Box::pin(self.next(deadline))
+    }
+}
+
+/// Führt einen Sprung aus und lässt den Körper **offen**.
+///
+/// Was [`StreamingTransport::open`] liefert: Kopfteil und offener Körper.
+pub type OpenedHop<'a> = BoxFuture<'a, Result<(HopHead, Box<dyn BodySource>), GuardError>>;
+
+/// Wie [`Transport`], nur ohne den Körper im Speicher. Dieselbe Auflage: die
+/// Implementierung löst nicht auf, sie verbindet mit `target.addr()`.
+pub trait StreamingTransport: Send + Sync {
+    fn open<'a>(
+        &'a self,
+        target: &'a VettedTarget,
+        policy: &'a GuardPolicy,
+        deadline: Instant,
+    ) -> OpenedHop<'a>;
+}
+
+/// Ein Strom, über den gelesen und geschrieben wird — `TcpStream` oder
+/// `TlsStream`. Der Hilfstrait existiert nur, weil ein Trait-Objekt nicht zwei
+/// Traits auf einmal nennen kann.
+trait Duplex: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send {}
+impl<T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send> Duplex for T {}
+
+/// HTTP/1.1 über TCP **oder** TLS, streamend. Der produktive Transport.
+pub struct StreamingHttpTransport;
+
+/// Die rustls-Konfiguration wird einmal gebaut und geteilt — das Einlesen der
+/// Wurzelzertifikate je Abruf wäre reine Verschwendung.
+static TLS_CONFIG: std::sync::OnceLock<Arc<tokio_rustls::rustls::ClientConfig>> =
+    std::sync::OnceLock::new();
+
+/// Wurzelzertifikate aus `webpki-roots`, Anbieter **ausdrücklich** `ring`.
+///
+/// `ClientConfig::builder()` würde den prozessweiten Standardanbieter nehmen.
+/// Der ist nicht gesetzt, wenn mehr als einer einkompiliert ist — dann
+/// paniert der Aufbau. `builder_with_provider` hängt an nichts Globalem.
+fn tls_config() -> Result<Arc<tokio_rustls::rustls::ClientConfig>, GuardError> {
+    if let Some(cfg) = TLS_CONFIG.get() {
+        return Ok(Arc::clone(cfg));
+    }
+    let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+    let config = tokio_rustls::rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| GuardError::Io(format!("TLS-Konfiguration: {e}")))?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let config = Arc::new(config);
+    // `set` kann verlieren, wenn zwei Abrufe gleichzeitig starten; dann gilt
+    // die fremde Konfiguration, die identisch ist.
+    let _ = TLS_CONFIG.set(Arc::clone(&config));
+    Ok(TLS_CONFIG.get().map(Arc::clone).unwrap_or(config))
+}
+
+impl StreamingTransport for StreamingHttpTransport {
+    fn open<'a>(
+        &'a self,
+        target: &'a VettedTarget,
+        policy: &'a GuardPolicy,
+        deadline: Instant,
+    ) -> OpenedHop<'a> {
+        Box::pin(async move {
+            // Die Adresse kommt aus dem `VettedTarget` — hier wird nichts
+            // aufgelöst. `connect_vetted` prüft zusätzlich die tatsächliche
+            // Gegenstelle nach dem Verbindungsaufbau.
+            let tcp = connect_vetted(target, policy, deadline).await?;
+
+            let stream: Box<dyn Duplex> = if target.url().is_tls() {
+                let config = tls_config()?;
+                // SNI und Zertifikatsprüfung gegen den **Namen** aus der URL,
+                // verbunden wird mit der geprüften Adresse. Genau diese
+                // Trennung ist der Punkt.
+                let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from(
+                    target.url().host.clone(),
+                )
+                .map_err(|_| {
+                    GuardError::MalformedUrl(format!(
+                        "'{}' ist kein gültiger TLS-Servername",
+                        target.url().host
+                    ))
+                })?;
+                let connector = tokio_rustls::TlsConnector::from(config);
+                let tls = with_deadline(deadline, connector.connect(server_name, tcp))
+                    .await?
+                    .map_err(|e| GuardError::Io(format!("TLS-Handshake: {e}")))?;
+                Box::new(tls)
+            } else {
+                Box::new(tcp)
+            };
+
+            let request = format!(
+                "GET {} HTTP/1.1\r\nHost: {}\r\nUser-Agent: rclone-gui\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",
+                target.url().path_and_query,
+                target.url().host_header()
+            );
+            let mut reader = BufReader::new(stream);
+            with_deadline(deadline, async {
+                reader
+                    .get_mut()
+                    .write_all(request.as_bytes())
+                    .await
+                    .map_err(|e| GuardError::Io(e.to_string()))
+            })
+            .await??;
+
+            let head = read_head(&mut reader, policy, deadline).await?;
+            let body = BodyReader::new(reader, &head, policy);
+            Ok((head, Box::new(body) as Box<dyn BodySource>))
+        })
+    }
+}
+
+/// Ergebnis eines streamenden Abrufs: alles ausser den Nutzdaten.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamedResponse {
+    /// Die URL, von der der Körper stammt — nach allen Weiterleitungen.
+    pub final_url: ParsedUrl,
+    /// Die Adresse, mit der zuletzt tatsächlich verbunden wurde.
+    pub final_addr: SocketAddr,
+    pub head: HopHead,
+}
+
+/// Wie [`fetch_guarded`], nur dass der Körper offen zurückgegeben wird.
+///
+/// Die Redirect-Schleife bleibt **hier**: jeder Sprung geht durch [`vet_url`],
+/// der Körper eines Zwischensprungs wird nicht gelesen, sondern fallen
+/// gelassen (womit die Verbindung zugeht).
+pub async fn fetch_guarded_stream(
+    url: &str,
+    policy: &GuardPolicy,
+    resolver: &dyn Resolver,
+    transport: &dyn StreamingTransport,
+) -> Result<(StreamedResponse, Box<dyn BodySource>), GuardError> {
+    let deadline = Instant::now() + policy.total_timeout;
+    let mut current = url.to_string();
+
+    for hop in 0..=policy.max_redirects {
+        let target = vet_url(&current, policy, resolver).await?;
+        let (head, body) = transport.open(&target, policy, deadline).await?;
+
+        match (head.is_redirect(), head.location.as_deref()) {
+            (true, Some(location)) => {
+                if hop == policy.max_redirects {
+                    return Err(GuardError::TooManyRedirects(policy.max_redirects));
+                }
+                let next = resolve_location(target.url(), location)?;
+                tracing::debug!(from = %target.url(), to = %next, "urlguard: Weiterleitung");
+                // Körper des Zwischensprungs interessiert nicht.
+                drop(body);
+                current = next;
+            }
+            _ => {
+                return Ok((
+                    StreamedResponse {
+                        final_url: target.url().clone(),
+                        final_addr: target.addr(),
+                        head,
+                    },
+                    body,
+                ));
             }
         }
     }
@@ -2107,5 +2531,308 @@ mod tests {
         // der Platz ist frei.
         assert_eq!(slots.in_use("anna"), 0);
         assert!(slots.acquire("anna").is_ok());
+    }
+
+    // -- Redirect-Kette auf dem streamenden Weg ----------------------------
+    //
+    // Derselbe Nachweis wie für den gepufferten Weg, aber gegen
+    // `fetch_guarded_stream`: der produktive Downloader benutzt
+    // ausschliesslich diese Schleife, und ein Schutz, der nur im gepufferten
+    // Weg geprüft ist, sagt über ihn nichts.
+
+    /// Körper aus dem Speicher, in einem Stück.
+    struct VecBody(Option<Vec<u8>>);
+
+    impl BodySource for VecBody {
+        fn next_chunk<'a>(
+            &'a mut self,
+            _deadline: Instant,
+        ) -> BoxFuture<'a, Result<Vec<u8>, GuardError>> {
+            let out = self.0.take().unwrap_or_default();
+            Box::pin(async move { Ok(out) })
+        }
+    }
+
+    /// Liefert vorgegebene Kopfteile und merkt sich die angesprochenen
+    /// Adressen — das Gegenstück zu [`MockTransport`] für den Strom-Weg.
+    struct MockStreamingTransport {
+        heads: Mutex<Vec<HopHead>>,
+        seen: Mutex<Vec<SocketAddr>>,
+    }
+
+    impl MockStreamingTransport {
+        fn new(heads: Vec<HopHead>) -> Self {
+            Self {
+                heads: Mutex::new(heads),
+                seen: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl StreamingTransport for MockStreamingTransport {
+        fn open<'a>(
+            &'a self,
+            target: &'a VettedTarget,
+            _policy: &'a GuardPolicy,
+            _deadline: Instant,
+        ) -> OpenedHop<'a> {
+            self.seen.lock().unwrap().push(target.addr);
+            let mut heads = self.heads.lock().unwrap();
+            let next = if heads.is_empty() {
+                Err(GuardError::BadResponse("keine Antwort mehr".into()))
+            } else {
+                let head = heads.remove(0);
+                Ok((
+                    head,
+                    Box::new(VecBody(Some(b"nutzdaten".to_vec()))) as Box<dyn BodySource>,
+                ))
+            };
+            Box::pin(async move { next })
+        }
+    }
+
+    fn stream_redirect(to: &str) -> HopHead {
+        HopHead {
+            status: 302,
+            location: Some(to.to_string()),
+            content_type: None,
+            content_disposition: None,
+            content_length: Some(0),
+            chunked: false,
+        }
+    }
+
+    fn stream_ok() -> HopHead {
+        HopHead {
+            status: 200,
+            location: None,
+            content_type: Some("application/octet-stream".into()),
+            content_disposition: None,
+            content_length: Some(9),
+            chunked: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_redirect_to_metadata_address_is_rejected() {
+        let t = MockStreamingTransport::new(vec![stream_redirect(
+            "http://169.254.169.254/latest/meta-data/",
+        )]);
+        let err = fetch_guarded_stream(
+            "http://public.example.com/start",
+            &GuardPolicy::default(),
+            &public_resolver(),
+            &t,
+        )
+        .await
+        .err()
+        .expect("müsste abgewiesen werden");
+        assert_eq!(err, GuardError::BlockedAddress(ip("169.254.169.254")));
+        // Der zweite Sprung wurde nie verbunden.
+        assert_eq!(t.seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_later_hop_to_loopback_is_rejected() {
+        let t = MockStreamingTransport::new(vec![
+            stream_redirect("http://second.example.com/next"),
+            stream_redirect("http://127.0.0.1/secret"),
+        ]);
+        let err = fetch_guarded_stream(
+            "http://public.example.com/start",
+            &GuardPolicy::default(),
+            &public_resolver(),
+            &t,
+        )
+        .await
+        .err()
+        .expect("müsste abgewiesen werden");
+        assert_eq!(err, GuardError::BlockedAddress(ip("127.0.0.1")));
+        assert_eq!(t.seen.lock().unwrap().len(), 2);
+    }
+
+    /// Gegenprobe: ohne Weiterleitung auf eine gesperrte Adresse geht derselbe
+    /// Aufbau durch. Ohne das wären die beiden Tests darüber auch grün, wenn
+    /// `fetch_guarded_stream` grundsätzlich nichts durchliesse.
+    #[tokio::test]
+    async fn stream_public_chain_succeeds() {
+        let t = MockStreamingTransport::new(vec![
+            stream_redirect("http://second.example.com/next"),
+            stream_ok(),
+        ]);
+        let (response, mut body) = fetch_guarded_stream(
+            "http://public.example.com/start",
+            &GuardPolicy::default(),
+            &public_resolver(),
+            &t,
+        )
+        .await
+        .expect("öffentliche Kette");
+        assert_eq!(
+            response.final_addr,
+            SocketAddr::new(ip("93.184.216.35"), 80)
+        );
+        assert_eq!(response.head.content_length, Some(9));
+        let chunk = body
+            .next_chunk(Instant::now() + Duration::from_secs(1))
+            .await
+            .expect("Körper");
+        assert_eq!(chunk, b"nutzdaten".to_vec());
+    }
+
+    #[tokio::test]
+    async fn stream_redirect_chain_is_capped() {
+        let policy = GuardPolicy {
+            max_redirects: 2,
+            ..GuardPolicy::default()
+        };
+        let heads = vec![
+            stream_redirect("http://public.example.com/1"),
+            stream_redirect("http://public.example.com/2"),
+            stream_redirect("http://public.example.com/3"),
+            stream_redirect("http://public.example.com/4"),
+        ];
+        let t = MockStreamingTransport::new(heads);
+        assert_eq!(
+            fetch_guarded_stream(
+                "http://public.example.com/start",
+                &policy,
+                &public_resolver(),
+                &t
+            )
+            .await
+            .err(),
+            Some(GuardError::TooManyRedirects(2))
+        );
+        // Drei Verbindungen: der Startabruf und zwei erlaubte Sprünge.
+        assert_eq!(t.seen.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn stream_rejects_non_http_redirect() {
+        let t = MockStreamingTransport::new(vec![stream_redirect("file:///etc/passwd")]);
+        assert!(matches!(
+            fetch_guarded_stream(
+                "http://public.example.com/start",
+                &GuardPolicy::default(),
+                &public_resolver(),
+                &t
+            )
+            .await
+            .err(),
+            Some(GuardError::UnsupportedScheme(_))
+        ));
+    }
+
+    /// Rebinding gegen den **streamenden** Weg: der Transport bekommt die
+    /// zuerst geprüfte Adresse, nicht die des zweiten DNS-Ergebnisses.
+    #[tokio::test]
+    async fn stream_transport_sees_only_the_vetted_address() {
+        struct Rebinding(AtomicUsize);
+        impl Resolver for Rebinding {
+            fn resolve<'a>(
+                &'a self,
+                _host: &'a str,
+                port: u16,
+            ) -> BoxFuture<'a, Result<Vec<SocketAddr>, GuardError>> {
+                let n = self.0.fetch_add(1, Ordering::SeqCst);
+                let addr = if n == 0 {
+                    ip("93.184.216.34")
+                } else {
+                    ip("127.0.0.1")
+                };
+                Box::pin(async move { Ok(vec![SocketAddr::new(addr, port)]) })
+            }
+        }
+        let t = MockStreamingTransport::new(vec![stream_ok()]);
+        let (response, _body) = fetch_guarded_stream(
+            "http://rebind.example.com/f.bin",
+            &GuardPolicy::default(),
+            &Rebinding(AtomicUsize::new(0)),
+            &t,
+        )
+        .await
+        .expect("erster Abruf");
+        assert_eq!(response.final_addr.ip(), ip("93.184.216.34"));
+        assert_eq!(
+            t.seen.lock().unwrap().as_slice(),
+            &[SocketAddr::new(ip("93.184.216.34"), 80)]
+        );
+    }
+
+    /// **Der Nachweis für Regel 1 am produktiven Transport.**
+    ///
+    /// Der Mock-Test darüber prüft nur, welche Adresse die Guard-Schleife dem
+    /// Transport *übergibt* — nicht, dass `StreamingHttpTransport::open` sie
+    /// auch benutzt. Ersetzt man dort `connect_vetted` durch ein eigenes
+    /// `TcpStream::connect` auf `target.url().host`, bleibt er grün. Gemessen:
+    /// die gesamte Suite bleibt grün. Ein Test, der nicht fehlschlagen kann.
+    ///
+    /// Hier ist der Unterschied beobachtbar. `t4probe.invalid` ist nach
+    /// RFC 2606 garantiert **nicht auflösbar**; der `StaticResolver` bildet
+    /// den Namen trotzdem auf den lokalen Testserver ab. Löst der Transport
+    /// selbst auf, scheitert der Verbindungsaufbau — nimmt er die Adresse aus
+    /// dem `VettedTarget`, gelingt der Abruf. Kein echtes Netzwerkziel nötig.
+    #[tokio::test]
+    async fn streaming_transport_connects_to_the_vetted_address_without_resolving() {
+        let base =
+            spawn_server(|_| b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhallo".to_vec()).await;
+        let port: u16 = base
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .expect("Port aus der Basis-URL");
+        let resolver = StaticResolver::new().with("t4probe.invalid", &[ip("127.0.0.1")]);
+
+        let (response, mut body) = fetch_guarded_stream(
+            &format!("http://t4probe.invalid:{port}/f.bin"),
+            &GuardPolicy::for_tests(),
+            &resolver,
+            &StreamingHttpTransport,
+        )
+        .await
+        .expect("der Transport muss die geprüfte Adresse benutzen statt selbst aufzulösen");
+
+        assert_eq!(response.final_addr, SocketAddr::new(ip("127.0.0.1"), port));
+        // Der Name bleibt der Name — er geht in `Host:` und SNI, nicht in die
+        // Verbindung. Genau diese Trennung ist der Schutz.
+        assert_eq!(response.final_url.host, "t4probe.invalid");
+        let chunk = body
+            .next_chunk(Instant::now() + Duration::from_secs(5))
+            .await
+            .expect("Körper");
+        assert_eq!(chunk, b"hallo".to_vec());
+    }
+
+    /// Der Körper wird gegen `max_bytes` gezählt, auch wenn die Gegenstelle
+    /// keine Länge nennt (`Framing::Eof`).
+    #[tokio::test]
+    async fn stream_body_limit_applies_without_content_length() {
+        let policy = GuardPolicy {
+            max_bytes: 8,
+            ..GuardPolicy::default()
+        };
+        let head = HopHead {
+            status: 200,
+            location: None,
+            content_type: None,
+            content_disposition: None,
+            content_length: None,
+            chunked: false,
+        };
+        // 32 Byte ohne Längenangabe: der Leser muss bei 8 abbrechen.
+        let data = [b'x'; 32];
+        let mut reader = BodyReader::new(BufReader::new(&data[..]), &head, &policy);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut total = 0usize;
+        let err = loop {
+            match reader.next(deadline).await {
+                Ok(chunk) if chunk.is_empty() => panic!("hätte scheitern müssen"),
+                Ok(chunk) => total += chunk.len(),
+                Err(e) => break e,
+            }
+        };
+        assert_eq!(err, GuardError::TooLarge { limit: 8 });
+        assert!(total <= 8, "{total} Byte durchgelassen");
     }
 }

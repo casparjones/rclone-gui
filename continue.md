@@ -163,11 +163,39 @@ hätte. Sie gehören in jeden künftigen Prompt:
   in seiner Umgebung (Zeitzonen), zog es nach `Done` und liess **beide** Kommentare
   stehen.
 
-### Ein Muster, fünfmal gefunden — die Serie ist geschlossen
-`derive(Debug)` mit einem Geheimnis im Struct: `LoginOutcome`, `ModuleConfig`,
-`RcloneConfig`, `ConfigRequest`, `NewShare`. Ein Tester hat `src/**` abschliessend
-durchsucht. Bei jedem neuen Struct mit Geheimnis: handgeschriebenes `Debug` **und ein
-Test**, sonst entsteht es wieder.
+### Ein Muster, ACHTMAL gefunden — und die Handsuche ist widerlegt
+`derive(Debug)` mit einem Geheimnis im Typ:
+
+| # | Typ | Was geleakt hätte |
+|---|---|---|
+| 1 | `LoginOutcome` (`auth.rs`) | Session-Cookie **und** voller Argon2-Hash |
+| 2 | `ModuleConfig` (`rsyncd.rs`) | Modul-Secret; Doc sagte „never logged" |
+| 3 | `RcloneConfig` (`models.rs`) | Remote-Passwort |
+| 4 | `ConfigRequest` (`models.rs`) | dito + `secret_access_key` |
+| 5 | `NewShare` (`shares.rs`) | Argon2id-PHC-String |
+| 6 | `SessionRefresh` (`auth.rs`) | **lebendes Sitzungstoken** (`set_cookie`) |
+| 7 | `ResetPageQuery` (`auth_web.rs:689`) | **Passwort-Reset-Token** |
+| 8 | `UrlFetchRequest` (`downloader.rs:73`) | Userinfo der Nutzer-URL |
+
+**Diese Zeile hat zweimal Entwarnung gegeben und lag zweimal falsch.** Nach dem fünften
+Fall hiess es „geschlossen"; der sechste entstand im nächsten Ticket. Nach dem sechsten
+versicherte ein Entwickler, es sei kein Feld mit Geheimnis dazugekommen.
+
+**Was den Unterschied machte:** Fall 7 und 8 fand ein Tester, der **nicht von Hand
+suchte**, sondern **alle 70 `derive(...Debug...)`-Stellen unter `src/` maschinell
+auflistete** und die Felder nach Inhalt bewertete. Genau das, was fünf sorgfältige
+Handsuchen nicht geleistet haben.
+
+Bei Fall 7 stand über dem Feld der Kommentar **„Never logged"**, und in den Folgezeilen
+steht `ResetForm` bewusst **ohne** `Debug` — dasselbe Token, zwei entgegengesetzte
+Entscheidungen direkt untereinander. Sorgfalt allein reicht hier nachweislich nicht.
+
+**Verlass dich nicht auf Feldnamen:** `set_cookie` heisst nicht „password", `url` nicht
+„secret". Fast alle Fälle waren **latent** — kein Aufrufer druckte sie. Geladene Waffen.
+
+Ticket `1e6aa483` baut die strukturelle Absicherung. Bis die steht, gehört die Frage in
+**jeden** Prompt, der `src/` anfasst — **und zwar als maschinelle Auflistung, nicht als
+Bitte um Sorgfalt.**
 
 ---
 
