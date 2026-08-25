@@ -65,7 +65,7 @@
 
 use crate::handlers::auth_web::CurrentUser;
 use crate::handlers::download::{is_within_root, resolve_within_root, user_root, RootScope};
-use crate::handlers::sync::JobStatus;
+use crate::handlers::sync::{CancelTarget, JobKind, JobStatus};
 use crate::handlers::urlguard::{
     fetch_guarded_stream, parse_url, vet_url, DownloadSlot, DownloadSlots, GuardError, GuardPolicy,
     Resolver, StreamingHttpTransport, StreamingTransport, SystemResolver,
@@ -74,10 +74,9 @@ use crate::models::{ApiResponse, SyncProgress};
 use axum::{extract::Json, response::Json as ResponseJson, Extension};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
@@ -118,76 +117,42 @@ lazy_static::lazy_static! {
     /// Gleichzeitige Abrufe je Nutzer.
     static ref SLOTS: Arc<DownloadSlots> =
         DownloadSlots::new(production_policy().max_concurrent_per_user);
-
-    /// Die Jobs dieses Moduls.
-    ///
-    /// Eigene Tabelle, weil die des Syncs (`sync::SYNC_JOBS`) modulprivat ist
-    /// und `sync.rs` in diesem Ticket nicht angefasst wird. Nach ausserhalb
-    /// sieht es trotzdem wie **eine** Liste aus: `main.rs` hängt
-    /// [`job_list`] an die Sync-Liste an, und die Fortschritts-, Log- und
-    /// Löschwege fallen auf dieses Modul zurück, wenn der Sync die Job-ID
-    /// nicht kennt. Der saubere Endzustand wäre eine gemeinsame Registry in
-    /// `sync.rs` — das ist eine Änderung an fremder Datei und im Bericht
-    /// vermerkt.
-    static ref JOBS: Mutex<HashMap<String, JobEntry>> = Mutex::new(HashMap::new());
 }
 
-/// Ein Job dieses Moduls.
-struct JobEntry {
-    progress: SyncProgress,
-    /// Wird gesetzt, wenn abgebrochen werden soll. Der Schreibweg prüft es
-    /// nach jedem Stück.
-    cancel: Arc<AtomicBool>,
-}
-
-/// Sperre auf der Job-Tabelle. Ein vergifteter Mutex darf keinen Request-Pfad
-/// abstürzen lassen — dieselbe Behandlung wie in `handlers::shares`.
-fn jobs() -> MutexGuard<'static, HashMap<String, JobEntry>> {
-    JOBS.lock().unwrap_or_else(|p| p.into_inner())
-}
-
-/// Alle Jobs dieses Moduls, für die gemeinsame Job-Liste.
-pub fn job_list() -> Vec<SyncProgress> {
-    let mut list: Vec<SyncProgress> = jobs().values().map(|e| e.progress.clone()).collect();
-    list.sort_by_key(|p| std::cmp::Reverse(p.start_time));
-    list
-}
-
-/// Fortschritt eines Jobs, oder `None`, wenn er nicht hierher gehört.
-pub fn job_progress(job_id: &str) -> Option<SyncProgress> {
-    jobs().get(job_id).map(|e| e.progress.clone())
-}
-
-/// Löscht einen beendeten Job samt Logdatei.
-///
-/// `None` heisst „kenne ich nicht" — dann ist der Sync zuständig.
-pub async fn delete_job(job_id: &str) -> Option<ApiResponse<String>> {
-    {
-        let mut guard = jobs();
-        let entry = guard.get(job_id)?;
-        if !entry.progress.status.is_terminal() {
-            return Some(ApiResponse::error(
-                "Ein laufender Abruf kann nur abgebrochen werden",
-            ));
-        }
-        guard.remove(job_id);
-    }
-    if let Err(e) = tokio::fs::remove_file(log_path(job_id)).await {
-        tracing::debug!("Logdatei von {} nicht löschbar: {}", job_id, e);
-    }
-    Some(ApiResponse::success("Job deleted successfully".to_string()))
-}
+// ---------------------------------------------------------------------------
+// Jobs
+//
+// Dieses Modul führt **keine** eigene Job-Tabelle mehr. Ein Abruf wird über
+// `sync::register_job` in die gemeinsame Tabelle eingetragen und dort
+// fortgeschrieben; Auflisten, Fortschritt, Log und Löschen liegen für beide
+// Jobarten in `handlers::sync`.
+//
+// Der Grund ist nicht Ordnungsliebe: mit zwei Tabellen musste `main.rs`
+// zusammenfügen und bei unbekannter ID auf dieses Modul zurückfallen, und
+// dieser Rückfallweg hatte **keine** Besitzprüfung — fremde Abrufe waren
+// sichtbar, abbrechbar und löschbar, und das Log eines Abrufs war danach für
+// niemanden mehr lesbar. Eine Prüfung, die zweimal dastehen muss, fehlt beim
+// dritten Mal.
+//
+// Was hier bleibt, ist der Abbruch: er ist die einzige Job-Operation mit einer
+// Bedeutung, die nur dieses Modul kennt (Flagge setzen, Bruchstück entfernen,
+// Zeile ins Log). Die Flagge selbst liegt in `sync`, die Besitzprüfung macht
+// die Route über `sync::job_access`.
+// ---------------------------------------------------------------------------
 
 /// Bricht einen laufenden Abruf ab.
+///
+/// **Ohne** eigene Besitzprüfung: die hat die Route über `sync::job_access`
+/// schon gemacht und dabei auch festgestellt, dass es ein Abruf ist. Eine
+/// zweite Prüfung hier wäre die zweite Wahrheit über denselben Zugriff.
 pub async fn cancel_job(job_id: String) -> ResponseJson<ApiResponse<String>> {
-    let flag = {
-        let guard = jobs();
-        match guard.get(&job_id) {
-            None => return ResponseJson(ApiResponse::error("Job not found")),
-            Some(entry) if entry.progress.status.is_terminal() => {
-                return ResponseJson(ApiResponse::error("Der Abruf ist bereits beendet"))
-            }
-            Some(entry) => Arc::clone(&entry.cancel),
+    let flag = match crate::handlers::sync::cancel_target(&job_id).await {
+        CancelTarget::Running(flag) => flag,
+        CancelTarget::Finished => {
+            return ResponseJson(ApiResponse::error("Der Abruf ist bereits beendet"))
+        }
+        CancelTarget::Unknown => {
+            return ResponseJson(ApiResponse::error(crate::handlers::sync::JOB_UNAVAILABLE))
         }
     };
     flag.store(true, Ordering::SeqCst);
@@ -607,13 +572,16 @@ async fn start_url_fetch_for(
         dry_run: false,
     };
 
-    jobs().insert(
-        job_id.clone(),
-        JobEntry {
-            progress,
-            cancel: Arc::clone(&cancel),
-        },
-    );
+    // Eintrag in die **gemeinsame** Job-Tabelle, mit Eigentümer, Art und
+    // Abbruchflagge. Danach ist dieser Abruf für Auflisten, Fortschritt, Log
+    // und Löschen ein Job wie jeder andere — und er gehört jemandem.
+    crate::handlers::sync::register_job(
+        progress,
+        &current.user.id,
+        JobKind::UrlFetch,
+        Some(Arc::clone(&cancel)),
+    )
+    .await;
 
     if let Err(e) = create_log(&job_id, &request.url, &target.dir).await {
         tracing::error!("Logdatei für {} nicht anlegbar: {}", job_id, e);
@@ -652,7 +620,7 @@ async fn start_url_fetch_for(
                     &format!("Fertig: {} ({} Byte)", landed.name, landed.bytes),
                 )
                 .await;
-                set_final_name(&task_id, &landed.name);
+                set_final_name(&task_id, &landed.name).await;
                 JobStatus::Completed
             }
             Err(FetchFailure::Cancelled) => {
@@ -669,7 +637,7 @@ async fn start_url_fetch_for(
                 JobStatus::failed(message)
             }
         };
-        finish(&task_id, status);
+        finish(&task_id, status).await;
     });
 
     ResponseJson(ApiResponse::success(job_id))
@@ -747,7 +715,7 @@ async fn run_fetch(
     transport: &dyn StreamingTransport,
     cancel: &AtomicBool,
 ) -> Result<Landed, FetchFailure> {
-    set_status(job_id, JobStatus::Running);
+    set_status(job_id, JobStatus::Running).await;
 
     // Die Redirect-Schleife führt `fetch_guarded_stream`: jeder Sprung
     // durchläuft `vet_url` erneut.
@@ -784,7 +752,7 @@ async fn run_fetch(
         .unwrap_or_else(|| filename_from_path(&response.final_url.path_and_query));
 
     let total = response.head.content_length.unwrap_or(0);
-    set_total(job_id, total);
+    set_total(job_id, total).await;
     append_log(
         job_id,
         &match response.head.content_length {
@@ -837,7 +805,7 @@ async fn run_fetch(
             )));
         }
         written += chunk.len() as u64;
-        set_transferred(job_id, written, total);
+        set_transferred(job_id, written, total).await;
 
         if written - last_reported_bytes >= PROGRESS_EVERY_BYTES
             || last_report.elapsed() >= PROGRESS_EVERY
@@ -915,45 +883,41 @@ async fn remove_temp(path: &Path) {
 // Fortschritt fortschreiben
 // ---------------------------------------------------------------------------
 
-fn set_status(job_id: &str, status: JobStatus) {
-    if let Some(entry) = jobs().get_mut(job_id) {
-        entry.progress.status = status;
-    }
+// Alle Änderungen gehen durch `sync::update_job`; ein Job, den es nicht mehr
+// gibt, ist dort ein stiller Nichtstuer — ein noch laufender Schreibweg darf an
+// einem gelöschten Job nicht scheitern.
+
+async fn set_status(job_id: &str, status: JobStatus) {
+    crate::handlers::sync::update_job(job_id, |p| p.status = status).await;
 }
 
-fn set_total(job_id: &str, total: u64) {
-    if let Some(entry) = jobs().get_mut(job_id) {
-        entry.progress.total = total;
-    }
+async fn set_total(job_id: &str, total: u64) {
+    crate::handlers::sync::update_job(job_id, |p| p.total = total).await;
 }
 
-fn set_transferred(job_id: &str, written: u64, total: u64) {
-    if let Some(entry) = jobs().get_mut(job_id) {
-        entry.progress.transferred = written;
-        entry.progress.total = total;
-        entry.progress.progress = if total > 0 {
+async fn set_transferred(job_id: &str, written: u64, total: u64) {
+    crate::handlers::sync::update_job(job_id, |p| {
+        p.transferred = written;
+        p.total = total;
+        p.progress = if total > 0 {
             (written as f64 / total as f64 * 100.0).min(100.0)
         } else {
             0.0
         };
-    }
+    })
+    .await;
 }
 
-fn set_final_name(job_id: &str, name: &str) {
-    if let Some(entry) = jobs().get_mut(job_id) {
-        entry.progress.source_name = name.to_string();
-    }
+async fn set_final_name(job_id: &str, name: &str) {
+    crate::handlers::sync::update_job(job_id, |p| p.source_name = name.to_string()).await;
 }
 
-fn finish(job_id: &str, status: JobStatus) {
-    let mut guard = jobs();
-    if let Some(entry) = guard.get_mut(job_id) {
-        if status.is_success() {
-            entry.progress.progress = 100.0;
-        }
-        entry.progress.status = status;
-        entry.progress.end_time = Some(Utc::now().timestamp());
-    }
+/// Endzustand. Geht durch `sync::complete_job` und damit durch dasselbe
+/// `finish_job` wie ein Sync-Lauf: `end_time` wird gesetzt, und auf 100 %
+/// gerundet wird **nur** bei `is_success()` — ein abgebrochener oder
+/// fehlgeschlagener Abruf behält seinen letzten Stand.
+async fn finish(job_id: &str, status: JobStatus) {
+    crate::handlers::sync::complete_job(job_id, status).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1245,24 +1209,25 @@ mod tests {
             root: dir.to_path_buf(),
             dir: dir.to_path_buf(),
         };
-        jobs().insert(
-            job_id.clone(),
-            JobEntry {
-                progress: SyncProgress {
-                    id: job_id.clone(),
-                    progress: 0.0,
-                    status: JobStatus::Starting,
-                    transferred: 0,
-                    total: 0,
-                    source_name: String::new(),
-                    start_time: 0,
-                    end_time: None,
-                    mode: "copy".to_string(),
-                    dry_run: false,
-                },
-                cancel: Arc::new(AtomicBool::new(false)),
+        // Über denselben Weg wie im Betrieb, in die gemeinsame Tabelle.
+        crate::handlers::sync::register_job(
+            SyncProgress {
+                id: job_id.clone(),
+                progress: 0.0,
+                status: JobStatus::Starting,
+                transferred: 0,
+                total: 0,
+                source_name: String::new(),
+                start_time: 0,
+                end_time: None,
+                mode: "copy".to_string(),
+                dry_run: false,
             },
-        );
+            "u-test-downloader",
+            JobKind::UrlFetch,
+            Some(Arc::new(AtomicBool::new(false))),
+        )
+        .await;
         let result = run_fetch(
             &job_id,
             url,
@@ -1274,7 +1239,7 @@ mod tests {
             cancel,
         )
         .await;
-        jobs().remove(&job_id);
+        crate::handlers::sync::drop_job_for_test(&job_id).await;
         // Das Log dieses Testjobs nicht liegen lassen.
         let _ = std::fs::remove_file(log_path(&job_id));
         result

@@ -9,6 +9,7 @@ use serde_json;
 use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::fs;
 use tokio::process::Command;
@@ -18,18 +19,26 @@ use uuid::Uuid;
 
 type SyncJobs = Arc<Mutex<HashMap<String, SyncProgress>>>;
 type JobEngines = Arc<Mutex<HashMap<String, Arc<dyn SyncEngine>>>>;
-/// Job-ID -> `users.id` des Kontos, dem der Lauf zugerechnet wird.
-type JobOwners = Arc<Mutex<HashMap<String, String>>>;
+/// Job-ID -> Eigentümer und Art des Laufs.
+type JobOwners = Arc<Mutex<HashMap<String, JobOwner>>>;
+/// Job-ID -> Abbruchflagge, sofern die Art des Jobs eine hat.
+type JobCancels = Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>;
 
 lazy_static::lazy_static! {
+    /// **Die** Job-Tabelle. Sync-Läufe und URL-Abrufe stehen hier gemeinsam;
+    /// es gibt keine zweite.
     static ref SYNC_JOBS: SyncJobs = Arc::new(Mutex::new(HashMap::new()));
     /// Engine used by a running job. Entries live only while the job runs.
     static ref JOB_ENGINES: JobEngines = Arc::new(Mutex::new(HashMap::new()));
-    /// Wer einen Job gestartet hat. Wird beim Anlegen gesetzt und mit dem Job
-    /// wieder entfernt; ein Job ohne Eintrag gilt als **fremd**, nicht als
-    /// frei (fail closed — nach einem Neustart ist die Jobtabelle ohnehin
-    /// leer, siehe `recover_stranded_jobs`).
+    /// Wer einen Job gestartet hat und welcher Art er ist. Wird beim Anlegen
+    /// gesetzt und mit dem Job wieder entfernt; ein Job ohne Eintrag gilt als
+    /// **fremd**, nicht als frei (fail closed — nach einem Neustart ist die
+    /// Jobtabelle ohnehin leer, siehe `recover_stranded_jobs`).
     static ref JOB_OWNERS: JobOwners = Arc::new(Mutex::new(HashMap::new()));
+    /// Abbruchflaggen. Wie `JOB_ENGINES` eine Nebentabelle zu einem Eintrag in
+    /// `SYNC_JOBS`, keine zweite Job-Tabelle: sie trägt keinen Zustand, den
+    /// eine Antwort an den Client zeigt.
+    static ref JOB_CANCELS: JobCancels = Arc::new(Mutex::new(HashMap::new()));
 }
 
 // ---------------------------------------------------------------------------
@@ -869,29 +878,183 @@ async fn resolved_log_path(job_id: &str) -> Option<PathBuf> {
     }
 }
 
-/// Merkt sich, wem ein Job gehört.
-async fn remember_job_owner(job_id: &str, user_id: &str) {
-    JOB_OWNERS
-        .lock()
-        .await
-        .insert(job_id.to_string(), user_id.to_string());
+// ---------------------------------------------------------------------------
+// Die gemeinsame Job-Verwaltung
+//
+// Es gibt genau **eine** Job-Tabelle (`SYNC_JOBS`) und genau **eine** Stelle,
+// an der über den Zugriff auf einen Job entschieden wird (`job_access`).
+//
+// Vorher führte `handlers::downloader` eine zweite Tabelle, `main.rs` hängte
+// beide Listen aneinander, und Fortschritt und Löschen fielen auf den
+// Downloader zurück, wenn der Sync die ID nicht kannte. Diese Rückfallregel
+// war der Grund, weshalb dieselbe fehlende Besitzprüfung **dreimal** gefunden
+// wurde: Auflisten, Abbrechen, Löschen. Eine Prüfung, die an drei Stellen
+// stehen muss, fehlt beim vierten Jobtyp wieder.
+//
+// Deshalb hier: eine Tabelle, eine Schleuse, und `main.rs` fügt nichts mehr
+// zusammen — es reicht `current` durch und verzweigt allenfalls nach
+// [`JobKind`], den die Schleuse mitliefert.
+//
+// **Zur Reihenfolge der Sperren:** `JOB_OWNERS`, `SYNC_JOBS`, `JOB_CANCELS`
+// und `JOB_ENGINES` werden nie gleichzeitig gehalten. Jede Sperre wird in
+// ihrer eigenen Anweisung genommen und dort wieder freigegeben; wo beides
+// gebraucht wird, steht die Auswertung der ersten in einem eigenen Block.
+// ---------------------------------------------------------------------------
+
+/// Welcher Weg einen Job ausführt.
+///
+/// Die Schleuse gibt ihn zurück, damit der Aufrufer verzweigen kann, **ohne**
+/// dafür eine ID in einer zweiten Tabelle zu suchen ("kennt der Sync sie
+/// nicht, ist es ein Abruf") — genau diese Rückfallregel hat die Prüfung
+/// dreimal verschluckt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobKind {
+    /// Übertragung durch eine Engine (`rclone`, `rsync`).
+    Sync,
+    /// HTTP-Abruf durch den Server (`handlers::downloader`).
+    UrlFetch,
 }
 
-/// Vergisst den Eigentümer eines Jobs, der aus der Tabelle fällt.
+/// Wem ein Job gehört und welcher Art er ist.
+struct JobOwner {
+    /// `users.id` des Kontos, dem der Lauf zugerechnet wird.
+    user_id: String,
+    kind: JobKind,
+}
+
+impl JobOwner {
+    /// **Die** Besitzentscheidung, an genau einer Stelle im Programm.
+    ///
+    /// Sie steht hier und nicht in den Aufrufern, weil es zwei Formen des
+    /// Zugriffs gibt — „darf ich an diesen Job" ([`job_access`]) und „welche
+    /// Jobs sind meine" ([`list_jobs_for`]) —, und zwei Vergleiche wären zwei
+    /// Gelegenheiten, verschiedene Antworten zu geben. Ein Mutationstest, der
+    /// diese Zeile aufweicht, muss **alle** Zugriffstests fallen lassen.
+    fn belongs_to(&self, current: &CurrentUser) -> bool {
+        self.user_id == current.user.id
+    }
+}
+
+/// Eine Antwort für „gibt es nicht" **und** „gehört dir nicht".
+///
+/// Wie [`LOG_UNAVAILABLE`] bewusst eine einzige Zeichenkette: unterschiedliche
+/// Meldungen machten jeden dieser Endpunkte zu einem Orakel, mit dem sich
+/// fremde Job-IDs durchprobieren liessen. Der Wortlaut ist der, den ein
+/// unbekannter Job schon vorher bekam.
+pub const JOB_UNAVAILABLE: &str = "Job not found";
+
+/// Legt einen Job an: Fortschritt, Eigentümer, Art und — wenn die Art eine
+/// hat — die Abbruchflagge.
+///
+/// Der **einzige** Weg, einen Job in die Tabelle zu bekommen. Damit kann kein
+/// Jobtyp entstehen, dessen Eigentümer niemand vermerkt hat: wer keinen
+/// Eigentümer hat, ist für jeden unsichtbar (fail closed), und das fällt beim
+/// ersten Blick in die eigene Job-Liste auf.
+pub async fn register_job(
+    progress: SyncProgress,
+    owner_id: &str,
+    kind: JobKind,
+    cancel: Option<Arc<AtomicBool>>,
+) {
+    let job_id = progress.id.clone();
+    SYNC_JOBS.lock().await.insert(job_id.clone(), progress);
+    JOB_OWNERS.lock().await.insert(
+        job_id.clone(),
+        JobOwner {
+            user_id: owner_id.to_string(),
+            kind,
+        },
+    );
+    if let Some(flag) = cancel {
+        JOB_CANCELS.lock().await.insert(job_id, flag);
+    }
+}
+
+/// Schreibt den Fortschritt eines Jobs fort.
+///
+/// Kennt die Tabelle die ID nicht mehr, passiert nichts — ein bereits
+/// gelöschter Job darf einen noch laufenden Schreibweg nicht abstürzen lassen.
+pub async fn update_job(job_id: &str, change: impl FnOnce(&mut SyncProgress)) {
+    if let Some(progress) = SYNC_JOBS.lock().await.get_mut(job_id) {
+        change(progress);
+    }
+}
+
+/// Setzt einen Job auf einen Endzustand — für Aufrufer aussehalb dieses Moduls.
+///
+/// Geht durch dasselbe [`finish_job`] wie der Sync und rundet deshalb auch für
+/// einen Abruf nur bei `is_success()` auf 100 %.
+pub async fn complete_job(job_id: &str, status: JobStatus) {
+    finish_job(&SYNC_JOBS, job_id, status).await;
+}
+
+/// Vergisst Eigentümer und Abbruchflagge eines Jobs, der aus der Tabelle fällt.
 async fn forget_job_owner(job_id: &str) {
     JOB_OWNERS.lock().await.remove(job_id);
+    JOB_CANCELS.lock().await.remove(job_id);
 }
 
-/// Darf `current` den Job `job_id` sehen?
+/// **Die** Zugriffsschleuse für Jobs jeder Art.
+///
+/// `Some(kind)` heisst „gehört diesem Konto"; `None` heisst „fremd **oder**
+/// unbekannt", und die beiden Fälle sind nicht unterscheidbar:
+///
+/// * **Byte-gleich**, weil jeder Aufrufer daraus dieselbe Antwort baut
+///   ([`JOB_UNAVAILABLE`], bzw. [`LOG_UNAVAILABLE`] beim Log).
+/// * **Zeitgleich**, weil es für einen Unberechtigten keinen zweiten Zweig
+///   gibt: es passiert genau eine Suche in einer `HashMap` und dann die
+///   Rückgabe. Kein Dateisystem, keine Datenbank, kein Ausgleichsaufwand — die
+///   Prüfung steht **vor** allem, dessen Dauer etwas verraten könnte. Genau
+///   das war der Fehler in der Vorgängerfassung von `get_sync_log_for`, wo
+///   `resolved_log_path()` vor der Besitzprüfung lief und damit die Existenz
+///   der Datei messbar machte (Ticket `06955e97`).
 ///
 /// **Fail closed**, in beide Richtungen: ein Job ohne bekannten Eigentümer ist
-/// so unlesbar wie der eines fremden Kontos. Auch ein Admin bekommt hier keine
-/// Ausnahme — dieselbe Begründung wie beim fehlenden `scope=system` für den
-/// Sync weiter oben: die Job-Logs enthalten Quell- und Zielpfade fremder
-/// Konten, und ein Hintergrundlauf ist kein sichtbarer Einzelzugriff, bei dem
-/// eine Ausnahme pro Request in der URL stünde.
-async fn job_belongs_to(job_id: &str, current: &CurrentUser) -> bool {
-    JOB_OWNERS.lock().await.get(job_id) == Some(&current.user.id)
+/// so unzugänglich wie der eines fremden Kontos. Auch ein Admin bekommt hier
+/// keine Ausnahme — dieselbe Begründung wie beim fehlenden `scope=system` für
+/// den Sync weiter oben: die Jobs tragen Quell- und Zielpfade fremder Konten,
+/// und ein Hintergrundlauf ist kein sichtbarer Einzelzugriff, bei dem eine
+/// Ausnahme pro Request in der URL stünde.
+pub async fn job_access(job_id: &str, current: &CurrentUser) -> Option<JobKind> {
+    match JOB_OWNERS.lock().await.get(job_id) {
+        Some(owner) if owner.belongs_to(current) => Some(owner.kind),
+        _ => None,
+    }
+}
+
+/// Wirft einen Job samt Nebeneinträgen aus der Tabelle — **nur für Tests**
+/// anderer Module, die einen Job anlegen und hinterher aufräumen müssen. Der
+/// produktive Weg ist `delete_job_for`, das den Zugriff prüft.
+#[cfg(test)]
+pub async fn drop_job_for_test(job_id: &str) {
+    SYNC_JOBS.lock().await.remove(job_id);
+    forget_job_owner(job_id).await;
+}
+
+/// Was ein Abbruchversuch vorfindet.
+pub enum CancelTarget {
+    /// Läuft noch, hier ist seine Flagge.
+    Running(Arc<AtomicBool>),
+    /// Schon in einem Endzustand.
+    Finished,
+    /// Kennt die Tabelle nicht (mehr).
+    Unknown,
+}
+
+/// Sucht die Abbruchflagge eines Jobs. **Ohne** Besitzprüfung — die hat der
+/// Aufrufer über [`job_access`] schon gemacht; hier gibt es keine zweite.
+pub async fn cancel_target(job_id: &str) -> CancelTarget {
+    let terminal = match SYNC_JOBS.lock().await.get(job_id) {
+        Some(progress) => progress.status.is_terminal(),
+        None => return CancelTarget::Unknown,
+    };
+    if terminal {
+        return CancelTarget::Finished;
+    }
+    match JOB_CANCELS.lock().await.get(job_id) {
+        Some(flag) => CancelTarget::Running(Arc::clone(flag)),
+        None => CancelTarget::Unknown,
+    }
 }
 
 /// Ensure the log directory exists and create a new log file with an initial entry
@@ -1100,15 +1263,15 @@ pub async fn start_sync_for(
         dry_run,
     };
 
-    {
-        let mut jobs = SYNC_JOBS.lock().await;
-        jobs.insert(job_id.clone(), progress);
-    }
-
-    // Wer den Lauf gestartet hat, wird zusammen mit dem Job vermerkt — die
-    // Grundlage der Zugriffsprüfung in `get_sync_log_for`. Der CLI-Weg geht
-    // durch dieselbe Funktion und trägt deshalb ebenfalls ein.
-    remember_job_owner(&job_id, &current.user.id).await;
+    // Anlegen, Eigentümer und Art in einem Schritt — `register_job` ist der
+    // einzige Weg in die Job-Tabelle, und damit gibt es keinen Job ohne
+    // vermerkten Eigentümer. Der CLI-Weg (`--start-task`) geht durch dieselbe
+    // Funktion und trägt deshalb ebenfalls ein.
+    //
+    // Ohne Abbruchflagge: der Abbruch eines *Sync*-Laufs ist ein eigenes
+    // Ticket. Sobald er kommt, ist hier der Platz dafür — die Wege für
+    // Abbruch, Liste und Löschen unterscheiden die Jobart schon.
+    register_job(progress, &current.user.id, JobKind::Sync, None).await;
 
     // Immediately create the log file so it is visible in the UI
     if let Err(e) = create_initial_log(&job_id, &sync_request, mode, dry_run).await {
@@ -1132,7 +1295,27 @@ pub async fn start_sync_for(
     ResponseJson(ApiResponse::success(job_id))
 }
 
-pub async fn get_sync_progress(job_id: String) -> ResponseJson<ApiResponse<SyncProgress>> {
+/// `GET /api/sync/:job_id` — Fortschritt eines Jobs, **mit** Besitzprüfung.
+///
+/// Die Schleuse läuft vor allem anderen: ein fremder oder unbekannter Job
+/// erzeugt weder einen Tabellenzugriff noch eine Dateioperation, und beide
+/// Fälle antworten byte-gleich mit [`JOB_UNAVAILABLE`] — dieselbe Meldung, die
+/// eine unbekannte ID auch vorher bekam.
+///
+/// Gilt für Sync-Läufe **und** URL-Abrufe; die Jobart entscheidet nur, ob der
+/// Fortschritt aus dem Job-Log nachgelesen wird.
+pub async fn get_sync_progress_for(
+    current: &CurrentUser,
+    job_id: String,
+) -> ResponseJson<ApiResponse<SyncProgress>> {
+    let Some(kind) = job_access(&job_id, current).await else {
+        return ResponseJson(ApiResponse::error(JOB_UNAVAILABLE));
+    };
+    job_progress(kind, job_id).await
+}
+
+/// Fortschritt eines Jobs, dessen Zugriff **bereits geprüft** ist.
+async fn job_progress(kind: JobKind, job_id: String) -> ResponseJson<ApiResponse<SyncProgress>> {
     let engine = engine_for_job(&job_id).await;
     let mut jobs = SYNC_JOBS.lock().await;
 
@@ -1141,7 +1324,14 @@ pub async fn get_sync_progress(job_id: String) -> ResponseJson<ApiResponse<SyncP
             // Update progress from log file if job is running and the engine
             // reports through the log file. Stdout based engines push their
             // progress into the job themselves while they run.
-            if progress.status == JobStatus::Running
+            //
+            // Nur für Sync-Läufe: ein URL-Abruf schreibt kein rclone-JSON in
+            // sein Log und führt seinen Fortschritt selbst fort
+            // (`downloader::set_transferred`). Ohne diese Bedingung liefe er in
+            // den Standard-Engine-Zweig, weil `engine_for_job` für eine ID ohne
+            // Engine die rclone-Engine annimmt.
+            if kind == JobKind::Sync
+                && progress.status == JobStatus::Running
                 && engine.progress_source() == ProgressSource::JobLog
             {
                 if let Some(snapshot) =
@@ -1154,11 +1344,47 @@ pub async fn get_sync_progress(job_id: String) -> ResponseJson<ApiResponse<SyncP
             }
             ResponseJson(ApiResponse::success(progress.clone()))
         }
-        None => ResponseJson(ApiResponse::error("Job not found")),
+        None => ResponseJson(ApiResponse::error(JOB_UNAVAILABLE)),
     }
 }
 
-pub async fn list_sync_jobs() -> ResponseJson<ApiResponse<Vec<SyncProgress>>> {
+/// `GET /api/sync` — die Jobs **dieses** Kontos, neueste zuerst.
+///
+/// Sync-Läufe und URL-Abrufe stehen in derselben Tabelle und kommen deshalb
+/// aus **einer** Abfrage; `main.rs` fügt nichts mehr zusammen.
+///
+/// Sortiert nach `start_time` (absteigend), bei Gleichstand nach ID. Nach
+/// Job-ID allein wäre die Reihenfolge bei UUIDs willkürlich — das war schon
+/// beim Zusammenführen zweier Quellen der Grund für die Umstellung, und es
+/// bleibt so.
+pub async fn list_jobs_for(current: &CurrentUser) -> ResponseJson<ApiResponse<Vec<SyncProgress>>> {
+    cleanup_stale_jobs().await;
+
+    // Erst die eigenen IDs, dann die Einträge — die beiden Sperren werden
+    // nacheinander gehalten, nie gleichzeitig.
+    let own: Vec<String> = {
+        let owners = JOB_OWNERS.lock().await;
+        owners
+            .iter()
+            .filter(|(_, owner)| owner.belongs_to(current))
+            .map(|(job_id, _)| job_id.clone())
+            .collect()
+    };
+
+    let mut job_list: Vec<SyncProgress> = {
+        let jobs = SYNC_JOBS.lock().await;
+        own.iter().filter_map(|id| jobs.get(id).cloned()).collect()
+    };
+
+    job_list.sort_by(|a, b| b.start_time.cmp(&a.start_time).then(b.id.cmp(&a.id)));
+
+    ResponseJson(ApiResponse::success(job_list))
+}
+
+/// Wirft beendete Jobs weg, die älter als 24 Stunden sind — samt Logdatei,
+/// Eigentümer und Abbruchflagge. Keine Zugriffsentscheidung: der Durchlauf
+/// gilt für alle Jobs und läuft bei jedem Abruf der Liste mit.
+async fn cleanup_stale_jobs() {
     let mut jobs = SYNC_JOBS.lock().await;
 
     // Clean up jobs older than 24 hours (86400 seconds)
@@ -1196,54 +1422,47 @@ pub async fn list_sync_jobs() -> ResponseJson<ApiResponse<Vec<SyncProgress>>> {
             forget_job_owner(&job_id).await;
         }
     }
-
-    let mut job_list: Vec<SyncProgress> = jobs.values().cloned().collect();
-
-    // Sort by creation time (newest first) - using job_id as timestamp proxy
-    job_list.sort_by(|a, b| b.id.cmp(&a.id));
-
-    ResponseJson(ApiResponse::success(job_list))
 }
 
-/// Liest das Log eines Jobs aus einem Request-Segment.
+/// `GET /api/sync/:job_id/log` — das Log eines Jobs, **mit** Besitzprüfung.
 ///
-/// Der Pfad geht durch das Logdatei-Jail (siehe oben) — ohne gültige Job-ID
-/// und ohne kanonisierten Pfad unterhalb von `data/log` wird gar nichts
-/// gelesen. Eine **Zugriffsprüfung** findet hier noch nicht statt, weil dieser
-/// Einstieg keinen `CurrentUser` bekommt; die gibt es in
-/// [`get_sync_log_for`], das dafür gedacht ist, in der Route an die Stelle
-/// dieser Funktion zu treten.
-pub async fn get_sync_log(job_id: String) -> ResponseJson<ApiResponse<String>> {
-    let Some(path) = resolved_log_path(&job_id).await else {
-        return ResponseJson(ApiResponse::error(LOG_UNAVAILABLE));
-    };
-
-    read_job_log(&job_id, &path).await
-}
-
-/// Wie [`get_sync_log`], zusätzlich mit Zugriffsprüfung.
+/// Reihenfolge, und die ist der Punkt: **erst** die Schleuse, **dann** das
+/// Dateisystem. Wer keinen Anspruch auf den Job hat, löst keine Dateioperation
+/// aus — dann kann deren Dauer auch nichts verraten. Die Vorgängerfassung rief
+/// `resolved_log_path()` vor der Prüfung und machte damit messbar, ob es die
+/// Datei gibt (+23,6 µs für eine von Hand angelegte Logdatei ohne Eigentümer,
+/// Ticket `06955e97`).
+///
+/// Danach dasselbe Jail wie zuvor: gültige Job-ID **und** kanonisierter Pfad
+/// unterhalb von `data/log`. Der bleibt auch für einen Job, der dem Aufrufer
+/// gehört, unangetastet — die ID kommt aus einem Pfadsegment, egal wem sie
+/// gehört.
 ///
 /// Fremder Job und unbekannter Job antworten **identisch** (dieselbe Meldung,
 /// derselbe Erfolgsstatus), sonst wäre der Endpunkt ein Orakel, mit dem sich
 /// fremde Job-IDs bestätigen liessen. Aus dem gleichen Grund wird die
 /// Ablehnung nur mit `user_id` und Job-ID protokolliert, nicht dem Client
 /// mitgeteilt.
-#[allow(dead_code)] // wartet auf die Route: `main.rs` gehört einem anderen Ticket
+///
+/// Gilt für **beide** Jobarten: ein URL-Abruf schreibt sein Log an dieselbe
+/// Stelle (`data/log/<job_id>.log`) und steht in derselben Tabelle, also
+/// braucht dieser Weg keine Verzweigung. Genau dadurch ist das Log eines
+/// Abrufs für seinen Erzeuger wieder lesbar.
 pub async fn get_sync_log_for(
     current: &CurrentUser,
     job_id: String,
 ) -> ResponseJson<ApiResponse<String>> {
-    let Some(path) = resolved_log_path(&job_id).await else {
-        return ResponseJson(ApiResponse::error(LOG_UNAVAILABLE));
-    };
-
-    if !job_belongs_to(&job_id, current).await {
+    if job_access(&job_id, current).await.is_none() {
         warn!(
             "📖 Logabruf abgelehnt: Job {} gehört nicht zu Konto {}",
             job_id, current.user.id
         );
         return ResponseJson(ApiResponse::error(LOG_UNAVAILABLE));
     }
+
+    let Some(path) = resolved_log_path(&job_id).await else {
+        return ResponseJson(ApiResponse::error(LOG_UNAVAILABLE));
+    };
 
     read_job_log(&job_id, &path).await
 }
@@ -1270,7 +1489,29 @@ async fn read_job_log(job_id: &str, path: &std::path::Path) -> ResponseJson<ApiR
     }
 }
 
-pub async fn delete_sync_job(job_id: String) -> ResponseJson<ApiResponse<String>> {
+/// `DELETE /api/sync/:job_id` — löscht einen beendeten Job, **mit**
+/// Besitzprüfung.
+///
+/// Die Schleuse steht vor allem anderen; ein fremder oder unbekannter Job
+/// bekommt [`JOB_UNAVAILABLE`] und löst keine Datei- oder Tabellenoperation
+/// aus. Gilt für Sync-Läufe und URL-Abrufe gleich — beide stehen in derselben
+/// Tabelle und legen ihr Log an derselben Stelle ab.
+pub async fn delete_job_for(
+    current: &CurrentUser,
+    job_id: String,
+) -> ResponseJson<ApiResponse<String>> {
+    if job_access(&job_id, current).await.is_none() {
+        warn!(
+            "🗑️ Löschung abgelehnt: Job {} gehört nicht zu Konto {}",
+            job_id, current.user.id
+        );
+        return ResponseJson(ApiResponse::error(JOB_UNAVAILABLE));
+    }
+    delete_own_job(job_id).await
+}
+
+/// Löschen eines Jobs, dessen Zugriff **bereits geprüft** ist.
+async fn delete_own_job(job_id: String) -> ResponseJson<ApiResponse<String>> {
     info!("🗑️ Delete request for job {}", job_id);
 
     let mut jobs = SYNC_JOBS.lock().await;
@@ -1811,7 +2052,7 @@ fn parse_byte_value(s: &str) -> u64 {
 
 /// Ein Eintrag der Löschvorschau.
 ///
-/// `dead_code` nur, weil die Route noch fehlt: `get_sync_deletions` ist in
+/// `dead_code` nur, weil die Route noch fehlt: `get_sync_deletions_for` ist in
 /// `src/main.rs` nicht registriert, und diese Datei darf das Routing nicht
 /// anfassen. Sobald `GET /api/sync/deletions/:job_id` steht, fällt das Attribut
 /// hier und an den drei folgenden Stellen weg.
@@ -1858,7 +2099,7 @@ const DELETION_REPORT_LIMIT: usize = 1000;
 /// Reine Funktion über den Logtext, damit sie ohne rclone-Lauf prüfbar ist.
 /// Zeilen, die kein JSON sind (die Kopfzeilen von `initial_log_text`), werden
 /// übersprungen.
-#[allow(dead_code)] // von `get_sync_deletions` benutzt, das noch keine Route hat
+#[allow(dead_code)] // von `get_sync_deletions_for` benutzt, das noch keine Route hat
 pub fn parse_planned_deletions(content: &str) -> Vec<PlannedDeletion> {
     let mut entries = Vec::new();
 
@@ -1910,9 +2151,21 @@ pub fn parse_planned_deletions(content: &str) -> Vec<PlannedDeletion> {
 /// zu verändern. Ob der Bericht aus einem Trockenlauf stammt, steht im
 /// Ergebnis (`dry_run`) und wird aus der Kopfzeile des Logs gelesen, damit ein
 /// abgeräumter Job (Neustart) den Bericht nicht als „echt" ausgibt.
+/// Der Weg geht durch **dieselbe** Schleuse wie Fortschritt, Log und Löschen —
+/// schon jetzt, obwohl die Route noch fehlt. Er liest ein Job-Log und damit
+/// Pfade eines Kontos; ohne die Prüfung wäre er die vierte Fundstelle desselben
+/// Musters, und genau das sollen die zusammengelegten Tickets verhindern.
+/// Reihenfolge wie überall: Besitz vor Dateisystem.
 #[allow(dead_code)] // siehe `PlannedDeletion`: Route fehlt noch
-pub async fn get_sync_deletions(job_id: String) -> ResponseJson<ApiResponse<DeletionReport>> {
-    // Dasselbe Jail wie in `get_sync_log`: die ID kommt aus einem
+pub async fn get_sync_deletions_for(
+    current: &CurrentUser,
+    job_id: String,
+) -> ResponseJson<ApiResponse<DeletionReport>> {
+    if job_access(&job_id, current).await.is_none() {
+        return ResponseJson(ApiResponse::error(LOG_UNAVAILABLE));
+    }
+
+    // Dasselbe Jail wie in `get_sync_log_for`: die ID kommt aus einem
     // Request-Segment, also wird sie geprüft, bevor sie einen Pfad bildet —
     // auch schon, solange die Route noch fehlt.
     let Some(log_file_path) = resolved_log_path(&job_id).await else {
@@ -2658,12 +2911,14 @@ mod tests {
     // Terminalpfade in der Jobtabelle
     // -----------------------------------------------------------------
 
+    /// Legt einen Job über den regulären Weg an — mit Eigentümer, denn ohne
+    /// einen ist er für jeden unsichtbar (fail closed).
     async fn insert_job(id: &str, status: JobStatus) {
-        SYNC_JOBS
-            .lock()
-            .await
-            .insert(id.to_string(), job(id, status));
+        register_job(job(id, status), TEST_OWNER, JobKind::Sync, None).await;
     }
+
+    /// Konto, dem die Jobs dieser Testgruppe gehören.
+    const TEST_OWNER: &str = "u-owner-1e67022b";
 
     /// Der Kern des Tickets: ein Job, dessen Prozessstart fehlschlägt, ist
     /// löschbar und hat `end_time` gesetzt.
@@ -2681,7 +2936,7 @@ mod tests {
             assert!(stored.status.is_terminal());
         }
 
-        let response = delete_sync_job(id.to_string()).await;
+        let response = delete_job_for(&user_with_id(TEST_OWNER), id.to_string()).await;
         assert!(
             response.0.success,
             "Job war nicht löschbar: {:?}",
@@ -2696,10 +2951,11 @@ mod tests {
         let id = "test-running-1e67022b";
         insert_job(id, JobStatus::Running).await;
 
-        let response = delete_sync_job(id.to_string()).await;
+        let response = delete_job_for(&user_with_id(TEST_OWNER), id.to_string()).await;
         assert!(!response.0.success);
 
         SYNC_JOBS.lock().await.remove(id);
+        forget_job_owner(id).await;
     }
 
     /// Der 24-Stunden-Cleanup erfasst auch fehlgeschlagene Jobs — vorher fiel
@@ -2718,10 +2974,10 @@ mod tests {
         for (id, status) in &ids {
             let mut entry = job(id, status.clone());
             entry.end_time = Some(old);
-            SYNC_JOBS.lock().await.insert(id.to_string(), entry);
+            register_job(entry, TEST_OWNER, JobKind::Sync, None).await;
         }
 
-        let _ = list_sync_jobs().await;
+        let _ = list_jobs_for(&user_with_id(TEST_OWNER)).await;
 
         let jobs = SYNC_JOBS.lock().await;
         for (id, _) in &ids {
@@ -3194,6 +3450,18 @@ mod tests {
         }
     }
 
+    /// Schreibt einen Eigentümer in die Tabelle, ohne einen Job anzulegen.
+    /// Nur für Tests, die allein den Log-Weg prüfen.
+    async fn remember_owner_for_test(job_id: &str, user_id: &str) {
+        JOB_OWNERS.lock().await.insert(
+            job_id.to_string(),
+            JobOwner {
+                user_id: user_id.to_string(),
+                kind: JobKind::Sync,
+            },
+        );
+    }
+
     fn user_with_id(id: &str) -> CurrentUser {
         let mut current = user_with_home(std::path::Path::new("/nonexistent"), "user");
         current.user.id = id.to_string();
@@ -3281,6 +3549,12 @@ mod tests {
             "Testaufbau kaputt: die Zieldatei fehlt"
         );
 
+        // Jeder Angriffsversuch wird dem Aufrufer **zugeschrieben** — sonst
+        // fiele er schon an der Zugriffsschleuse durch, und der Test bewiese
+        // nur noch, dass unbekannte IDs abgewiesen werden. So prüft er, was er
+        // prüfen soll: das Pfad-Jail hält auch für einen Job, der dem Aufrufer
+        // gehört.
+        let owner = user_with_id("u-jail-owner");
         for attempt in [
             format!("../{id}"),
             format!("..%2F{id}"),
@@ -3288,7 +3562,8 @@ mod tests {
             format!(r"..\{id}"),
             format!("./../{id}"),
         ] {
-            let response = get_sync_log(attempt.clone()).await.0;
+            remember_owner_for_test(&attempt, &owner.user.id).await;
+            let response = get_sync_log_for(&owner, attempt.clone()).await.0;
             assert!(!response.success, "Ausbruch gelungen mit {attempt:?}");
             assert!(
                 response
@@ -3312,7 +3587,9 @@ mod tests {
         let root = tokio::fs::canonicalize(LOG_DIR).await.expect("Wurzel");
         assert!(resolved.starts_with(&root), "Pfad ausserhalb: {resolved:?}");
 
-        let response = get_sync_log(id).await.0;
+        let owner = user_with_id("u-valid-owner");
+        remember_owner_for_test(&id, &owner.user.id).await;
+        let response = get_sync_log_for(&owner, id).await.0;
         assert!(response.success, "Log nicht lesbar: {:?}", response.error);
         assert_eq!(response.data.as_deref(), Some("[test] hallo\n"));
     }
@@ -3337,7 +3614,9 @@ mod tests {
             resolved_log_path(&id).await.is_none(),
             "Symlink nach draussen wurde akzeptiert"
         );
-        let response = get_sync_log(id).await.0;
+        let owner = user_with_id("u-symlink-owner");
+        remember_owner_for_test(&id, &owner.user.id).await;
+        let response = get_sync_log_for(&owner, id).await.0;
         assert!(!response.success);
         assert!(response
             .data
@@ -3357,7 +3636,7 @@ mod tests {
 
         let owner = user_with_id("u-owner");
         let stranger = user_with_id("u-stranger");
-        remember_job_owner(&id, &owner.user.id).await;
+        remember_owner_for_test(&id, &owner.user.id).await;
 
         let mine = get_sync_log_for(&owner, id.clone()).await.0;
         assert!(mine.success, "Eigenes Log nicht lesbar: {:?}", mine.error);
@@ -3380,5 +3659,351 @@ mod tests {
         let orphan = get_sync_log_for(&owner, id).await.0;
         assert!(!orphan.success);
         assert_eq!(orphan.error, unknown.error);
+    }
+
+    // -----------------------------------------------------------------
+    // Zugriffsschleuse: fremde Jobs
+    //
+    // Die Tickets `5f4cf35a`, `9337871d` und `fae31c06`. Gemessen wurde vorher
+    // mit zwei echten Konten: `GET /api/sync` zeigte fremde Abrufe samt
+    // Dateinamen, der Abbruch eines fremden Jobs ging durch, und `DELETE`
+    // löschte Job und Logdatei eines fremden Kontos.
+    // -----------------------------------------------------------------
+
+    /// Ein fremder Job ist nicht auflistbar — und die Gegenprobe zeigt, dass
+    /// derselbe Aufbau einen sichtbaren Job **melden würde**.
+    #[tokio::test]
+    async fn a_foreign_job_is_not_in_the_list() {
+        let owner = user_with_id("u-list-owner");
+        let stranger = user_with_id("u-list-stranger");
+        let mine = format!("test-list-mine-{}", Uuid::new_v4());
+        let theirs = format!("test-list-theirs-{}", Uuid::new_v4());
+
+        register_job(
+            job(&mine, JobStatus::Completed),
+            &owner.user.id,
+            JobKind::Sync,
+            None,
+        )
+        .await;
+        register_job(
+            job(&theirs, JobStatus::Completed),
+            &stranger.user.id,
+            JobKind::UrlFetch,
+            None,
+        )
+        .await;
+
+        let list = list_jobs_for(&owner).await.0.data.expect("Liste");
+        let ids: Vec<&str> = list.iter().map(|p| p.id.as_str()).collect();
+
+        // Gegenprobe im selben Test: der eigene Job **ist** drin. Ohne diesen
+        // Nachweis könnte der Test auch bestehen, weil die Liste leer ist.
+        assert!(ids.contains(&mine.as_str()), "eigener Job fehlt: {ids:?}");
+        assert!(
+            !ids.contains(&theirs.as_str()),
+            "fremder Job in der Liste: {ids:?}"
+        );
+
+        drop_job_for_test(&mine).await;
+        drop_job_for_test(&theirs).await;
+    }
+
+    /// Fortschritt, Log und Löschen: fremd und unbekannt antworten byte-gleich,
+    /// und der eigene Job funktioniert unverändert.
+    #[tokio::test]
+    async fn foreign_and_unknown_answer_alike_on_every_job_route() {
+        let owner = user_with_id("u-routes-owner");
+        let stranger = user_with_id("u-routes-stranger");
+        let id = Uuid::new_v4().to_string();
+        let _log = TestLogFile::new(&format!("{id}.log"), "[test] Quelle: /home/alice\n");
+        let unknown = Uuid::new_v4().to_string();
+
+        register_job(
+            job(&id, JobStatus::Completed),
+            &owner.user.id,
+            JobKind::UrlFetch,
+            None,
+        )
+        .await;
+
+        // Fortschritt.
+        let foreign = get_sync_progress_for(&stranger, id.clone()).await.0;
+        let nobody = get_sync_progress_for(&stranger, unknown.clone()).await.0;
+        assert!(!foreign.success && foreign.data.is_none());
+        assert_eq!(foreign.error, nobody.error);
+        assert_eq!(foreign.error.as_deref(), Some(JOB_UNAVAILABLE));
+        // Gegenprobe: dem Eigentümer antwortet derselbe Weg mit dem Job.
+        let mine = get_sync_progress_for(&owner, id.clone()).await.0;
+        assert!(mine.success, "eigener Fortschritt: {:?}", mine.error);
+
+        // Log — der Kern von `fae31c06`: das Log eines **Abruf**-Jobs ist für
+        // seinen Erzeuger wieder lesbar, für ein fremdes Konto nicht.
+        let mine_log = get_sync_log_for(&owner, id.clone()).await.0;
+        assert!(mine_log.success, "eigenes Abruf-Log: {:?}", mine_log.error);
+        assert_eq!(
+            mine_log.data.as_deref(),
+            Some("[test] Quelle: /home/alice\n")
+        );
+        let foreign_log = get_sync_log_for(&stranger, id.clone()).await.0;
+        let nobody_log = get_sync_log_for(&stranger, unknown.clone()).await.0;
+        assert!(foreign_log.data.is_none(), "fremder Loginhalt ausgeliefert");
+        assert_eq!(foreign_log.error, nobody_log.error);
+        assert_eq!(foreign_log.error.as_deref(), Some(LOG_UNAVAILABLE));
+
+        // Abbruch: der Weg über die Schleuse gibt für ein fremdes Konto keine
+        // Jobart heraus, also erreicht die Route den Downloader nie.
+        assert!(job_access(&id, &stranger).await.is_none());
+        assert_eq!(job_access(&id, &owner).await, Some(JobKind::UrlFetch));
+
+        // Löschen: fremd == unbekannt, und der Job ist danach noch da.
+        let foreign_del = delete_job_for(&stranger, id.clone()).await.0;
+        let nobody_del = delete_job_for(&stranger, unknown).await.0;
+        assert!(!foreign_del.success);
+        assert_eq!(foreign_del.error, nobody_del.error);
+        assert_eq!(foreign_del.error.as_deref(), Some(JOB_UNAVAILABLE));
+        assert!(
+            SYNC_JOBS.lock().await.contains_key(&id),
+            "fremdes Löschen hat den Job entfernt"
+        );
+
+        // Und der Eigentümer darf löschen.
+        let mine_del = delete_job_for(&owner, id.clone()).await.0;
+        assert!(mine_del.success, "eigenes Löschen: {:?}", mine_del.error);
+        assert!(!SYNC_JOBS.lock().await.contains_key(&id));
+    }
+
+    /// Gegenprobe zur Schleuse: **ohne** die Besitzprüfung — hier als naive
+    /// Suche nachgebaut, die nur nach der ID geht — wäre der fremde Job
+    /// erreichbar. Der Test hält damit fest, dass die vorigen Tests nicht
+    /// deshalb grün sind, weil die Tabelle leer ist oder die ID nicht passt.
+    #[tokio::test]
+    async fn without_the_check_the_foreign_job_would_be_reachable() {
+        let owner = user_with_id("u-control-owner");
+        let stranger = user_with_id("u-control-stranger");
+        let id = format!("test-control-{}", Uuid::new_v4());
+        register_job(
+            job(&id, JobStatus::Completed),
+            &owner.user.id,
+            JobKind::Sync,
+            None,
+        )
+        .await;
+
+        // Die naive Fassung: ID in der Tabelle, fertig.
+        let naive = SYNC_JOBS.lock().await.contains_key(&id);
+        assert!(
+            naive,
+            "Testaufbau kaputt: der Job liegt nicht in der Tabelle"
+        );
+
+        // Die echte Fassung sagt trotzdem nein.
+        assert!(job_access(&id, &stranger).await.is_none());
+
+        drop_job_for_test(&id).await;
+    }
+
+    /// Ein Job ohne Eigentümer bleibt zu — auch für den, der ihn angelegt hat
+    /// (fail closed). Deckt den Fall nach einem Neustart ab, in dem die
+    /// Eigentümertabelle leer ist.
+    #[tokio::test]
+    async fn a_job_without_an_owner_is_closed_to_everyone() {
+        let owner = user_with_id("u-orphan-owner");
+        let id = Uuid::new_v4().to_string();
+        let _log = TestLogFile::new(&format!("{id}.log"), "[test] verwaist\n");
+        register_job(
+            job(&id, JobStatus::Completed),
+            &owner.user.id,
+            JobKind::Sync,
+            None,
+        )
+        .await;
+
+        // Gegenprobe zuerst: mit Eigentümer ist es lesbar.
+        assert!(get_sync_log_for(&owner, id.clone()).await.0.success);
+
+        forget_job_owner(&id).await;
+        let orphan = get_sync_log_for(&owner, id.clone()).await.0;
+        assert!(!orphan.success);
+        assert_eq!(orphan.error.as_deref(), Some(LOG_UNAVAILABLE));
+        assert!(get_sync_progress_for(&owner, id.clone())
+            .await
+            .0
+            .data
+            .is_none());
+
+        SYNC_JOBS.lock().await.remove(&id);
+    }
+
+    /// `finish_job` gilt für beide Jobarten gleich: aufgerundet wird nur bei
+    /// Erfolg. Ein abgebrochener Abruf behält seinen letzten Stand — sonst
+    /// stünde in der Liste „100 %" über einer Datei, die es nicht gibt.
+    #[tokio::test]
+    async fn a_cancelled_fetch_is_not_rounded_up_to_a_hundred() {
+        let owner = user_with_id("u-round-owner");
+        for (suffix, status, expected) in [
+            ("cancelled", JobStatus::Cancelled, 42.0),
+            ("completed", JobStatus::Completed, 100.0),
+        ] {
+            let id = format!("test-round-{suffix}-{}", Uuid::new_v4());
+            let mut entry = job(&id, JobStatus::Running);
+            entry.progress = 42.0;
+            register_job(entry, &owner.user.id, JobKind::UrlFetch, None).await;
+
+            complete_job(&id, status).await;
+
+            let stored = SYNC_JOBS.lock().await.get(&id).cloned().expect("Job");
+            assert_eq!(stored.progress, expected, "Job {id}");
+            assert!(stored.end_time.is_some(), "end_time fehlt bei {id}");
+
+            drop_job_for_test(&id).await;
+        }
+    }
+
+    /// Zeitgleichheit von „fremd" und „unbekannt" am Log-Weg.
+    ///
+    /// **Bewusst `#[ignore]`:** eine Laufzeitmessung ist auf einer geteilten
+    /// Maschine kein verlässliches Testkriterium — grün oder rot hinge an der
+    /// Last des Nachbarprozesses. Der Lauf ist reproduzierbar hinterlegt, damit
+    /// die Messung wiederholbar ist:
+    ///
+    /// ```text
+    /// cargo test -- --ignored --nocapture foreign_and_unknown_take_the_same_time
+    /// ```
+    ///
+    /// Aufbau wie in der Vorlage: n Paare, die Reihenfolge **innerhalb** des
+    /// Paares abwechselnd, damit eine Drift der Maschine beide Seiten gleich
+    /// trifft. Dazu eine **Nullkontrolle** mit einer echten Differenz — ohne
+    /// sie wäre „kein Signal gefunden" wertlos.
+    #[tokio::test]
+    #[ignore]
+    async fn foreign_and_unknown_take_the_same_time() {
+        use std::time::Instant;
+
+        let stranger = user_with_id("u-timing-stranger");
+        let owner = user_with_id("u-timing-owner");
+
+        // Ein fremder Job, dessen Logdatei **existiert** — das ist der Fall,
+        // der in der Vorgängerfassung messbar war.
+        let foreign = Uuid::new_v4().to_string();
+        let _log = TestLogFile::new(&format!("{foreign}.log"), "[test] fremd\n");
+        register_job(
+            job(&foreign, JobStatus::Completed),
+            &owner.user.id,
+            JobKind::Sync,
+            None,
+        )
+        .await;
+
+        let pairs = 6000usize;
+        let mut d_real = Vec::with_capacity(pairs);
+        let mut d_null = Vec::with_capacity(pairs);
+
+        for i in 0..pairs {
+            let unknown = Uuid::new_v4().to_string();
+
+            // Realfall: fremd gegen unbekannt.
+            let (a, b) = if i % 2 == 0 {
+                let t0 = Instant::now();
+                let _ = get_sync_log_for(&stranger, foreign.clone()).await;
+                let a = t0.elapsed();
+                let t1 = Instant::now();
+                let _ = get_sync_log_for(&stranger, unknown.clone()).await;
+                (a, t1.elapsed())
+            } else {
+                let t1 = Instant::now();
+                let _ = get_sync_log_for(&stranger, unknown.clone()).await;
+                let b = t1.elapsed();
+                let t0 = Instant::now();
+                let _ = get_sync_log_for(&stranger, foreign.clone()).await;
+                (t0.elapsed(), b)
+            };
+            d_real.push(a.as_nanos() as f64 - b.as_nanos() as f64);
+
+            // Nullkontrolle: derselbe Aufbau, aber eine Seite macht
+            // zusätzlich das, was die Prüfung verhindert — sie fasst das
+            // Dateisystem an. Findet die Messung *das* nicht, findet sie
+            // nichts.
+            let t2 = Instant::now();
+            let _ = resolved_log_path(&foreign).await;
+            let _ = get_sync_log_for(&stranger, foreign.clone()).await;
+            let with_fs = t2.elapsed();
+            let t3 = Instant::now();
+            let _ = get_sync_log_for(&stranger, unknown).await;
+            let without = t3.elapsed();
+            d_null.push(with_fs.as_nanos() as f64 - without.as_nanos() as f64);
+        }
+
+        let report = |label: &str, d: &[f64]| {
+            let n = d.len() as f64;
+            let mean = d.iter().sum::<f64>() / n;
+            let var = d.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
+            let t = mean / (var / n).sqrt();
+            println!("{label}: n={n} mean={mean:.1} ns t={t:.2}");
+            t
+        };
+
+        let t_real = report("Realfall (fremd - unbekannt)", &d_real);
+        let t_null = report("Nullkontrolle (mit Dateizugriff)", &d_null);
+
+        // Die Nullkontrolle muss deutlich anschlagen, sonst taugt die Messung
+        // nichts. Der Realfall darf es nicht.
+        assert!(
+            t_null.abs() > 5.0,
+            "Nullkontrolle findet keine echte Differenz (t={t_null:.2}) — die Messung taugt nicht"
+        );
+        assert!(
+            t_real.abs() < 3.0,
+            "Realfall zeigt ein Zeitsignal (t={t_real:.2})"
+        );
+
+        drop_job_for_test(&foreign).await;
+    }
+
+    /// Abbruch: die Flagge, die `cancel_target` herausgibt, ist **die** des
+    /// laufenden Abrufs — und ein beendeter oder unbekannter Job gibt keine
+    /// heraus. Über HTTP war der laufende Fall auf dieser Maschine nicht
+    /// erreichbar (kein Netz für einen Abruf, der lange genug läuft), deshalb
+    /// hier.
+    #[tokio::test]
+    async fn cancel_target_hands_out_the_flag_of_a_running_fetch() {
+        let owner = user_with_id("u-cancel-owner");
+        let id = format!("test-cancel-{}", Uuid::new_v4());
+        let flag = Arc::new(AtomicBool::new(false));
+        register_job(
+            job(&id, JobStatus::Running),
+            &owner.user.id,
+            JobKind::UrlFetch,
+            Some(Arc::clone(&flag)),
+        )
+        .await;
+
+        match cancel_target(&id).await {
+            CancelTarget::Running(handed) => {
+                handed.store(true, std::sync::atomic::Ordering::SeqCst);
+                assert!(
+                    flag.load(std::sync::atomic::Ordering::SeqCst),
+                    "die herausgegebene Flagge gehört zu einem anderen Job"
+                );
+            }
+            _ => panic!("laufender Abruf gilt nicht als laufend"),
+        }
+
+        // Beendet: keine Flagge mehr.
+        complete_job(&id, JobStatus::Cancelled).await;
+        assert!(matches!(cancel_target(&id).await, CancelTarget::Finished));
+
+        // Unbekannt: auch keine.
+        assert!(matches!(
+            cancel_target(&Uuid::new_v4().to_string()).await,
+            CancelTarget::Unknown
+        ));
+
+        // Und mit dem Job verschwindet die Flagge aus der Nebentabelle.
+        let _ = delete_job_for(&owner, id.clone()).await;
+        assert!(
+            !JOB_CANCELS.lock().await.contains_key(&id),
+            "Abbruchflagge überlebt den Job"
+        );
     }
 }

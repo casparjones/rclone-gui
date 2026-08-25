@@ -2447,7 +2447,9 @@ mod tests {
     #[tokio::test]
     async fn the_only_administrator_survives_all_three_attempts() {
         let (pool, _dir) = temp_pool().await;
-        create_user(&pool, &sample_admin("a1", "root")).await.unwrap();
+        create_user(&pool, &sample_admin("a1", "root"))
+            .await
+            .unwrap();
         create_user(&pool, &sample_user("u1", "bob")).await.unwrap();
 
         // löschen
@@ -2492,8 +2494,12 @@ mod tests {
     async fn with_a_second_active_admin_all_three_ways_are_allowed() {
         for attempt in ["delete", "demote", "disable"] {
             let (pool, _dir) = temp_pool().await;
-            create_user(&pool, &sample_admin("a1", "root")).await.unwrap();
-            create_user(&pool, &sample_admin("a2", "carol")).await.unwrap();
+            create_user(&pool, &sample_admin("a1", "root"))
+                .await
+                .unwrap();
+            create_user(&pool, &sample_admin("a2", "carol"))
+                .await
+                .unwrap();
 
             match attempt {
                 "delete" => assert!(
@@ -2525,7 +2531,9 @@ mod tests {
     #[tokio::test]
     async fn a_disabled_admin_does_not_count_as_a_survivor() {
         let (pool, _dir) = temp_pool().await;
-        create_user(&pool, &sample_admin("a1", "root")).await.unwrap();
+        create_user(&pool, &sample_admin("a1", "root"))
+            .await
+            .unwrap();
         let mut sleeping = sample_admin("a2", "carol");
         sleeping.is_active = false;
         create_user(&pool, &sleeping).await.unwrap();
@@ -2572,7 +2580,9 @@ mod tests {
         assert!(delete_user_protected(&pool, "a1").await.unwrap().is_none());
 
         // Und umgekehrt: der `Admin` genügt als Überlebender für einen zweiten.
-        create_user(&pool, &sample_admin("a2", "carol")).await.unwrap();
+        create_user(&pool, &sample_admin("a2", "carol"))
+            .await
+            .unwrap();
         assert!(delete_user_protected(&pool, "a2").await.unwrap().is_some());
     }
 
@@ -2581,7 +2591,9 @@ mod tests {
     #[tokio::test]
     async fn the_last_admin_can_still_be_edited_harmlessly() {
         let (pool, _dir) = temp_pool().await;
-        create_user(&pool, &sample_admin("a1", "root")).await.unwrap();
+        create_user(&pool, &sample_admin("a1", "root"))
+            .await
+            .unwrap();
 
         let after = update_user_protected(&pool, "a1", None, Some("/srv/neu"), None)
             .await
@@ -2606,8 +2618,12 @@ mod tests {
     #[tokio::test]
     async fn a_partial_update_writes_nothing_it_was_not_asked_to() {
         let (pool, _dir) = temp_pool().await;
-        create_user(&pool, &sample_admin("a1", "root")).await.unwrap();
-        create_user(&pool, &sample_admin("a2", "carol")).await.unwrap();
+        create_user(&pool, &sample_admin("a1", "root"))
+            .await
+            .unwrap();
+        create_user(&pool, &sample_admin("a2", "carol"))
+            .await
+            .unwrap();
 
         // a1 wird herabgestuft …
         update_user_protected(&pool, "a1", Some("user"), None, None)
@@ -2630,7 +2646,9 @@ mod tests {
     #[tokio::test]
     async fn an_update_without_a_field_is_refused_before_sql() {
         let (pool, _dir) = temp_pool().await;
-        create_user(&pool, &sample_admin("a1", "root")).await.unwrap();
+        create_user(&pool, &sample_admin("a1", "root"))
+            .await
+            .unwrap();
         assert!(update_user_protected(&pool, "a1", None, None, None)
             .await
             .is_err());
@@ -2680,8 +2698,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn the_naive_read_then_write_locks_the_instance_out() {
         let (pool, _dir) = temp_pool().await;
-        create_user(&pool, &sample_admin("a1", "root")).await.unwrap();
-        create_user(&pool, &sample_admin("a2", "carol")).await.unwrap();
+        create_user(&pool, &sample_admin("a1", "root"))
+            .await
+            .unwrap();
+        create_user(&pool, &sample_admin("a2", "carol"))
+            .await
+            .unwrap();
 
         let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
         let mut handles = Vec::new();
@@ -2718,8 +2740,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_removal_of_the_last_two_admins_leaves_one_standing() {
         let (pool, _dir) = temp_pool().await;
-        create_user(&pool, &sample_admin("a1", "root")).await.unwrap();
-        create_user(&pool, &sample_admin("a2", "carol")).await.unwrap();
+        create_user(&pool, &sample_admin("a1", "root"))
+            .await
+            .unwrap();
+        create_user(&pool, &sample_admin("a2", "carol"))
+            .await
+            .unwrap();
 
         let gate = std::sync::Arc::new(tokio::sync::Barrier::new(2));
         let mut handles = Vec::new();
@@ -2741,7 +2767,10 @@ mod tests {
             n
         };
 
-        assert_eq!(deleted, 1, "es sind {deleted} von 2 Löschungen durchgegangen");
+        assert_eq!(
+            deleted, 1,
+            "es sind {deleted} von 2 Löschungen durchgegangen"
+        );
         assert_eq!(active_admins(&pool).await, 1);
     }
 
@@ -2752,9 +2781,15 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn no_mix_of_concurrent_attempts_can_empty_the_admin_set() {
         let (pool, _dir) = temp_pool().await;
-        create_user(&pool, &sample_admin("a1", "root")).await.unwrap();
-        create_user(&pool, &sample_admin("a2", "carol")).await.unwrap();
-        create_user(&pool, &sample_admin("a3", "dave")).await.unwrap();
+        create_user(&pool, &sample_admin("a1", "root"))
+            .await
+            .unwrap();
+        create_user(&pool, &sample_admin("a2", "carol"))
+            .await
+            .unwrap();
+        create_user(&pool, &sample_admin("a3", "dave"))
+            .await
+            .unwrap();
 
         const ATTEMPTS: usize = 24;
         let gate = std::sync::Arc::new(tokio::sync::Barrier::new(ATTEMPTS));
@@ -2794,13 +2829,17 @@ mod tests {
     #[tokio::test]
     async fn username_collisions_are_found_regardless_of_case() {
         let (pool, _dir) = temp_pool().await;
-        create_user(&pool, &sample_user("u1", "Alice")).await.unwrap();
+        create_user(&pool, &sample_user("u1", "Alice"))
+            .await
+            .unwrap();
 
         assert!(username_exists_ignoring_case(&pool, "alice").await.unwrap());
         assert!(username_exists_ignoring_case(&pool, "ALICE").await.unwrap());
         assert!(username_exists_ignoring_case(&pool, "Alice").await.unwrap());
         assert!(!username_exists_ignoring_case(&pool, "alic").await.unwrap());
-        assert!(!username_exists_ignoring_case(&pool, "alicee").await.unwrap());
+        assert!(!username_exists_ignoring_case(&pool, "alicee")
+            .await
+            .unwrap());
         // Die gross-/kleinschreibungsabhängige Fassung sieht das nicht — das
         // ist der Grund, warum es die neue gibt.
         assert!(!username_exists(&pool, "alice").await.unwrap());
@@ -2814,7 +2853,9 @@ mod tests {
         create_user(&pool, &sample_user("u1", "bob")).await.unwrap();
         assert_eq!(active_admins(&pool).await, 0);
 
-        create_user(&pool, &sample_admin("a1", "root")).await.unwrap();
+        create_user(&pool, &sample_admin("a1", "root"))
+            .await
+            .unwrap();
         assert_eq!(active_admins(&pool).await, 1);
 
         let mut sleeping = sample_admin("a2", "carol");

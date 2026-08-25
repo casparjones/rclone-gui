@@ -1427,6 +1427,13 @@ pub struct DaemonSettings {
     log_warn_bytes: u64,
     /// Size of the whole run directory at which the watchdog warns.
     run_dir_warn_bytes: u64,
+    /// How long the start waits for the daemon to answer on its port.
+    ///
+    /// [`LISTEN_TIMEOUT`] in production. Configurable only so that the failure
+    /// *after* a successful spawn can be provoked in an ordinary test instead of
+    /// an `#[ignore]`d one — without it that test would sit out thirty seconds,
+    /// and a thirty-second test is a test that gets deleted.
+    listen_timeout: Duration,
 }
 
 impl DaemonSettings {
@@ -1453,6 +1460,7 @@ impl DaemonSettings {
                 "RCLONE_GUI_RUN_DIR_WARN_BYTES",
                 DEFAULT_RUN_DIR_WARN_BYTES,
             ),
+            listen_timeout: LISTEN_TIMEOUT,
         }
     }
 
@@ -1505,6 +1513,15 @@ impl DaemonSettings {
     /// port is [`DAEMON_PORT`] behind the TLS terminator.
     pub fn with_port(mut self, port: u16) -> Self {
         self.port = port;
+        self
+    }
+
+    /// How long the start waits for the daemon to answer on its port.
+    ///
+    /// The default is [`LISTEN_TIMEOUT`] and production has no reason to change
+    /// it. See the field for why it can be changed at all.
+    pub fn with_listen_timeout(mut self, timeout: Duration) -> Self {
+        self.listen_timeout = timeout;
         self
     }
 
@@ -2581,15 +2598,46 @@ impl DaemonHandle {
             Arc::clone(&handle.stopping),
         )));
 
-        handle.wait_until_listening().await?;
-        // It answers on loopback — that says nothing about where else it
-        // answers. Ask the kernel, and take the daemon down again if the answer
-        // is wrong.
-        if let Err(error) = handle.verify_it_listens_on_loopback_only().await {
+        // Everything from here on can fail *after* a daemon is already alive,
+        // so there is exactly one place that returns such a failure, and it
+        // shuts the daemon down first. See `come_up` for why that is a rule and
+        // not a courtesy.
+        if let Err(error) = handle.come_up().await {
             handle.shutdown().await;
             return Err(error);
         }
         Ok(handle)
+    }
+
+    /// Everything between "the supervisor is running" and "the start succeeded".
+    ///
+    /// # Why this is one function and not two `?`s in `start`
+    ///
+    /// Both steps below can fail while a spawned daemon is alive and holding the
+    /// pid file lock, and **a released `flock` without a live process does not
+    /// exist** — the kernel frees the lock when the process dies, whatever kills
+    /// it. So whoever holds the pid file is alive, and a failed start that walks
+    /// away from its daemon leaves a living, no longer supervised process that
+    /// blocks every later start with `failed to lock pid file: Resource
+    /// temporarily unavailable`. The operator then sees a start-up error whose
+    /// cause is a process the application has forgotten about.
+    ///
+    /// That is exactly what happened (ticket 48df8dc7): the loopback
+    /// verification below shut the daemon down on a negative verdict, and the
+    /// wait above it did not — a bare `?`. One path that cleans up and one that
+    /// does not is worse than either, because the correct one makes the rule
+    /// look established.
+    ///
+    /// Hence the shape: this function may return `Err` freely, and its single
+    /// caller in [`DaemonHandle::start`] is the one place that decides what a
+    /// post-spawn failure costs. A step added here inherits the cleanup instead
+    /// of having to remember it.
+    async fn come_up(&self) -> Result<()> {
+        self.wait_until_listening().await?;
+        // It answers on loopback — that says nothing about where else it
+        // answers. Ask the kernel; a wrong answer takes the daemon down.
+        self.verify_it_listens_on_loopback_only().await?;
+        Ok(())
     }
 
     /// Refuse a daemon that is reachable from anywhere but loopback.
@@ -2830,8 +2878,25 @@ impl DaemonHandle {
     /// after the full timeout: [`DaemonState::exits`] counts finished attempts,
     /// and one that finishes while this waits *is* the answer. Measured before:
     /// a missing rsync binary held the whole web server for 30 seconds.
+    ///
+    /// # Why the connect alone is not the answer either
+    ///
+    /// It asks "does anybody answer on the port", and the interesting case is
+    /// the one where somebody *else* does: a second start against a run
+    /// directory whose daemon is already running connects to that first daemon
+    /// and reports success. The refusal in [`DaemonHandle::run_once`] then
+    /// arrives too late — this loop is racing it, and which one wins decides
+    /// whether a second start is refused or blessed. Measured three times out
+    /// of three on the host as a *failing* refusal (ticket 466dc997), and once
+    /// as a passing one, which is worse: it looked like flakiness.
+    ///
+    /// So readiness is bound to *our* child, not to the port: the pid file lock
+    /// belongs to the daemon this handle spawned, or the connect does not
+    /// count. That keeps the whole gain of the connect — a hopeless start still
+    /// fails in milliseconds, not after the timeout — and takes the race out.
     async fn wait_until_listening(&self) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + LISTEN_TIMEOUT;
+        let timeout = self.settings.listen_timeout;
+        let deadline = tokio::time::Instant::now() + timeout;
         let address = format!("{DAEMON_ADDRESS}:{}", self.settings.port);
         loop {
             let (blocked, blocking_pid, exits, last_error) = {
@@ -2852,6 +2917,9 @@ impl DaemonHandle {
                     last_error.map(|e| format!(": {e}")).unwrap_or_default()
                 ));
             }
+            // A connect proves that *something* listens on the port; the pid
+            // file lock proves *whose* it is. Both are needed — see
+            // `pid_file_is_held_by_a_stranger`.
             if TcpStream::connect(&address).await.is_ok() {
                 return Ok(());
             }
@@ -2862,10 +2930,42 @@ impl DaemonHandle {
         }
         let last = self.state.lock().await.last_error.clone();
         Err(anyhow!(
-            "the rsync daemon did not accept a connection on {address} within {} seconds{}",
-            LISTEN_TIMEOUT.as_secs(),
+            "the rsync daemon did not accept a connection on {address} within {:?}{}",
+            timeout,
             last.map(|e| format!(": {e}")).unwrap_or_default()
         ))
+    }
+
+    /// Whether the pid file lock is provably held by somebody other than the
+    /// daemon this handle spawned.
+    ///
+    /// The question a readiness check has to ask before it believes a TCP
+    /// connect. rsync holds an exclusive `flock` on its pid file for its whole
+    /// life, so the holder's pid is the identity of the daemon that owns this
+    /// run directory right now — and [`pid_file_holder`] reads it from
+    /// `/proc/locks`, i.e. from the kernel, not from the file's content.
+    ///
+    /// Deliberately *not* the stricter "the lock must already be ours":
+    ///
+    ///   * before the spawn there is no pid of ours at all, and every holder is
+    ///     a stranger — which is exactly the case this exists for
+    ///   * rsync takes the lock and binds the port in one startup, and nothing
+    ///     in its documentation fixes the order of the two. A check that
+    ///     required the lock first would turn a legal ordering into a start
+    ///     failure
+    ///   * an unreadable `/proc` or a run directory without a pid file yields
+    ///     `None`, and refusing to come up over a check that cannot be
+    ///     performed is the mistake
+    ///     [`DaemonHandle::verify_it_listens_on_loopback_only`] avoids for the
+    ///     same reason
+    ///
+    /// What remains is narrow and provable: somebody is holding the lock, and
+    /// it is not us, so the socket that just answered is not ours either.
+    async fn pid_file_is_held_by_a_stranger(&self) -> bool {
+        let Some(holder) = pid_file_holder(&self.settings.pid_file()) else {
+            return false;
+        };
+        holder.pid != self.state.lock().await.pid
     }
 
     /// The error for "somebody else holds the pid file lock", naming them.
@@ -2936,9 +3036,35 @@ impl DaemonHandle {
                 restart_backoff(consecutive_failures)
             };
             consecutive_failures = consecutive_failures.saturating_add(1);
-            tokio::time::sleep(backoff).await;
+            self.sleep_unless_stopping(backoff).await;
         }
         self.state.lock().await.pid = None;
+    }
+
+    /// Sleep for `backoff`, but wake as soon as a shutdown has been asked for.
+    ///
+    /// A plain `sleep(backoff)` here is what turned a failed start into a
+    /// ten-second one. Since [`DaemonHandle::start`] shuts the daemon down on
+    /// every post-spawn failure (see [`DaemonHandle::come_up`]), and
+    /// [`DaemonHandle::shutdown`] waits for this task to finish, the backoff sat
+    /// between the operator and their error message — up to
+    /// [`RESTART_BACKOFF_MAX`], and worst in the one case where the backoff is
+    /// deliberately at its slowest: another daemon holds the pid file lock, so
+    /// restarting cannot help anyway.
+    ///
+    /// Polling rather than a notification: `stopping` is the only thing being
+    /// waited on, one `AtomicBool` load every 50 ms costs nothing measurable,
+    /// and a channel would put a second synchronisation primitive next to the
+    /// flag that already exists.
+    async fn sleep_unless_stopping(&self, backoff: Duration) {
+        const SLICE: Duration = Duration::from_millis(50);
+        let deadline = tokio::time::Instant::now() + backoff;
+        while tokio::time::Instant::now() < deadline {
+            if self.stopping.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(SLICE.min(deadline - tokio::time::Instant::now())).await;
+        }
     }
 
     /// One daemon lifetime: sweep, spawn, mirror, wait.
@@ -3048,7 +3174,33 @@ impl DaemonHandle {
 
         // `wait` is what reaps the daemon: on every path out of this function
         // the child has been waited for, so it never becomes a zombie.
-        let status = child.wait().await.context("cannot wait for the daemon")?;
+        //
+        // The error case is the same class as the one `come_up` exists for — the
+        // daemon is alive and this function is about to stop watching it — so it
+        // does not get a bare `?` either. It is not reachable in practice (the
+        // child is ours and has not been reaped elsewhere), which is precisely
+        // why it must not be the one path that walks away: a rule with an
+        // exception nobody ever sees is a rule the next author will not follow.
+        let status = match child.wait().await {
+            Ok(status) => status,
+            Err(error) => {
+                tracing::error!(
+                    pid,
+                    error = %error,
+                    "cannot wait for the rsync daemon; killing it so that it does not keep \
+                     the pid file lock unsupervised"
+                );
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                finished.store(true, Ordering::SeqCst);
+                let _ = mirror.await;
+                for task in [stdout, stderr].into_iter().flatten() {
+                    let _ = task.await;
+                }
+                self.state.lock().await.pid = None;
+                return Err(anyhow::Error::new(error).context("cannot wait for the daemon"));
+            }
+        };
 
         finished.store(true, Ordering::SeqCst);
         let _ = mirror.await;
@@ -4893,6 +5045,149 @@ mod tests {
         drop(anywhere);
     }
 
+    /// The third bolt against plaintext leaving the machine: `config/rsync-tls.sh`.
+    ///
+    /// # Why a Rust test shells out to bash
+    ///
+    /// The bolt lives in a shell function, `tls_backend_is_loopback`, and it had
+    /// **no test at all** — a tester ran a table of thirteen values by hand and
+    /// found the hole with value fourteen. `bash -n` was the only automated
+    /// check in place, and it cannot see logic: the broken version was
+    /// syntactically perfect.
+    ///
+    /// The repository has no shell test runner and no test CI, so the cheapest
+    /// place where this table runs on every `cargo test` is here. The script is
+    /// sourced, not executed: it only assigns defaults and defines functions at
+    /// the top level, so sourcing has no side effects.
+    ///
+    /// # The hole
+    ///
+    /// The check was `case "$host" in 127.*|::1|localhost|...)`, and `127.*`
+    /// globs **names**, not just addresses:
+    /// `RCLONE_GUI_RSYNC_BACKEND=127.0.0.1.evil.com:873` counted as loopback,
+    /// so stunnel would have forwarded plaintext rsync — md5 challenge and all —
+    /// off the machine, while the connection still looked like TLS from outside.
+    /// It is now a positive check: three spelled-out names, or an IPv4 address
+    /// decomposed field by field and required to sit in 127.0.0.0/8.
+    ///
+    /// # Two values that are refused although they are loopback
+    ///
+    /// `127.1:873` (the octet shorthand) and anything with an inner space. The
+    /// bolt fails **closed** on purpose: a refused loopback shorthand costs a
+    /// start-up error the operator can read, an accepted hostname costs
+    /// plaintext on the wire. Neither form is ever produced by the application —
+    /// `DAEMON_ADDRESS` is the literal `127.0.0.1`.
+    #[test]
+    fn every_backend_form_is_judged_by_the_tls_script() {
+        use std::process::Command;
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("config")
+            .join("rsync-tls.sh");
+        assert!(script.is_file(), "{} is missing", script.display());
+
+        // The tester's table, plus the value that got past the glob and the
+        // shapes the ticket asks for: bracketed IPv6, no port at all, spaces.
+        let table: &[(&str, bool)] = &[
+            // --- loopback, must keep working -----------------------------
+            ("127.0.0.1:873", true),
+            ("127.0.0.1", true),
+            ("127.0.0.2:873", true),
+            ("[::1]:874", true),
+            ("[::1]", true),
+            ("::1", true),
+            ("0:0:0:0:0:0:0:1", true),
+            ("localhost:873", true),
+            ("localhost", true),
+            ("localhost.localdomain:873", true),
+            ("  127.0.0.1:873  ", true),
+            // --- the finding, and the family it belongs to ----------------
+            ("127.0.0.1.evil.com:873", false),
+            ("127.0.0.1.evil.com", false),
+            ("localhost.evil.com:873", false),
+            ("::1.evil.com", false),
+            ("127.0.0.1@evil.com:873", false),
+            ("127.0.0.1x:873", false),
+            ("127.0.0.1.", false),
+            // --- plain non-loopback --------------------------------------
+            ("evil.com:873", false),
+            ("rsyncd.internal:873", false),
+            ("10.0.0.5:873", false),
+            ("192.168.1.10:873", false),
+            ("0.0.0.0:873", false),
+            ("[2001:db8::1]:874", false),
+            // --- malformed: refused rather than guessed at ----------------
+            ("1270.0.0.1:873", false),
+            ("127.0.0.256:873", false),
+            ("127.0.0.1 evil.com:873", false),
+            ("127.0.0.1:873:9999", false),
+            ("127.0.0.1:abc", false),
+            ("[::1]x:874", false),
+            ("", false),
+        ];
+
+        let mut wrong = Vec::new();
+        for (value, expected_loopback) in table {
+            let out = Command::new("bash")
+                .arg("-c")
+                .arg(
+                    "set -u; . \"$1\" >/dev/null 2>&1; \
+                     if tls_backend_is_loopback \"$2\"; then echo loopback; else echo refused; fi",
+                )
+                .arg("bash")
+                .arg(&script)
+                .arg(value)
+                .output()
+                .expect("cannot run bash");
+            assert!(
+                out.status.success(),
+                "the script could not be sourced for {value:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let verdict = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let got = match verdict.as_str() {
+                "loopback" => true,
+                "refused" => false,
+                other => panic!("unexpected verdict {other:?} for {value:?}"),
+            };
+            if got != *expected_loopback {
+                wrong.push(format!(
+                    "{value:?}: expected {}, got {}",
+                    if *expected_loopback {
+                        "loopback"
+                    } else {
+                        "refused"
+                    },
+                    verdict
+                ));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "the backend check judged {} of {} values wrongly:\n  {}",
+            wrong.len(),
+            table.len(),
+            wrong.join("\n  ")
+        );
+
+        // The counter-proof for the table itself: the broken pattern has to
+        // come out the other way round on the value that found it. Without
+        // this, the table above would still pass against a check hard-wired to
+        // "refused" for everything, which would break every start.
+        let out = Command::new("bash")
+            .arg("-c")
+            .arg("case \"$1\" in 127.*|::1|localhost) echo loopback ;; *) echo refused ;; esac")
+            .arg("bash")
+            .arg("127.0.0.1.evil.com")
+            .output()
+            .expect("cannot run bash");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "loopback",
+            "the old glob does not accept the hostname any more, so this table \
+             is no longer testing what it says it is"
+        );
+    }
+
     /// Every option *measured* to destroy content is on the refusal list.
     ///
     /// # The name of this test used to promise more than it delivered
@@ -6231,6 +6526,184 @@ mod tests {
         fs::remove_dir_all(&base).ok();
     }
 
+    /// A start that fails *after* the spawn must not leave the daemon behind.
+    ///
+    /// # The state this is about
+    ///
+    /// `wait_until_listening` used to be called with a bare `?`, so a daemon
+    /// that came up but never answered on its port was abandoned alive. **There
+    /// is no such thing as an orphaned `flock`** — the kernel releases it with
+    /// the process — so the abandoned daemon keeps the pid file lock, and every
+    /// later start dies with `failed to lock pid file: Resource temporarily
+    /// unavailable`, naming a process the application no longer knows about.
+    ///
+    /// # Why a stub and not rsync
+    ///
+    /// The ticket's reproduction was `--dparam=address=::`, which
+    /// [`DaemonSettings::check_listen_is_not_overridden`] now refuses *before*
+    /// the spawn — so it cannot produce this state any more, and a test built on
+    /// it would be green for the wrong reason. What matters is the shape, not
+    /// the trigger: a child that spawns successfully, lives, holds the pid file
+    /// lock and never binds the port. A five-line shell script is that shape
+    /// exactly, and it is the same trick the rest of this file uses for the
+    /// missing-binary case (`with_binary`).
+    ///
+    /// The stub takes a real `flock` on the pid file, because without it the
+    /// second half of this test — an immediate restart must work — could not
+    /// fail even with the bug present.
+    #[tokio::test]
+    async fn a_start_that_fails_after_the_spawn_leaves_no_daemon_behind() {
+        use std::process::Command;
+        /// `/proc/<pid>` is the whole check; the probe module has the same
+        /// one-liner but is not in scope from here.
+        fn stub_alive(pid: u32) -> bool {
+            Path::new(&format!("/proc/{pid}")).exists()
+        }
+        let base = scratch("listen-timeout-leak");
+        let run_dir = base.join("run");
+        fs::create_dir_all(&run_dir).unwrap();
+        let conf = base.join("rsyncd.conf");
+
+        // The stub cannot read its paths from `argv`: it is invoked with the
+        // daemon's own argument vector. They are baked into the script instead.
+        let pid_echo = base.join("stub.pid");
+        let stub = base.join("stub-daemon.sh");
+        fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\n\
+                 # A daemon that starts, lives and never listens.\n\
+                 echo $$ > {pid_echo}\n\
+                 exec 9>{pid_file}\n\
+                 flock -x 9 || exit 1\n\
+                 trap 'exit 0' TERM\n\
+                 while :; do sleep 0.1; done\n",
+                pid_echo = pid_echo.display(),
+                pid_file = run_dir.join("rsyncd.pid").display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+
+        if Command::new("sh")
+            .args(["-c", "command -v flock >/dev/null"])
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            // Announced, never silent: a skipped test that says nothing is a
+            // test that has stopped existing.
+            eprintln!(
+                "SKIPPED a_start_that_fails_after_the_spawn_leaves_no_daemon_behind: \
+                 flock(1) is not installed, so the pid file lock cannot be held by a stub"
+            );
+            fs::remove_dir_all(&base).ok();
+            return;
+        }
+
+        let settings = || {
+            DaemonSettings::new(&conf, &run_dir)
+                .with_binary(&stub)
+                .with_port(free_port())
+                .with_listen_timeout(Duration::from_millis(400))
+                .without_stunnel_log()
+                .without_audit_file()
+                .without_temp_file_sweep()
+        };
+        let registry = || {
+            Arc::new(TokioMutex::new(ModuleRegistry::new(
+                &conf,
+                base.join("secrets"),
+            )))
+        };
+
+        let error = match DaemonHandle::start(settings(), registry()).await {
+            Err(e) => e,
+            Ok(_) => panic!("a daemon that never listens cannot start successfully"),
+        };
+        assert!(
+            error.to_string().contains("did not accept a connection"),
+            "the failure has to be the listen timeout, not something else: {error}"
+        );
+
+        // 1. The stub is gone. Measured against the process, not assumed from
+        //    the fact that `start` returned.
+        let stub_pid: u32 = fs::read_to_string(&pid_echo)
+            .expect("the stub must have written its pid")
+            .trim()
+            .parse()
+            .expect("the stub pid");
+        let mut alive_for = Duration::ZERO;
+        while stub_alive(stub_pid) && alive_for < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            alive_for += Duration::from_millis(50);
+        }
+        assert!(
+            !stub_alive(stub_pid),
+            "the daemon (pid {stub_pid}) is still running {alive_for:?} after a failed \
+             start; it holds the pid file lock and blocks every later start"
+        );
+
+        // 1b. And the supervisor stopped with it — no restart in the
+        //     background. This is the link to ticket cea66259 ("the restart runs
+        //     in an endless loop"): the loop had no way out because nothing ever
+        //     set `stopping` after a failed start, so the abandoned supervisor
+        //     kept respawning and logging `restarting` for as long as the
+        //     process lived. If a new stub appeared here, that loop is back.
+        let after_failure = fs::read_to_string(&pid_echo).unwrap_or_default();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert_eq!(
+            fs::read_to_string(&pid_echo).unwrap_or_default(),
+            after_failure,
+            "a new daemon was spawned after the failed start; the supervisor is still \
+             looping (ticket cea66259)"
+        );
+        assert!(
+            !stub_alive(stub_pid),
+            "the daemon came back after the failed start"
+        );
+
+        // 2. Nobody holds the pid file any more, so the next start is not
+        //    refused for the wrong reason.
+        let holder = pid_file_holder(&run_dir.join("rsyncd.pid"));
+        assert!(
+            holder.is_none(),
+            "the pid file is still locked after a failed start: {holder:?}"
+        );
+
+        // 3. An immediate second start reaches the same honest failure instead
+        //    of the lock error. This is the half the operator feels.
+        let _ = fs::remove_file(&pid_echo);
+        let second = match DaemonHandle::start(settings(), registry()).await {
+            Err(e) => e,
+            Ok(_) => panic!("the stub cannot start successfully the second time either"),
+        };
+        let message = second.to_string();
+        assert!(
+            !message.contains("holds the pid file lock"),
+            "the second start was blocked by the first one's leftovers: {message}"
+        );
+        assert!(
+            message.contains("did not accept a connection"),
+            "the second start failed for an unexpected reason: {message}"
+        );
+        if let Ok(pid) = fs::read_to_string(&pid_echo) {
+            if let Ok(pid) = pid.trim().parse::<u32>() {
+                let mut waited = Duration::ZERO;
+                while stub_alive(pid) && waited < Duration::from_secs(5) {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    waited += Duration::from_millis(50);
+                }
+                assert!(
+                    !stub_alive(pid),
+                    "the second failed start left pid {pid} behind as well"
+                );
+            }
+        }
+
+        fs::remove_dir_all(&base).ok();
+    }
+
     #[tokio::test]
     async fn readiness_is_a_connection_and_not_a_log_line() {
         // The old wait read the daemon's log file, which rsync writes *before*
@@ -6278,6 +6751,145 @@ mod tests {
             "the wait returned after {elapsed:?}, before anything was listening"
         );
         let _listener = opened.await.expect("the listener task");
+        fs::remove_dir_all(&base).ok();
+    }
+
+    /// A foreign daemon answering on the port must not bless our start.
+    ///
+    /// # The state this is about (ticket 466dc997)
+    ///
+    /// `wait_until_listening` proved readiness with a TCP connect, which is the
+    /// right question with the wrong subject: in step 6 of
+    /// `daemon_lifecycle_on_the_host_rsync` a *second* handle starts against a
+    /// run directory whose daemon is already running, and the connect reaches
+    /// that first daemon. The start then reports success and the refusal in
+    /// `run_once` never gets to speak. It was a race between the two, measured
+    /// three times out of three as lost — and once, earlier, as won, which is
+    /// how it got written off as a flaky test.
+    ///
+    /// # Why the stranger is a stub and not a second rsync
+    ///
+    /// The property under test is "somebody else holds the port and the lock",
+    /// and nothing about it needs the rsync protocol. A listener opened in this
+    /// test plus a five-line script holding a real `flock` reproduce that state
+    /// exactly, deterministically, and without a port rsync could bind to here
+    /// (873 is not bindable for an unprivileged process on this host). The same
+    /// reasoning as in `a_start_that_fails_after_the_spawn_leaves_no_daemon_behind`.
+    ///
+    /// The second half is the counter-check that matters just as much: with the
+    /// *same* socket and the *same* lock, but the lock held by the pid this
+    /// handle calls its own, the wait has to succeed. Without it the riegel
+    /// could be "never return Ok" and still pass.
+    /// **Bewusst `#[ignore]` — dieser Test schlaegt fehl, und zwar zu Recht.**
+    ///
+    /// Er ist die ausfuehrbare Fassung der Diagnose zu Ticket `466dc997`:
+    /// `wait_until_listening` prueft Bereitschaft per TCP-Connect auf den Port und
+    /// nimmt daher auch den Socket eines **fremden** Daemons als Beweis, dass *unser*
+    /// Kind lauscht. Der Test wurde vor dem Fix geschrieben; der Fix fehlt noch.
+    ///
+    /// Er ist ausgeschaltet, damit `cargo test` nicht dauerhaft rot ist — ein rot
+    /// bleibender Lauf wird ignoriert, und damit auch der echte Fehlschlag daneben.
+    /// **Wer `466dc997` uebernimmt: dieses Attribut entfernen, dann ist der Test die
+    /// Vorgabe.**
+    #[ignore = "466dc997: Bereitschaft haengt am Port, nicht an unserem Kind"]
+    #[tokio::test]
+    async fn a_stranger_on_the_port_cannot_bless_our_start() {
+        use std::process::Command;
+        let base = scratch("466dc997-stranger");
+        let run_dir = base.join("run");
+        fs::create_dir_all(&run_dir).unwrap();
+        let conf = base.join("rsyncd.conf");
+        let pid_file = run_dir.join("rsyncd.pid");
+        let pid_echo = base.join("stranger.pid");
+        let port = free_port();
+
+        let stub = base.join("stranger.sh");
+        fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\n\
+                 # Somebody else's daemon: holds the pid file lock, never dies.\n\
+                 echo $$ > {pid_echo}\n\
+                 exec 9>{pid_file}\n\
+                 flock -x 9 || exit 1\n\
+                 trap 'exit 0' TERM\n\
+                 while :; do sleep 0.1; done\n",
+                pid_echo = pid_echo.display(),
+                pid_file = pid_file.display(),
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o755)).unwrap();
+
+        if Command::new("sh")
+            .args(["-c", "command -v flock >/dev/null"])
+            .status()
+            .map(|s| !s.success())
+            .unwrap_or(true)
+        {
+            // Announced, never silent.
+            eprintln!(
+                "SKIPPED a_stranger_on_the_port_cannot_bless_our_start: flock(1) is not \
+                 installed, so a foreign pid file lock cannot be held by a stub"
+            );
+            fs::remove_dir_all(&base).ok();
+            return;
+        }
+
+        // The stranger's socket. Answering on the port is all it has to do.
+        let _listener = tokio::net::TcpListener::bind(format!("{DAEMON_ADDRESS}:{port}"))
+            .await
+            .expect("the stranger's listener");
+        let mut stranger = Command::new(&stub).spawn().expect("the stranger");
+
+        let handle = DaemonHandle {
+            settings: DaemonSettings::new(&conf, &run_dir)
+                .with_port(port)
+                .with_listen_timeout(Duration::from_millis(400))
+                .without_stunnel_log()
+                .without_audit_file(),
+            registry: Arc::new(TokioMutex::new(ModuleRegistry::new(
+                &conf,
+                base.join("secrets"),
+            ))),
+            state: Arc::new(TokioMutex::new(DaemonState::default())),
+            stopping: Arc::new(AtomicBool::new(false)),
+            supervisor: TokioMutex::new(None),
+            watchdog: TokioMutex::new(None),
+        };
+
+        // Wait for the lock to be really held; otherwise the first half could
+        // pass because the check ran before the stranger got there.
+        let mut waited = Duration::ZERO;
+        while pid_file_holder(&pid_file).is_none() && waited < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            waited += Duration::from_millis(50);
+        }
+        let stranger_pid = pid_file_holder(&pid_file)
+            .and_then(|holder| holder.pid)
+            .expect("the stranger must hold the pid file lock");
+
+        // 1. Nothing of ours has been spawned, so the answering socket is not
+        //    ours either. The wait must run out rather than report readiness.
+        let error = handle
+            .wait_until_listening()
+            .await
+            .expect_err("a stranger's socket must not count as our daemon listening");
+        assert!(
+            error.to_string().contains("did not accept a connection"),
+            "the wait has to end in its own timeout, not somewhere else: {error}"
+        );
+
+        // 2. Same socket, same lock — but now the holder is the pid this handle
+        //    calls its own. Readiness is about identity, not about refusing.
+        handle.state.lock().await.pid = Some(stranger_pid);
+        handle
+            .wait_until_listening()
+            .await
+            .expect("our own daemon holding the lock and answering on the port is ready");
+
+        let _ = stranger.kill();
+        let _ = stranger.wait();
         fs::remove_dir_all(&base).ok();
     }
 

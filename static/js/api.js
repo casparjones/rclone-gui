@@ -426,3 +426,60 @@ export function deleteTask(taskId) {
 export function startTask(taskName) {
     return postJson('/api/tasks/start', { task_name: taskName }).then(announceSyncStarted);
 }
+
+// Users ----------------------------------------------------------------------
+//
+// The admin routes are guarded **server-side** (`require_admin` in
+// `src/handlers/users.rs`). Hiding the section from a non-admin is convenience;
+// the binding answer is a 403, and every caller here must be able to show it.
+// So none of these functions swallow a status: a refusal comes back as an
+// ordinary `{ ok: false, error, status }` and the reason the server gave is the
+// text the user reads. It is written for a human on purpose ("Ein
+// Administrator kann sich die Adminrechte nicht selbst entziehen …"), which is
+// why it is passed through instead of being replaced by a generic message.
+//
+// The password of an account is never part of an answer — `UserView` does not
+// have the field at all.
+
+export function fetchUsers() {
+    return request('/api/users');
+}
+
+// `{ username, password, role?, home_path? }`. `password` is mandatory; a
+// missing `role` creates a `user`, a missing `home_path` puts the home under
+// `RCLONE_GUI_DEFAULT_PATH/<name>`.
+export function createUser(user) {
+    return postJson('/api/users', user);
+}
+
+// Only the fields that are present are changed; an empty body is rejected with
+// 400. `password` here is an admin resetting *another* account — for the own
+// one the server points at `changeOwnPassword()` below.
+export function updateUser(userId, changes) {
+    return request(`/api/users/${encodeURIComponent(userId)}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(changes)
+    });
+}
+
+// `dataMode` is **mandatory** and must be `keep` or `delete`: what happens to
+// the personal rclone configuration is asked, never assumed. `transfer` exists
+// as a rejected value (400) and is deliberately not offered here — see
+// `parse_delete_mode`.
+export function deleteUser(userId, dataMode) {
+    return request(
+        `/api/users/${encodeURIComponent(userId)}?data=${encodeURIComponent(dataMode)}`,
+        { method: 'DELETE' }
+    );
+}
+
+// The own password, with the old one. **On success every session of the account
+// is gone, this one included** — the caller has to go to the login page, or the
+// next request is a 401 and the app looks broken.
+export function changeOwnPassword(currentPassword, newPassword) {
+    return postJson('/api/users/me/password', {
+        current_password: currentPassword,
+        new_password: newPassword
+    });
+}

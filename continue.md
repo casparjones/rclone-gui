@@ -1,6 +1,7 @@
 # continue.md — Wiederaufnahme
 
-Stand: 19.08.2026, 00:30. Lauf zur vereinbarten Frist geordnet beendet.
+Stand: 25.08.2026. Lauf beendet, weil das Kontingent aufgebraucht war. Alle Agenten
+**geordnet gestoppt**, nicht abgestürzt.
 Arbeitsanweisung: `AGENTS.md`. Board: https://plankton.tiny-dev.de/p/rclone-gui
 
 ---
@@ -8,19 +9,14 @@ Arbeitsanweisung: `AGENTS.md`. Board: https://plankton.tiny-dev.de/p/rclone-gui
 ## 1. Wo die Arbeit liegt
 
 **Branch `feat/epic1-ui-rework-und-sicherheitshaertung`, gepusht.** Von dort
-weiterarbeiten und später nach `main` mergen.
+weiterarbeiten, später nach `main` mergen.
 
-```
-1672d62  Epic 1 UI-Rework, Auth-Fundament und Sicherheitshaertung
-7f99967  Passwort-Reset, Delete-Option und Haertung des Schreibwegs
-```
+**`.env` ist bewusst nicht committet** (echtes Admin-Passwort im Klartext) und inzwischen
+gitignored.
 
-**`.env` ist bewusst nicht committet** — dort steht ein echtes Admin-Passwort im
-Klartext. Die Datei ist inzwischen gitignored; das Risiko ist damit strukturell weg.
-
-### Eine Lehre, die Geld gekostet hat
-Der erste Commit entstand, **während Agenten liefen**, und hat ihre Arbeit eingesammelt.
-Ein Nachfolger las danach „Teilarbeit liegt uncommittet im Baum", fand einen sauberen
+### Die Lehre, die zweimal Geld gekostet hat
+Ein Commit entstand, **während Agenten liefen**, und hat ihre Arbeit eingesammelt. Ein
+Nachfolger las danach „Teilarbeit liegt uncommittet im Baum", fand einen sauberen
 `git status` und hätte zwei fertige Tickets beinahe neu geschrieben.
 
 **Ein sauberer Arbeitsbaum heisst hier nicht, dass nichts getan wurde.**
@@ -33,13 +29,22 @@ Vor dem Neuschreiben immer `git log -p -- <datei>` und den Ist-Zustand ansehen.
 **Grün, gemessen nach dem Ende aller Agenten:**
 
 ```
-cargo check      0 Fehler
-cargo test       395 bestanden, 0 Fehlschläge, 9 ignoriert
-JS-Module        alle 21 als ESM syntaktisch sauber
-Marker           <!-- RCLONE_GUI_SCRIPTS --> vorhanden
-clippy           18 Findings, alle vorbestehend
-                 (main.rs 13, sync.rs 5) — Ticket e81f29bb
+cargo test    530 bestanden (517 Bibliothek + 13 no_debug_leaks), 0 Fehlschläge
+JS-Module     alle als ESM syntaktisch sauber
+Marker        <!-- RCLONE_GUI_SCRIPTS --> vorhanden
+clippy        Bestandsschuld: main.rs 13, sync.rs 5, urlguard.rs 1 — Ticket e81f29bb
 ```
+
+### Ein Test ist bewusst abgeschaltet — bitte lesen
+`a_stranger_on_the_port_cannot_bless_our_start` (`rsyncd.rs`) trägt
+`#[ignore = "466dc997: …"]`. Er **schlägt zu Recht fehl**: ein Entwickler hat ihn als
+ausführbare Fassung der Diagnose zu `466dc997` geschrieben (`wait_until_listening`
+nimmt auch den Socket eines **fremden** Daemons als Beweis, dass unser Kind lauscht),
+und wurde vor dem Fix gestoppt.
+
+Abgeschaltet, weil ein dauerhaft roter Lauf ignoriert wird — und damit der echte
+Fehlschlag daneben. **Wer `466dc997` übernimmt: Attribut entfernen, dann ist der Test
+die Vorgabe.** Die Begründung steht im Code.
 
 ---
 
@@ -47,15 +52,26 @@ clippy           18 Findings, alle vorbestehend
 
 | Spalte | Anzahl |
 |---|---|
-| Done | **78** |
-| Testing | 2 |
+| Done | **97** |
+| Testing | 8 (gebaut und gemessen, Abnahme fehlt) |
 | In Progress | 0 |
-| Todo | 74 |
+| Todo | 72 |
 
-In `Testing` liegen `7f74ec7b` (rsync-Exit-Codes) und `374aff19` (atomares
-`save_to_file`). Beide sind gebaut und gemessen, nur die Abnahme fehlt.
+### In `Testing` — die Arbeit ist da, nur ungeprüft
+`7c6da059` RCLONE_GUI_BIND · `5ed9c0d5` CLI-Exit 4 für Teilerfolg · `95ef7412`
+Symlink/fsync · `9337871d` Job-Tabellen zusammengeführt · `1e6aa483` Debug-Wächter ·
+`42a3aecf` Job-Log-Zugriffsprüfung · `5f4cf35a` **Sicherheit: fremde Jobs** ·
+`fae31c06` Abruf-Log lesbar
 
----
+**`5f4cf35a` ist der wichtigste** — zwei Tester hatten gemessen, dass ein zweites Konto
+fremde Jobs **abbrechen und löschen** konnte, samt Logdatei. Der Fix führt die beiden
+Job-Tabellen zusammen; `register_job` ist jetzt der einzige Weg hinein, also gibt es
+keinen Job ohne Eigentümer.
+
+### Vier Tickets waren beim Stopp in Arbeit
+`a6fc8d12` (Test-CI) steht zurück in Todo. Die übrigen drei Agenten waren mitten in
+`466dc997`/`cea66259`, `c25b3d90`/`58adcf30` und der Abnahme von `0541474c`/`3d8e3a8c`.
+Ihre Teilarbeit ist **committet** — erst `git log -p` lesen.
 
 ## 4. Epic-Stand
 

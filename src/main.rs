@@ -231,12 +231,12 @@ async fn main() {
     println!("   GET    /api/preview/image             -> preview_image");
     println!("   GET    /api/preview/video             -> preview_video");
     println!("   POST   /api/sync                      -> start_sync");
-    println!("   GET    /api/sync                      -> list_sync_jobs");
+    println!("   GET    /api/sync                      -> list_jobs_for");
     println!("   GET    /api/sync-log/:job_id          -> get_sync_log_for (temp route)");
-    println!("   DELETE /api/sync-delete/:job_id       -> delete_sync_job (temp route)");
+    println!("   DELETE /api/sync-delete/:job_id       -> delete_job_for (temp route)");
     println!("   GET    /api/sync/:job_id/log          -> get_sync_log_for");
-    println!("   GET    /api/sync/:job_id              -> get_sync_progress");
-    println!("   DELETE /api/sync/:job_id              -> delete_sync_job");
+    println!("   GET    /api/sync/:job_id              -> get_sync_progress_for");
+    println!("   DELETE /api/sync/:job_id              -> delete_job_for");
     println!("   GET    /api/tasks                     -> get_tasks");
     println!("   POST   /api/tasks                     -> create_task");
     println!("   DELETE /api/tasks/:task_id            -> delete_task");
@@ -536,62 +536,66 @@ async fn delete_config_handler(
 }
 
 // ---------------------------------------------------------------------------
-// Job-Wege: Sync und URL-Abruf in einer Liste
+// Job-Wege
 //
-// Der URL-Abruf ist ein regulärer Job, führt seine Einträge aber in
-// `handlers::downloader` — die Tabelle des Syncs (`SYNC_JOBS`) ist modulprivat,
-// und `sync.rs` gehört in diesem Ticket einem anderen Ticket. Für den Client
-// ist das unsichtbar: die Liste wird hier zusammengeführt, und Fortschritt und
-// Löschen fallen auf den Downloader zurück, wenn der Sync die ID nicht kennt.
-// Der Log-Weg braucht keine Verzweigung — beide schreiben nach
-// `data/log/<job_id>.log`.
+// Sync-Läufe und URL-Abrufe stehen in **einer** Tabelle (`handlers::sync`), und
+// über den Zugriff entscheidet **eine** Schleuse (`sync::job_access`). Hier
+// wird nichts mehr zusammengefügt und nichts mehr auf einen zweiten Handler
+// zurückgefallen, wenn eine Job-ID unbekannt ist.
+//
+// Das ist der Punkt und nicht nur Aufräumen: die frühere Rückfallregel
+// ("kennt der Sync die ID nicht, fragen wir den Downloader") hatte in ihrem
+// Downloader-Zweig **keine** Besitzprüfung. Gemessen mit zwei Konten: fremde
+// Abrufe waren samt Dateinamen sichtbar, abbrechbar und löschbar. Eine Prüfung,
+// die an drei Stellen stehen muss, fehlt an der vierten.
+//
+// Jeder Handler hier reicht nur `CurrentUser` durch. Dass die Sitzungsprüfung
+// gelaufen ist, beweist `Extension<CurrentUser>`.
 // ---------------------------------------------------------------------------
 
-/// `GET /api/sync` — Sync-Jobs **und** URL-Abrufe.
+/// `GET /api/sync` — die Jobs dieses Kontos, Sync und Abruf gemeinsam.
 ///
-/// Sortiert nach Startzeit, neueste zuerst. Die Sync-Liste allein war nach
-/// Job-ID sortiert; das ist bei UUIDs eine willkürliche Reihenfolge und taugt
-/// nicht als gemeinsame Ordnung für zwei Quellen.
-async fn list_jobs_handler() -> axum::response::Json<models::ApiResponse<Vec<models::SyncProgress>>>
-{
-    let mut response = handlers::sync::list_sync_jobs().await.0;
-    let mut fetches = handlers::downloader::job_list();
-    if let Some(list) = response.data.as_mut() {
-        list.append(&mut fetches);
-        list.sort_by(|a, b| b.start_time.cmp(&a.start_time).then(b.id.cmp(&a.id)));
-    }
-    axum::response::Json(response)
+/// Sortierung (`start_time` absteigend) liegt jetzt in `sync::list_jobs_for`;
+/// sie bleibt, wie sie ist — nach Job-ID wäre sie bei UUIDs willkürlich, und
+/// Job-Leiste und Panel sind damit abgenommen.
+async fn list_jobs_handler(
+    Extension(current): Extension<handlers::auth_web::CurrentUser>,
+) -> axum::response::Json<models::ApiResponse<Vec<models::SyncProgress>>> {
+    handlers::sync::list_jobs_for(&current).await
 }
 
+/// `POST /api/download-url/:job_id/cancel` — bricht einen eigenen Abruf ab.
+///
+/// Die Schleuse liefert die Jobart mit; nur ein **eigener** Abruf kommt
+/// überhaupt bis zum Downloader. Fremd, unbekannt und „ist ein Sync-Lauf"
+/// antworten byte-gleich — die Route kann keinen Sync abbrechen, und sie soll
+/// auch nicht verraten, dass eine fremde ID einen gibt.
 async fn cancel_url_fetch_handler(
+    Extension(current): Extension<handlers::auth_web::CurrentUser>,
     Path(job_id): Path<String>,
 ) -> axum::response::Json<models::ApiResponse<String>> {
-    handlers::downloader::cancel_job(job_id).await
+    match handlers::sync::job_access(&job_id, &current).await {
+        Some(handlers::sync::JobKind::UrlFetch) => handlers::downloader::cancel_job(job_id).await,
+        _ => axum::response::Json(models::ApiResponse::error(handlers::sync::JOB_UNAVAILABLE)),
+    }
 }
 
 async fn get_sync_progress_handler(
+    Extension(current): Extension<handlers::auth_web::CurrentUser>,
     Path(job_id): Path<String>,
 ) -> axum::response::Json<models::ApiResponse<models::SyncProgress>> {
-    if let Some(progress) = handlers::downloader::job_progress(&job_id) {
-        return axum::response::Json(models::ApiResponse::success(progress));
-    }
-    handlers::sync::get_sync_progress(job_id).await
+    handlers::sync::get_sync_progress_for(&current, job_id).await
 }
 
 /// `GET /api/sync/:job_id/log` — das Log eines Jobs, **mit** Besitzprüfung.
 ///
-/// Der angemeldete Nutzer kommt aus `Extension<CurrentUser>`, das die
-/// Sitzungsprüfung in die Request-Extensions gelegt hat — dasselbe Muster wie
-/// `start_sync`. `get_sync_log_for` prüft fail closed: ein Job ohne bekannten
-/// Eigentümer ist so unlesbar wie der eines fremden Kontos, und beide Fälle
-/// antworten byte-gleich, damit der Endpunkt keine fremden Job-IDs bestätigt.
+/// `get_sync_log_for` prüft fail closed und **vor** jeder Dateioperation: ein
+/// Job ohne bekannten Eigentümer ist so unlesbar wie der eines fremden Kontos,
+/// beide Fälle antworten byte-gleich, und für einen Unberechtigten wird gar
+/// nichts erst nachgesehen — deshalb kann auch die Dauer nichts verraten.
 ///
-/// **Folge für den URL-Abruf:** dessen Jobs liegen in
-/// `handlers::downloader::JOBS`, das keinen Eigentümer mitführt, und ihre Logs
-/// werden dadurch für *jeden* unlesbar. Das ist die richtige Richtung — bisher
-/// waren sie für jedes angemeldete Konto lesbar —, aber es ist ein
-/// Funktionsverlust, der eine Eigentümerspalte im Downloader braucht. Beides
-/// liegt in fremden Dateien und ist im Bericht vermerkt.
+/// Gilt für Sync-Läufe und URL-Abrufe gleich: beide stehen in derselben Tabelle
+/// und schreiben ihr Log nach `data/log/<job_id>.log`.
 async fn get_sync_log_handler(
     Extension(current): Extension<handlers::auth_web::CurrentUser>,
     Path(job_id): Path<String>,
@@ -600,12 +604,10 @@ async fn get_sync_log_handler(
 }
 
 async fn delete_sync_job_handler(
+    Extension(current): Extension<handlers::auth_web::CurrentUser>,
     Path(job_id): Path<String>,
 ) -> axum::response::Json<models::ApiResponse<String>> {
-    if let Some(response) = handlers::downloader::delete_job(&job_id).await {
-        return axum::response::Json(response);
-    }
-    handlers::sync::delete_sync_job(job_id).await
+    handlers::sync::delete_job_for(&current, job_id).await
 }
 
 async fn get_config_for_edit_handler(
@@ -1612,7 +1614,12 @@ async fn handle_cli_task_execution(
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-        let progress_response = handlers::sync::get_sync_progress(job_id.clone()).await;
+        // Derselbe Weg wie über HTTP, inklusive Schleuse: der Job ist eben
+        // unter `current` angelegt worden, also lässt sie ihn durch. Ein
+        // zweiter, ungeprüfter Einstieg für die CLI wäre genau die Tür, die
+        // dieses Ticket zumacht.
+        let progress_response =
+            handlers::sync::get_sync_progress_for(&current, job_id.clone()).await;
         if let Some(progress) = progress_response.0.data {
             println!(
                 "📈 Progress: {:.1}% | Status: {} | Transferred: {} / {}",
