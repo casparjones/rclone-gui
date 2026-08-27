@@ -198,7 +198,9 @@ function loadVisibleThumbs() {
 function entryMarkup(entry) {
     const path = escapeHtml(entry.path);
     const name = escapeHtml(entry.name);
-    const size = entry.is_dir ? '—' : formatBytes(entry.size || 0);
+    // Same expression as the remote pane (ui/remotepane.js): unknown reads as an
+    // em dash, never as an empty cell and never as "0 B".
+    const size = entry.is_dir ? '—' : (formatBytes(entry.size) || '—');
     const modified = formatTimestamp(entry.modified);
     const nav = entry.is_dir ? '1' : '0';
 

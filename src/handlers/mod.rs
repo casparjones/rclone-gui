@@ -4,6 +4,7 @@ pub mod config;
 pub mod download;
 pub mod downloader;
 pub mod files;
+pub mod oauth;
 pub mod preview;
 pub mod rsyncd;
 pub mod shares;

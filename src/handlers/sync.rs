@@ -17,6 +17,12 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+/// Die zweite Engine. Sie steht in einer eigenen Datei, weil dieses Modul
+/// schon gross genug ist; als Kindmodul kommt sie an die privaten Bausteine
+/// hier heran (`path_segments`, `is_dry_run`, `classify_rsync_exit`), ohne dass
+/// dafür etwas öffentlich werden muss.
+pub mod rsync_engine;
+
 type SyncJobs = Arc<Mutex<HashMap<String, SyncProgress>>>;
 type JobEngines = Arc<Mutex<HashMap<String, Arc<dyn SyncEngine>>>>;
 /// Job-ID -> Eigentümer und Art des Laufs.
@@ -363,7 +369,6 @@ fn path_segments(path: &str) -> Vec<&str> {
 pub struct JobSpec<'a> {
     /// Identifies the job; engines that need per-job scratch files (rsync's
     /// password file) name them after it.
-    #[allow(dead_code)]
     pub job_id: &'a str,
     pub request: &'a SyncRequest,
     pub mode: TransferMode,
@@ -400,9 +405,8 @@ pub enum ProgressSource {
     /// The child writes machine readable progress into the job log file, which
     /// is polled on demand (rclone `--use-json-log`).
     JobLog,
-    /// The child reports progress on stdout, read line by line while it runs
-    /// (rsync `--info=progress2`).
-    #[allow(dead_code)] // used by the rsync engine
+    /// The child reports progress on stdout, read while it runs
+    /// (rsync `--info=progress2`, siehe `pump_stdout_progress`).
     Stdout,
 }
 
@@ -428,6 +432,20 @@ impl From<(f64, u64, u64)> for ProgressSnapshot {
 pub trait SyncEngine: Send + Sync {
     /// Short name, used in log messages.
     fn name(&self) -> &'static str;
+
+    /// Der Request, **bevor** ein Job entsteht.
+    ///
+    /// Alles, was eine Engine ohne Seiteneffekt prüfen kann, gehört hierher und
+    /// nicht in [`SyncEngine::build_command`]: ein abgelehnter Sync soll weder
+    /// einen Job in der Liste noch eine Logdatei noch eine Password-Datei
+    /// hinterlassen. Genau dieselbe Reihenfolge gilt schon für Remote-Name,
+    /// Quellpfad und den Löschschalter.
+    ///
+    /// Vorgabe ist „nichts zu prüfen" — rclone bringt seine Prüfungen aus dem
+    /// Bestand mit (`ensure_configured_remote`, `backup_dir_target`).
+    fn validate_request(&self, _request: &SyncRequest) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// Build the child process for one job. May fail for engines that have to
     /// materialise credentials first.
@@ -495,7 +513,6 @@ pub trait SyncEngine: Send + Sync {
 /// steht in Klammern dahinter, damit man sie noch nachschlagen kann.
 ///
 /// `code == None` bedeutet: durch ein Signal beendet, es gibt keinen Code.
-#[allow(dead_code)] // verdrahtet der rsync-Client (`classify_exit` des RsyncEngine)
 pub fn classify_rsync_exit(code: Option<i32>) -> JobStatus {
     let code = match code {
         Some(code) => code,
@@ -570,10 +587,28 @@ pub fn classify_rsync_exit(code: Option<i32>) -> JobStatus {
     }
 }
 
-/// Engine for a request. Only rclone exists today; the mode switch that picks
-/// a different engine is a separate ticket.
-fn select_engine(_sync_request: &SyncRequest) -> Arc<dyn SyncEngine> {
-    Arc::new(RcloneEngine)
+/// Die Engine für einen Request — **und** die Prüfung, ob es das Ziel gibt.
+///
+/// Die beiden gehören zusammen, weil sie sich unterscheiden: ein rclone-Remote
+/// muss in der `rclone.conf` des Nutzers stehen, eine rsync-Gegenstelle in
+/// ihrer Hinterlegung unter `data/peers/`. Wären das zwei getrennte Schritte,
+/// gäbe es einen Weg, an dem einer davon fehlt.
+///
+/// Die Reihenfolge ist Absicht: **erst** die Gegenstelle. Eine unbrauchbare
+/// Hinterlegung ist ein Fehler und *kein* Rückfall auf rclone — sonst liefe ein
+/// Push in ein gleichnamiges rclone-Remote, also an ein anderes Ziel als
+/// gemeint. Ist der Name keine Gegenstelle, bleibt die rclone-Prüfung
+/// wortgleich die von vorher.
+///
+/// Der Aufruf steht in `start_sync_for` vor der Job-Anlage; ein abgelehnter
+/// Request hinterlässt weder Job noch Logdatei noch Prozess.
+async fn select_engine(sync_request: &SyncRequest) -> anyhow::Result<Arc<dyn SyncEngine>> {
+    if let Some(target) = rsync_engine::lookup_peer(&sync_request.remote_name).await? {
+        return Ok(Arc::new(rsync_engine::RsyncEngine::new(target)));
+    }
+
+    crate::config_manager::ensure_configured_remote(&sync_request.remote_name).await?;
+    Ok(Arc::new(RcloneEngine))
 }
 
 /// The engine a job runs with, falling back to rclone for unknown jobs.
@@ -739,6 +774,7 @@ fn initial_log_text(
     sync_request: &SyncRequest,
     mode: TransferMode,
     dry_run: bool,
+    engine: &str,
 ) -> String {
     let remote_target = format!("{}:{}", sync_request.remote_name, sync_request.remote_path);
     let timestamp = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S UTC");
@@ -783,7 +819,17 @@ fn initial_log_text(
         }
     }
 
-    text.push_str(&format!("[{}] Starting rclone operation...\n\n", timestamp));
+    // Der Name der Engine, nicht das Wort „rclone": bei einem rsync-Lauf stand
+    // hier sonst ein Werkzeug, das gar nicht beteiligt war.
+    //
+    // Die Ziel-URL der Gegenstelle steht bewusst **nicht** im Log. Sie enthält
+    // den Modulnamen, und der ist Teil der Kopplung — der Nutzer sieht ihn
+    // nirgends. `Remote:` und `Target:` nennen den Namen der Gegenstelle und
+    // den Pfad, und das ist alles, was zum Nachvollziehen nötig ist.
+    text.push_str(&format!(
+        "[{}] Starting {} operation...\n\n",
+        timestamp, engine
+    ));
     text
 }
 
@@ -1063,11 +1109,12 @@ async fn create_initial_log(
     sync_request: &SyncRequest,
     mode: TransferMode,
     dry_run: bool,
+    engine: &str,
 ) -> tokio::io::Result<()> {
     fs::create_dir_all(LOG_DIR).await?;
 
     let log_file_path = internal_log_path(job_id);
-    let initial_log = initial_log_text(job_id, sync_request, mode, dry_run);
+    let initial_log = initial_log_text(job_id, sync_request, mode, dry_run, engine);
 
     fs::write(&log_file_path, initial_log).await
 }
@@ -1155,17 +1202,22 @@ pub async fn start_sync_for(
     current: &CurrentUser,
     mut sync_request: SyncRequest,
 ) -> ResponseJson<ApiResponse<String>> {
-    // Vor allem anderen: der Remote-Name muss syntaktisch sauber und
-    // konfiguriert sein. Ein Name wie `:local` wäre rclones
+    // Vor allem anderen: das Ziel muss existieren, und der Name muss
+    // syntaktisch sauber sein. Ein Name wie `:local` wäre rclones
     // On-the-fly-Syntax für ein nicht konfiguriertes Backend und schriebe in
     // beliebige Wirtspfade. Die Prüfung steht deshalb vor der Job-Anlage:
     // Wird sie abgelehnt, entsteht weder ein Job noch ein Log noch ein
-    // rclone-Prozess.
-    if let Err(e) = crate::config_manager::ensure_configured_remote(&sync_request.remote_name).await
-    {
-        warn!("Sync abgelehnt: {}", e);
-        return ResponseJson(ApiResponse::error(&e.to_string()));
-    }
+    // Kindprozess.
+    //
+    // `select_engine` entscheidet dabei in einem Schritt, **welche** Engine
+    // überträgt: eine gekoppelte rsync-Gegenstelle oder ein rclone-Remote.
+    let engine = match select_engine(&sync_request).await {
+        Ok(engine) => engine,
+        Err(e) => {
+            warn!("Sync abgelehnt: {}", e);
+            return ResponseJson(ApiResponse::error(&e.to_string()));
+        }
+    };
 
     // Dasselbe gilt für die Quelle: abgelehnt wird, bevor ein Job in der
     // Tabelle steht, bevor eine Logdatei angelegt ist und bevor irgendein
@@ -1195,7 +1247,14 @@ pub async fn start_sync_for(
     // ---------------------------------------------------------------------
     let mode = transfer_mode(&sync_request);
     let dry_run = is_dry_run(&sync_request);
-    let engine = select_engine(&sync_request);
+
+    // Was die Engine an diesem Request auszusetzen hat — auch das noch vor der
+    // Job-Anlage. Für rclone ist das leer, die rsync-Engine prüft hier
+    // Zielpfad, Quelle und den (dort nicht unterstützten) Sicherungsordner.
+    if let Err(e) = engine.validate_request(&sync_request) {
+        warn!("Sync abgelehnt ({}): {}", engine.name(), e);
+        return ResponseJson(ApiResponse::error(&e.to_string()));
+    }
 
     if mode.deletes() {
         if !engine.supports_mirror() {
@@ -1268,13 +1327,23 @@ pub async fn start_sync_for(
     // vermerkten Eigentümer. Der CLI-Weg (`--start-task`) geht durch dieselbe
     // Funktion und trägt deshalb ebenfalls ein.
     //
-    // Ohne Abbruchflagge: der Abbruch eines *Sync*-Laufs ist ein eigenes
-    // Ticket. Sobald er kommt, ist hier der Platz dafür — die Wege für
-    // Abbruch, Liste und Löschen unterscheiden die Jobart schon.
-    register_job(progress, &current.user.id, JobKind::Sync, None).await;
+    // **Mit** Abbruchflagge: sie ist dieselbe Flagge, die ein URL-Abruf schon
+    // hat, und `execute_sync` beendet den Kindprozess, sobald sie gesetzt ist.
+    // Ein rsync-Transfer kann Stunden laufen; ein Lauf, der sich nicht
+    // abbrechen lässt, ist bei dieser Laufzeit ein Mangel und nicht bloss
+    // unbequem. Was noch fehlt, ist der HTTP-Weg, der sie setzt — die Route
+    // liegt in `main.rs` und gehört einem anderen Ticket.
+    let cancel = Arc::new(AtomicBool::new(false));
+    register_job(
+        progress,
+        &current.user.id,
+        JobKind::Sync,
+        Some(Arc::clone(&cancel)),
+    )
+    .await;
 
     // Immediately create the log file so it is visible in the UI
-    if let Err(e) = create_initial_log(&job_id, &sync_request, mode, dry_run).await {
+    if let Err(e) = create_initial_log(&job_id, &sync_request, mode, dry_run, engine.name()).await {
         error!("Failed to create initial log for {}: {}", job_id, e);
     } else {
         debug!("📝 Initial log file created for job {}", job_id);
@@ -1289,7 +1358,7 @@ pub async fn start_sync_for(
     let sync_jobs = SYNC_JOBS.clone();
 
     tokio::spawn(async move {
-        execute_sync(job_id_clone, sync_request, sync_jobs, engine).await;
+        execute_sync(job_id_clone, sync_request, sync_jobs, engine, cancel).await;
     });
 
     ResponseJson(ApiResponse::success(job_id))
@@ -1559,6 +1628,7 @@ async fn execute_sync(
     sync_request: SyncRequest,
     sync_jobs: SyncJobs,
     engine: Arc<dyn SyncEngine>,
+    cancel: Arc<AtomicBool>,
 ) {
     let log_file_path = internal_log_path(&job_id);
 
@@ -1570,7 +1640,7 @@ async fn execute_sync(
     let dry_run = is_dry_run(&sync_request);
 
     // Ensure log directory and initial log exist in case start_sync didn't manage to create them (e.g. on crash)
-    if let Err(e) = create_initial_log(&job_id, &sync_request, mode, dry_run).await {
+    if let Err(e) = create_initial_log(&job_id, &sync_request, mode, dry_run, engine.name()).await {
         eprintln!("Failed to ensure initial log: {}", e);
     }
 
@@ -1651,8 +1721,33 @@ async fn execute_sync(
         }
     }
 
-    // Wait for the engine process to exit
-    let status = child.wait().await;
+    // Auf das Prozessende warten — und dabei die Abbruchflagge im Auge
+    // behalten.
+    //
+    // Warum ein Zeitscheiben-Warten und kein `select!` auf die Flagge: in einem
+    // `select!` müssten beide Zweige `child` mutably halten (einer für
+    // `wait()`, der andere für `start_kill()`), und das lässt der Borrow-Checker
+    // nicht zu. `Child::wait` ist ausdrücklich abbruchsicher (Tokio-Doku), das
+    // Wiederaufsetzen verliert den Exit-Status also nicht.
+    let mut cancelled = false;
+    let status = loop {
+        match tokio::time::timeout(std::time::Duration::from_millis(200), child.wait()).await {
+            Ok(status) => break status,
+            Err(_) => {
+                if !cancelled && cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    warn!("🛑 Job {} wird abgebrochen", job_id);
+                    // SIGKILL. Ein SIGTERM wäre bei rsync die freundlichere
+                    // Wahl, aber `tokio::process` kennt nur diesen Weg ohne
+                    // zusätzliche Abhängigkeit, und der Teiltransfer bleibt
+                    // dank `--partial` trotzdem verwertbar.
+                    if let Err(e) = child.start_kill() {
+                        warn!("🛑 Job {} liess sich nicht beenden: {}", job_id, e);
+                    }
+                    cancelled = true;
+                }
+            }
+        }
+    };
 
     cleanup_temp_files(&command).await;
 
@@ -1660,6 +1755,13 @@ async fn execute_sync(
     // `describe_exit()` ist hier nur noch Anzeigetext — er wird in
     // `JobStatus::Failed` verpackt, das Terminal-Verhalten hängt am Typ.
     let final_status = match &status {
+        // Ein abgebrochener Lauf ist `Cancelled` und nicht „durch ein Signal
+        // beendet" — den Text hätte sonst der Nutzer verursacht und würde ihn
+        // als Fehler der Anwendung lesen.
+        _ if cancelled => {
+            info!("🛑 Job {} abgebrochen", job_id);
+            JobStatus::Cancelled
+        }
         Ok(es) if es.success() => {
             info!("✅ Job {} completed successfully", job_id);
             JobStatus::Completed
@@ -1759,17 +1861,69 @@ async fn cleanup_temp_files(command: &EngineCommand) {
 }
 
 /// Read progress from an engine's stdout and write it into the shared job state.
+///
+/// **Zerlegt an `\r` *und* `\n`, nicht mit `BufReader::lines()`.** rsyncs
+/// `--info=progress2` trennt seine Sätze mit Wagenrücklauf; nur der letzte endet
+/// mit `\n` (gemessen, rsync 3.5.0 und 3.4.3). Mit `lines()` käme deshalb bis
+/// zum Prozessende **eine** riesige Zeile an, und der Fortschritt stünde die
+/// ganze Laufzeit auf 0 % — ein Fehler, den niemand als Parserfehler erkennt,
+/// weil die Anzeige einfach nur „hängt".
 async fn pump_stdout_progress(
     stdout: tokio::process::ChildStdout,
     job_id: String,
     sync_jobs: SyncJobs,
     engine: Arc<dyn SyncEngine>,
 ) {
-    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::io::AsyncReadExt;
 
-    let mut lines = BufReader::new(stdout).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        if let Some(snapshot) = engine.parse_progress(&line) {
+    let mut stdout = stdout;
+    let mut buffer = Vec::new();
+    let mut chunk = [0u8; 4096];
+
+    loop {
+        let read = match stdout.read(&mut chunk).await {
+            Ok(0) => break,
+            Ok(read) => read,
+            Err(e) => {
+                debug!("Fortschritt von Job {} nicht mehr lesbar: {}", job_id, e);
+                break;
+            }
+        };
+        buffer.extend_from_slice(&chunk[..read]);
+
+        // Der letzte, noch unvollständige Satz bleibt im Puffer.
+        let mut start = 0;
+        let mut last_end = 0;
+        let mut records: Vec<String> = Vec::new();
+        for (index, byte) in buffer.iter().enumerate() {
+            if *byte == b'\r' || *byte == b'\n' {
+                if index > start {
+                    records.push(String::from_utf8_lossy(&buffer[start..index]).into_owned());
+                }
+                start = index + 1;
+                last_end = start;
+            }
+        }
+        buffer.drain(..last_end);
+
+        for record in records {
+            if let Some(snapshot) = engine.parse_progress(&record) {
+                let mut jobs = sync_jobs.lock().await;
+                if let Some(progress) = jobs.get_mut(&job_id) {
+                    progress.progress = snapshot.percent;
+                    progress.transferred = snapshot.transferred;
+                    progress.total = snapshot.total;
+                }
+            }
+        }
+    }
+
+    // Was ohne abschliessendes Trennzeichen übrig bleibt, ist trotzdem ein
+    // vollständiger Satz — bei einem hart beendeten Kindprozess der letzte
+    // gemessene Stand.
+    if !buffer.is_empty() {
+        let rest = String::from_utf8_lossy(&buffer).into_owned();
+        if let Some(snapshot) = engine.parse_progress(&rest) {
             let mut jobs = sync_jobs.lock().await;
             if let Some(progress) = jobs.get_mut(&job_id) {
                 progress.progress = snapshot.percent;
@@ -3266,8 +3420,10 @@ mod tests {
             .expect("--backup-dir gesetzt");
         assert_eq!(args[idx + 1], "myremote:dst-backup/2026/alt");
         // Und das Log nennt denselben Pfad.
-        assert!(initial_log_text("job-1", &req, TransferMode::Mirror, false)
-            .contains("Backup dir: myremote:dst-backup/2026/alt"));
+        assert!(
+            initial_log_text("job-1", &req, TransferMode::Mirror, false, "rclone")
+                .contains("Backup dir: myremote:dst-backup/2026/alt")
+        );
     }
 
     /// Der Modus steht im Log-Kopf, in Klartext und ohne Zweideutigkeit.
@@ -3275,19 +3431,19 @@ mod tests {
     fn log_kopf_nennt_den_modus() {
         let req = request(None);
 
-        let kopie = initial_log_text("job-1", &req, TransferMode::Copy, false);
+        let kopie = initial_log_text("job-1", &req, TransferMode::Copy, false, "rclone");
         assert!(kopie.contains("Mode: copy"));
         assert!(!kopie.contains("GELOESCHT"));
         assert!(!kopie.contains("Dry run:"));
 
-        let spiegel = initial_log_text("job-1", &req, TransferMode::Mirror, true);
+        let spiegel = initial_log_text("job-1", &req, TransferMode::Mirror, true, "rclone");
         assert!(spiegel.contains("Mode: mirror"));
         assert!(spiegel.contains("GELOESCHT"));
         assert!(spiegel.contains("Dry run:"));
 
         let mut mit_backup = request(None);
         mit_backup.backup_dir = Some("archiv".to_string());
-        let text = initial_log_text("job-1", &mit_backup, TransferMode::Mirror, false);
+        let text = initial_log_text("job-1", &mit_backup, TransferMode::Mirror, false, "rclone");
         assert!(text.contains("Backup dir: myremote:archiv"));
     }
 
@@ -4005,5 +4161,225 @@ mod tests {
             !JOB_CANCELS.lock().await.contains_key(&id),
             "Abbruchflagge überlebt den Job"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Der Stdout-Weg der rsync-Engine, an echten Prozessen
+    //
+    // Beide Tests fahren `execute_sync` mit einer Engine, deren Kindprozess
+    // wirklich startet. Ein Parser-Test allein hätte den Fehler nicht gefunden,
+    // um den es hier geht: rsync trennt seine Fortschrittssätze mit `\r`, und
+    // mit `BufReader::lines()` käme bis zum Prozessende **eine** Zeile an.
+    // -----------------------------------------------------------------------
+
+    /// Engine, die ein Shell-Kommando startet und ihren Fortschritt wie die
+    /// rsync-Engine aus stdout liest.
+    struct StdoutEngine {
+        script: &'static str,
+    }
+
+    impl SyncEngine for StdoutEngine {
+        fn name(&self) -> &'static str {
+            "stdout-test"
+        }
+        fn build_command(&self, _spec: &JobSpec<'_>) -> anyhow::Result<EngineCommand> {
+            Ok(EngineCommand::new(
+                "sh",
+                vec!["-c".to_string(), self.script.to_string()],
+            ))
+        }
+        fn progress_source(&self) -> ProgressSource {
+            ProgressSource::Stdout
+        }
+        fn parse_progress(&self, chunk: &str) -> Option<ProgressSnapshot> {
+            // Derselbe Parser, den die rsync-Engine benutzt.
+            rsync_engine::parse_progress2_line(chunk)
+        }
+    }
+
+    fn sync_request_for_test(source: &str) -> SyncRequest {
+        SyncRequest {
+            source_path: source.to_string(),
+            remote_name: "peer-test".to_string(),
+            remote_path: "ziel".to_string(),
+            chunk_size: None,
+            use_chunking: None,
+            delete_target: None,
+            delete_confirmed: None,
+            dry_run: None,
+            backup_dir: None,
+        }
+    }
+
+    /// **Der Riegel gegen die `\r`-Falle.** Das Skript schreibt genau das, was
+    /// `--info=progress2` schreibt: Sätze durch Wagenrücklauf getrennt, nur der
+    /// letzte mit `\n`, danach die `--stats`-Zeilen. Am Ende muss der Job den
+    /// letzten Fortschrittssatz tragen — nicht 0 %, und nicht die Zahlen aus
+    /// den Statistikzeilen.
+    #[tokio::test]
+    async fn progress_arrives_from_stdout_split_at_carriage_returns() {
+        let id = format!("stdout-969c46ad-{}", Uuid::new_v4());
+        insert_job(&id, JobStatus::Starting).await;
+
+        let engine: Arc<dyn SyncEngine> = Arc::new(StdoutEngine {
+            script: concat!(
+                r"printf '\r        32,768   0%%    0.00kB/s    0:00:00';",
+                r"printf '\r     3,000,000  20%%    2.76GB/s    0:00:01 (xfr#1, to-chk=4/6)';",
+                r"printf '\r    15,000,000 100%%    2.32GB/s    0:00:02 (xfr#5, to-chk=0/6)\n';",
+                r"printf 'sent 15,001,234 bytes  received 130 bytes  1,000.00 bytes/sec\n';",
+                r"printf 'total size is 15,000,000  speedup is 1.00\n'"
+            ),
+        });
+
+        execute_sync(
+            id.clone(),
+            sync_request_for_test("/tmp"),
+            SYNC_JOBS.clone(),
+            engine,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+
+        {
+            let jobs = SYNC_JOBS.lock().await;
+            let stored = jobs.get(&id).expect("job");
+            assert!(stored.status.is_success(), "Status: {}", stored.status);
+            assert_eq!(stored.transferred, 15_000_000, "letzter Fortschrittssatz");
+            assert_eq!(stored.total, 15_000_000);
+            assert_eq!(stored.progress, 100.0);
+        }
+
+        let _ = delete_job_for(&user_with_id(TEST_OWNER), id.clone()).await;
+        let _ = fs::remove_file(internal_log_path(&id)).await;
+    }
+
+    /// Gegenprobe zum Test darüber: **derselbe** Aufbau mit einem Kind, das
+    /// gar keinen Fortschritt schreibt, lässt den Job bei 0 %. Ohne diese
+    /// Gegenprobe wäre der grüne Test oben auch dann grün, wenn die Zahlen aus
+    /// irgendeiner anderen Quelle kämen.
+    #[tokio::test]
+    async fn without_progress_output_the_job_stays_at_zero() {
+        let id = format!("stdout-quiet-969c46ad-{}", Uuid::new_v4());
+        insert_job(&id, JobStatus::Starting).await;
+
+        let engine: Arc<dyn SyncEngine> = Arc::new(StdoutEngine {
+            script: "printf 'kein Fortschritt hier\\n'",
+        });
+
+        execute_sync(
+            id.clone(),
+            sync_request_for_test("/tmp"),
+            SYNC_JOBS.clone(),
+            engine,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .await;
+
+        {
+            let jobs = SYNC_JOBS.lock().await;
+            let stored = jobs.get(&id).expect("job");
+            // Erfolgreich, deshalb rundet `finish_job` auf 100 % — die
+            // *gemessenen* Bytes bleiben aber 0.
+            assert_eq!(stored.transferred, 0);
+            assert_eq!(stored.total, 0);
+        }
+
+        let _ = delete_job_for(&user_with_id(TEST_OWNER), id.clone()).await;
+        let _ = fs::remove_file(internal_log_path(&id)).await;
+    }
+
+    /// Abbruch: die Flagge, die `cancel_target` herausgibt, beendet den
+    /// Kindprozess, und der Job landet in `Cancelled` — nicht in „durch ein
+    /// Signal beendet", was der Nutzer als Fehler der Anwendung lesen würde.
+    #[tokio::test]
+    async fn a_running_sync_is_killed_when_its_cancel_flag_is_set() {
+        let id = format!("cancel-533ed42c-{}", Uuid::new_v4());
+        let cancel = Arc::new(AtomicBool::new(false));
+        register_job(
+            job(&id, JobStatus::Starting),
+            TEST_OWNER,
+            JobKind::Sync,
+            Some(Arc::clone(&cancel)),
+        )
+        .await;
+
+        // Das Kind schreibt seine PID und lebt dann lange genug, dass der
+        // Abbruch wirklich einen laufenden Prozess trifft.
+        let pid_file = std::env::temp_dir().join(format!("cancel-533ed42c-{}.pid", Uuid::new_v4()));
+        // `exec` ist Absicht: `rsync-ssl` ruft am Ende `exec rsync …` auf, das
+        // Kind, das wir beenden, **ist** also der Übertragungsprozess und nicht
+        // eine Hülle darum. Ein Skript ohne `exec` würde einen Enkel
+        // hinterlassen und damit etwas anderes prüfen als die Wirklichkeit.
+        let script: &'static str =
+            Box::leak(format!("echo $$ > {} ; exec sleep 60", pid_file.display()).into_boxed_str());
+        let engine: Arc<dyn SyncEngine> = Arc::new(StdoutEngine { script });
+
+        let id_clone = id.clone();
+        // **Dieselbe** Flagge, die `register_job` in die Nebentabelle gelegt
+        // hat — genau wie im produktiven Weg. Eine eigene Flagge hier hätte
+        // einen Test ergeben, der nie abbricht (erst so gemessen).
+        let flag_for_run = Arc::clone(&cancel);
+        let run = tokio::spawn(async move {
+            execute_sync(
+                id_clone,
+                sync_request_for_test("/tmp"),
+                SYNC_JOBS.clone(),
+                engine,
+                flag_for_run,
+            )
+            .await;
+        });
+
+        // Warten, bis das Kind läuft — sonst prüft der Test den Abbruch eines
+        // Prozesses, den es noch nicht gibt.
+        let mut pid = None;
+        for _ in 0..100 {
+            if let Ok(text) = std::fs::read_to_string(&pid_file) {
+                if let Ok(parsed) = text.trim().parse::<u32>() {
+                    pid = Some(parsed);
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let pid = pid.expect("Kindprozess ist gestartet");
+
+        // Über denselben Weg wie ein URL-Abruf: Flagge holen, Flagge setzen.
+        match cancel_target(&id).await {
+            CancelTarget::Running(flag) => flag.store(true, std::sync::atomic::Ordering::SeqCst),
+            _ => panic!("laufender Sync gilt nicht als laufend"),
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(20), run)
+            .await
+            .expect("Lauf endet nach dem Abbruch")
+            .expect("Lauf ohne Panik");
+
+        {
+            let jobs = SYNC_JOBS.lock().await;
+            let stored = jobs.get(&id).expect("job");
+            assert!(
+                matches!(stored.status, JobStatus::Cancelled),
+                "Status nach Abbruch: {}",
+                stored.status
+            );
+            assert!(stored.end_time.is_some(), "end_time fehlt");
+        }
+
+        // Kein Prozess bleibt zurück. Gezielt über die gemerkte PID — niemals
+        // `pkill -f`, das trifft die Testserver aller parallel laufenden
+        // Agenten.
+        assert!(
+            !std::path::Path::new(&format!("/proc/{}", pid)).exists()
+                || std::fs::read_to_string(format!("/proc/{}/stat", pid))
+                    .map(|s| s.contains(" Z "))
+                    .unwrap_or(true),
+            "Kindprozess {} lebt nach dem Abbruch weiter",
+            pid
+        );
+
+        let _ = std::fs::remove_file(&pid_file);
+        let _ = delete_job_for(&user_with_id(TEST_OWNER), id.clone()).await;
+        let _ = fs::remove_file(internal_log_path(&id)).await;
     }
 }

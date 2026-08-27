@@ -37,6 +37,21 @@ das ausdrücklich dabei.
 > * Der `speedup`-Wert 2.279.513 war der **falschen Zeile** zugeordnet; er gehört zum
 >   74-B-Lauf. Der Wert selbst ist unverändert.
 
+> **Dritter Durchgang, 27.08.2026.** Messwerte unverändert. Neu bzw. berichtigt:
+> * **Port 873 war als feste Grösse beschrieben — das war falsch.** Seit dem rootlosen
+>   Betrieb (`50c8ec48`) nimmt der Daemon 8873, wenn er sich nicht härten kann. Neuer
+>   Abschnitt „Härtungsmodi", samt der Erkennung (euid **oder** Datei-Capability) und
+>   dem, was rootlos kostet. Ticket `d2f1783d`.
+> * Neuer Abschnitt **„Netzwerk-Voraussetzungen"**: die vollständige Porttabelle mit
+>   Richtung, die drei unabhängigen Riegel gegen einen erreichbaren Klartext-Daemon,
+>   Copy-&-Paste-Bausteine (nginx `stream`, haproxy, compose, ufw/firewalld) und eine
+>   Gegenprobe von aussen. Ticket `6a94c4cd`.
+> * Der **Direktmodus** ist in der Porttabelle ganz entfallen — er stand in der
+>   Ticketbeschreibung noch als Zeile „rsync direkt, 873, eingehend". Entscheidung E2 ist
+>   gegen ihn gefallen; wer der Tabelle folgte, öffnete 873 nach aussen.
+> * Neu belegt: `RCLONE_GUI_RSYNCD_DIR` muss **absolut** sein. Ein relativer Wert bringt
+>   den Daemon mit `… must be an absolute path` nicht hoch — gemessen, nicht übernommen.
+
 ## Kurzfassung
 
 Der Entwurf trägt **im Kern**, aber drei seiner Annahmen sind falsch:
@@ -106,7 +121,15 @@ port = 873
     max connections = 4
     temp dir = /.rsync-tmp
     refuse options = copy-links copy-dirlinks copy-unsafe-links delete remove-source-files remove-sent-files force
+    transfer logging = yes
+    log format = rclone-gui-audit %a %u %m %o %l %b %f
 ```
+
+> **`port = 873` im Block oben ist der Wert des gehärteten Modus.** Rootlos rendert
+> dieselbe Stelle `port = 8873`, aus `use chroot = yes` wird `use chroot = no`, und die
+> beiden Zeilen `uid`/`gid` entfallen ganz (`ModuleConfig::render`, Parameter
+> `hardening`). `address = 127.0.0.1`, `munge symlinks` und `refuse options` stehen in
+> **beiden** Modi — siehe „Härtungsmodi".
 
 > **Der Block ist bewusst nicht spaltenausgerichtet.** `render_conf` und
 > `ModuleConfig::render` (`src/handlers/rsyncd.rs`) schreiben **ein** Leerzeichen um
@@ -114,7 +137,9 @@ port = 873
 > Dokuments hat den Block der Lesbarkeit halber ausgerichtet (`port    = 873`); wer ihn
 > als Referenz für einen Vergleich oder einen Test heranzog, bekam einen Unterschied,
 > den es im Code nicht gibt. Die Schlüsselreihenfolge stimmt und ist ebenfalls die des
-> Codes.
+> Codes. **Die letzten zwei Zeilen (`transfer logging`, `log format`) fehlten hier bis
+> 27.08.2026** — der Block behauptete Zeichengenauigkeit und war zwei Zeilen kürzer als
+> `ModuleConfig::render`.
 
 **Modulname: `"pair"` + 16 Hexzeichen, 20 Zeichen gesamt.** `MODULE_NAME_RANDOM_BYTES = 8`
 (`rsyncd.rs`) → 8 Zufallsbytes, hex gerendert. Ältere Fassungen dieses Dokuments zeigten
@@ -132,10 +157,13 @@ wird (`--dparam=pid file=…`, `--dparam=lock file=…`, `--log-file=…`), dami
 generierte Datei eine reine Modulbeschreibung bleibt: siehe „Daemon-Lebenszyklus".
 
 Kleiner, aber beim Nachstellen relevanter Punkt: `argv()` gibt zusätzlich `--port=<port>`
-mit, obwohl `port` auch in der Datei steht. Die Kommandozeile gewinnt. Im Regelbetrieb
-sind beide `873`; wer den Daemon für einen Test auf einem anderen Port hochzieht, ändert
-also den Wert in den `DaemonSettings`, nicht den in der Conf — eine Änderung nur in der Datei
-bleibt wirkungslos.
+mit, obwohl `port` auch in der Datei steht. Die Kommandozeile gewinnt. Beide Werte stammen
+aus derselben Quelle und stimmen deshalb überein — **`873` ist dabei nicht fest**, sondern
+der Wert des gehärteten Modus; rootlos stehen in beiden `8873`, siehe „Härtungsmodi". Wer
+den Daemon für einen Test auf einem anderen Port hochzieht, ändert den Wert in den
+`DaemonSettings`, nicht den in der Conf — eine Änderung nur in der Datei bleibt
+wirkungslos. Ein `--dparam=port=…` ist kein Weg dorthin, er wird abgewiesen (siehe
+„Netzwerk-Voraussetzungen").
 
 `address = 127.0.0.1` ist fest verdrahtet. Es gibt bewusst **keinen Zweig** für einen
 Direktmodus: eine Konfiguration, die „auf 0.0.0.0 lauschen" gar nicht ausdrücken kann,
@@ -406,6 +434,11 @@ Ein Verbindungsversuch von A direkt auf 873 endet mit
 `failed to connect to peerb (192.168.224.2): Connection refused (111)` — der Daemon ist
 von aussen nicht erreichbar.
 
+Die Messung stammt aus dem gehärteten Modus (Container). Rootlos steht in derselben Zeile
+`127.0.0.1:8873`; die Aussage — Loopback, und von aussen verweigert — ist dieselbe, und
+sie wird nach dem Start gegen `/proc/net/tcp` geprüft (siehe
+„Netzwerk-Voraussetzungen").
+
 ### Sync, Modus Direkt (nur LAN/VPN) — **entfallen**
 
 > **Entscheidung E2 ist gefallen: der Direktmodus ist nicht im Produkt.** Die App kennt
@@ -576,6 +609,169 @@ rsync error: syntax or usage error (code 1) at main.c(1150) [Receiver=3.4.1]
 
 Lesen aus demselben Modul funktioniert. `list = no` blendet das Modul aus dem
 Listing (`rsync rsync://host:873/`) aus — die Ausgabe ist leer, exit 0.
+
+## Härtungsmodi: Port 873 gehärtet, Port 8873 rootlos
+
+**Der Daemon-Port ist nicht fest.** Ältere Fassungen dieses Dokuments und des `README`
+nannten 873 als feste Grösse — seit dem rootlosen Betrieb (Ticket `50c8ec48`) stimmt das
+nicht mehr, und wer der alten Fassung folgte, öffnete im Zweifel den falschen Port.
+
+Maßgeblich ist `Hardening` in `src/handlers/rsyncd.rs`. Dieselbe Regel steht ein zweites
+Mal in `config/rsync-tls.sh` (`rsyncd_default_port`), weil stunnel die Entscheidung der
+App nicht erfragen kann — und ein Backend auf dem falschen Port heisst: der Daemon läuft,
+und niemand erreicht ihn.
+
+| Modus | Erkennung | Daemon-Port | `use chroot` | `uid`/`gid` |
+|---|---|---|---|---|
+| `Hardening::Full` | euid 0 **oder** Datei-Capability `cap_sys_chroot` auf dem rsync-Binary | 873 | ja | ja |
+| `Hardening::Rootless` | keins von beidem | **8873** (`ROOTLESS_DAEMON_PORT`) | nein | nein |
+
+`RCLONE_GUI_RSYNCD_PORT` überschreibt den Port in **beiden** Modi; App und Skript lesen
+dieselbe Variable, es wird also nur eine Seite gesetzt. Ein unparsbarer oder `0`-Wert
+wird **ignoriert** und ist kein Startfehler: der Port ist hier keine Sicherheitsgrenze —
+das sind `address = 127.0.0.1`, die dparam-Prüfung und das `/proc/net/tcp`-Verdikt (siehe
+„Netzwerk-Voraussetzungen").
+
+`8873` ist keine Zahl mit Bedeutung, sondern eine mit zwei Eigenschaften: sie ist grösser
+als 1023 (ein `const`-`assert!` in `rsyncd.rs` hält das fest, damit ein Tippfehler ein
+Compile-Fehler wird und kein Startfehler), und sie behält die Gestalt von 873, damit eine
+`ss -ltnp`-Zeile wiedererkennbar bleibt.
+
+### Warum die Erkennung **nicht** `geteuid() == 0` ist
+
+Das ist die lehrreiche Stelle, und die naheliegende Prüfung wäre falsch gewesen.
+
+Der ausgelieferte Container läuft als `USER appuser` (uid 1001) und bekommt die volle
+Härtung trotzdem — über `setcap cap_sys_chroot,cap_setgid=ep /usr/bin/rsync` im
+`Dockerfile` (siehe „Die Rechtegrenze" unten). Eine reine euid-Prüfung hätte damit
+**genau das Deployment, für das der chroot gebaut wurde**, als rootlos eingestuft und die
+chroot-Härtung **stillschweigend** abgeschaltet: kein Fehler, keine Meldung, eine Schicht
+weniger.
+
+Gefragt wird deshalb nicht „sind wir root", sondern „wird der Daemon, den wir gleich
+starten, `chroot()` können":
+
+* `effective_uid()` liest die `Uid:`-Zeile aus `/proc/self/status` (`libc` ist keine
+  deklarierte Abhängigkeit dieses Crates; alles andere in diesem Modul fragt den Kernel
+  ebenfalls über `/proc`),
+* `binary_can_chroot()` ruft `getcap` auf **dem Binary, das gestartet wird** — die
+  Capability sitzt an der Datei, eine Frage nach einer anderen Datei wäre eine andere
+  Frage. Ein bloßes `rsync` wird vorher über `PATH` aufgelöst, weil `getcap` eine Datei
+  will und kein Kommando.
+
+**Jede unbeantwortbare Frage zählt als „nicht privilegiert":** kein `getcap`, ein
+Exit ≠ 0, ein unlesbarer Pfad. Der Ausgang ist damit „rootlos, **und es sagt es**" statt
+„verspricht chroot und stirbt darin".
+
+Angesagt wird das nicht nebenbei: `Hardening::warnings()` liefert die Zeilen als Daten,
+`src/main.rs` schreibt sie nach stderr **und** ins Log. Getrennt gehalten, damit ein Test
+behaupten kann, dass der Modus sagt, was er kostet — eine Ankündigung, die nur in einem
+`println!` existiert, kann niemand prüfen.
+
+### Was der rootlose Modus kostet — keine Fussnote
+
+Es ist eine echte Einbusse, drei auf einmal:
+
+* **Kein `use chroot`.** Die Modulgrenze hängt dann allein an rsyncs eigener
+  Pfadprüfung. Das ist eine fehlende **zweite** Schicht, nicht eine fehlende erste — und
+  der Nachweis ist geführt: die Grenzprüfungen der Testreihe fahren mit
+  `Backend::HostRootless` dieselben Fälle und dieselbe `WeakDaemon`-Gegenprobe wie im
+  gehärteten Modus. Aber „hält in der Messung" ist nicht „hat zwei Riegel".
+* **Kein `uid`/`gid`-Wechsel.** Der Daemon bedient jedes Modul als der Nutzer, der die
+  Anwendung gestartet hat; ein Modul reicht damit so weit, wie dieser Nutzer reicht.
+* **Unprivilegierter Port.** Für sich harmlos, aber die TLS-Terminierung muss mitgezogen
+  werden (siehe unten).
+
+Deshalb ist der rootlose Modus **für die Entwicklung auf einem Host** gedacht. Der
+Container behält den gehärteten Weg.
+
+### Warum es rootlos überhaupt gebraucht wird
+
+Auf einem gewöhnlichen Entwicklungshost scheitert der gehärtete Weg an zwei Stellen,
+und beide melden nur das Symptom:
+
+* `/etc/rsyncd` ist nicht beschreibbar — `cannot create the daemon run directory
+  /etc/rsyncd/run: Permission denied (os error 13)`. Genau darauf ist der Nutzer
+  gestossen, der `50c8ec48` ausgelöst hat.
+* Port 873 ist nicht bindbar. **Gemessen auf dem Entwicklungshost (27.08.2026):**
+
+  ```
+  $ sysctl net.ipv4.ip_unprivileged_port_start
+  net.ipv4.ip_unprivileged_port_start = 1024
+  $ python3 -c "import socket; socket.socket().bind(('127.0.0.1',873))"
+  PermissionError: [Errno 13] Permission denied
+  $ python3 -c "import socket; socket.socket().bind(('127.0.0.1',8873))"
+  # (kein Fehler)
+  ```
+
+  Es fehlt also **kein Binary** — `rsync` liegt auf diesem Host (3.5.0, im Image 3.4.3).
+  Es ist der Port.
+
+Rootlos liegt die Konfiguration deshalb nicht unter `/etc/rsyncd`, sondern im
+Datenverzeichnis der Anwendung (`<cwd>/data/rsyncd`), neben `tasks.db`, `cfg/` und
+`log/`.
+
+### Fallstrick: `RCLONE_GUI_RSYNCD_DIR` muss **absolut** sein
+
+Ein **relativer** Wert scheitert — nicht beim Setzen, sondern beim Start des Daemons, und
+kein Test hatte das gefunden. rsync löst `secrets file` selbst auf, und sein
+Arbeitsverzeichnis ist nicht unser eigenes; `DaemonConfig` weist einen relativen Pfad
+deshalb ab.
+
+**Gemessen (27.08.2026, `target/debug/rclone-gui`, eigenes Datenverzeichnis):**
+
+```
+$ RCLONE_GUI_RSYNCD=1 RCLONE_GUI_RSYNCD_DIR=relconf rclone-gui --bind 127.0.1.77:19078
+🔗 Starting the rsync daemon:
+   📄 Configuration: relconf/rsyncd.conf
+   🔌 Port: 8873
+   ❌ the rsync daemon did not start: cannot publish the module configuration before
+      starting the daemon: relconf/secrets/rsyncd.secrets must be an absolute path
+      the server continues without the rsync transport
+      the reason is reported at GET /api/rsyncd/status
+```
+
+Mit demselben Verzeichnis als **absolutem** Pfad kommt der Daemon hoch
+(`rsync daemon started … port=8873 address="127.0.0.1"`).
+
+> **Was die Auflösung gegen `current_dir()` abdeckt und was nicht** — hier lag ein
+> früherer Ticketstand ungenau: absolut gemacht wird der **eingebaute Standardwert**
+> (`current_dir()/data/rsyncd`, `src/main.rs`). Ein **ausdrücklich gesetztes**
+> `RCLONE_GUI_RSYNCD_DIR` wird unverändert übernommen und, wenn es relativ ist, mit der
+> Meldung oben abgewiesen. Der Start läuft dabei ohne rsync-Transport weiter, statt
+> abzubrechen — die Ursache steht auf der Konsole und unter `GET /api/rsyncd/status`.
+>
+> Praktisch heisst das: **`RCLONE_GUI_RSYNCD_DIR=$PWD/data/rsyncd`**, nicht
+> `data/rsyncd`.
+
+### stunnel muss auf denselben Port zeigen — in beiden Modi
+
+stunnel verbindet in beiden Modi auf `127.0.0.1:<port>`; nur die Zahl unterscheidet sich.
+`config/rsync-tls.sh` rechnet den Standardwert mit derselben Regel aus:
+
+```sh
+# config/rsync-tls.sh, rsyncd_default_port()
+RCLONE_GUI_RSYNCD_PORT gesetzt  -> dieser Wert
+id -u = 0                       -> 873
+getcap /usr/bin/rsync | grep cap_sys_chroot -> 873
+sonst                           -> 8873
+```
+
+**Gemessen auf dem Entwicklungshost (27.08.2026)**, die Funktion aus dem Skript heraus
+aufgerufen: `8873` — passend zu `getcap /usr/bin/rsync` mit leerer Ausgabe und uid 1000.
+Der App-Start auf demselben Host sagt dazu von sich aus, was zu setzen ist:
+
+```
+point the TLS terminator at it: RCLONE_GUI_RSYNC_BACKEND=127.0.0.1:8873
+```
+
+`RCLONE_GUI_RSYNC_BACKEND` überschreibt weiterhin alles — und wird gegen Loopback
+geprüft, siehe „Netzwerk-Voraussetzungen".
+
+> **Nicht gemessen von diesem Durchgang:** die Container-Gegenprobe (cap gesetzt → 873,
+> cap entfernt → 8873) ist aus dem Bericht zu `50c8ec48` übernommen und hier **nicht**
+> nachgefahren; `stunnel` liegt auf diesem Host nicht (`which stunnel` → nichts), ein
+> TLS-Nachweis dort läuft über `socat OPENSSL-LISTEN`.
 
 ## `use chroot`
 
@@ -955,6 +1151,242 @@ Beobachtungen aus dem PoC, relevant für `7dcd5a54`:
   nicht.
 - Konfigurationsfehler melden sich als `Failed to parse config file: <pfad>` auf stderr,
   Exit ungleich 0. Ein Trockenlauf vor dem Reload ist damit möglich.
+
+## Netzwerk-Voraussetzungen: Ports, Richtung, Erreichbarkeit
+
+Wer eine Kopplung einrichtet, soll nicht raten müssen, welche Ports offen sein müssen.
+Diese Tabelle ist die vollständige Liste. Der **Direktmodus ist gestrichen** (Entscheidung
+E2), es gibt also keine Zeile „rsync direkt" mehr — eine ältere Fassung dieses Dokuments
+und des Tickets führte sie noch, und wer ihr folgte, öffnete 873 nach aussen.
+
+| Zweck | Port | Richtung | Nötig wann |
+|---|---|---|---|
+| Web-UI / OAuth | 443, bzw. der konfigurierte Port (im Compose-Standard 8080 hinter einem Reverse Proxy) | eingehend | immer |
+| rsync über TLS | 874 (`RCLONE_GUI_RSYNC_TLS_PORT`) | eingehend | immer |
+| Daemon-Backend | 873 gehärtet, **8873 rootlos** (`RCLONE_GUI_RSYNCD_PORT`) | **nur localhost** | nie nach aussen |
+
+Dazu die öffentliche Basis-URL, unter der die Instanz für die Gegenstelle erreichbar sein
+muss: `RCLONE_GUI_PUBLIC_BASE_URL`. Sie ist das Ziel der OAuth-Redirects und der
+Pairing-Links; steht dort noch `http://localhost:8080`, schlägt die Kopplung fehl, sobald
+die Gegenstelle auf einem anderen Host läuft.
+
+Der Name in `RCLONE_GUI_PEER_HOSTNAME` muss **derselbe** sein, unter dem die Gegenstelle
+diese Instanz anspricht — `rsync-ssl` prüft ihn gegen den SAN, eine IP genügt nur als
+`IP:`-SAN. Siehe „Zertifikatsprüfung".
+
+### Dass der Daemon-Port von aussen nicht erreichbar ist, ist kein Ratschlag
+
+Es ist ein **Fehler**, wenn er es doch ist: hinter 873/8873 läuft das rsync-Protokoll im
+Klartext, authentifiziert allein über MD5-Challenge-Response (siehe „Auth-Digest").
+Deshalb hängen daran drei voneinander unabhängige Riegel — und die Unabhängigkeit ist der
+Punkt, nicht die Anzahl:
+
+**1. `address = 127.0.0.1` in der generierten Datei, und eine dparam-Prüfung *vor* dem
+Start.** `--dparam` überschreibt die Datei. Gemessen (rsync 3.5.0, dieselbe generierte
+Konfiguration, gestartet mit `--dparam=address=0.0.0.0`):
+
+```text
+LISTEN 0 5 0.0.0.0:18690 0.0.0.0:*
+```
+
+— das rsync-Protokoll auf jeder Schnittstelle, ohne TLS in Sichtweite. **Nichts in der
+Anwendung hat es bemerkt, weil die Konfigurationsdatei weiter `address = 127.0.0.1` sagte
+und jeder bestehende Test die Datei liest.** `check_listen_is_not_overridden`
+(`rsyncd.rs`) verweigert deshalb jeden `--dparam` auf `LISTEN_PARAMS = ["address",
+"port"]`, auch aus den Testsonden heraus.
+
+**2. Ein `/proc/net/tcp`-Verdikt *nach* dem Start.** Die beiden Prüfungen oben sind
+Aussagen über **Eingaben**; diese fragt den Kernel nach dem **Ergebnis**:
+`loopback_only_verdict` liest `/proc/net/tcp` und `/proc/net/tcp6` und nimmt den Daemon
+wieder herunter, wenn auf seinem Port etwas lauscht, das nicht Loopback ist. Damit fällt
+auch auf, was die Eingabeprüfungen nicht sehen können — ein künftiges rsync, das
+`address` ignoriert, eine handgeschriebene Konfiguration, ein fremder Prozess auf dem
+Port. Ein `/proc`, das gar nicht lesbar ist, wird **gemeldet und durchgelassen**: sonst
+bricht die Auslieferung an einer Prüfung statt an einem Befund, und die beiden
+Eingabe-Riegel stehen dort weiter.
+
+**3. `config/rsync-tls.sh` bricht ab, wenn das Backend nicht Loopback ist.** Der Riegel
+lag in einer Shell-Funktion und hatte **keinen Test**; ein Tester fuhr eine Tabelle von
+dreizehn Werten von Hand und fand die Lücke mit Wert vierzehn. Die erste Fassung fragte
+`case "$host" in 127.*|::1|localhost)`, und `127.*` globbt **Namen**, nicht nur Adressen:
+
+```
+RCLONE_GUI_RSYNC_BACKEND=127.0.0.1.evil.com:873   ->   galt als Loopback
+```
+
+stunnel hätte Klartext-rsync samt MD5-Challenge vom Rechner weggetragen, während die
+Verbindung von aussen weiter wie TLS aussah. Heute ist es eine positive Prüfung:
+ausgeschriebene Namen, oder eine IPv4-Adresse **feldweise zerlegt** und in 127.0.0.0/8
+verlangt. Die Tabelle läuft mit **31 Werten** bei jedem `cargo test`
+(`every_backend_form_is_judged_by_the_tls_script`, `rsyncd.rs`), samt Gegenprobe, dass das
+alte Glob den Fundwert andersherum beurteilt.
+
+**Gemessen (27.08.2026, `tls_backend_is_loopback` aus `config/rsync-tls.sh` gesourct):**
+
+| Wert | Verdikt |
+|---|---|
+| `127.0.0.1:8873`, `127.1.2.3:873`, `localhost:873`, `localhost.localdomain:8873`, `[::1]:873`, `127.0.0.1` | Loopback |
+| `127.0.0.1.evil.com:873`, `127.0.0.1x:873`, `0.0.0.0:873`, `10.0.0.5:873`, `127.0.0.1:` | abgewiesen |
+
+Ebenfalls gemessen: `rsyncd_default_port()` liefert auf diesem Host `8873` — passend zu
+uid 1000 und einer leeren Ausgabe von `getcap /usr/bin/rsync`.
+
+### Reverse Proxy vor 874: **durchreichen**, nicht terminieren
+
+Port 874 trägt TLS, das **stunnel** mit dem Zertifikat dieser Instanz terminiert, und die
+Gegenstelle prüft es gegen die beim Pairing erhaltene CA. Ein Proxy, der davor selbst TLS
+terminiert und neu aufbaut, präsentiert damit das falsche Zertifikat — die Gegenstelle
+sieht `certificate verify failed` und der Job schlägt fehl. **Vor 874 gehört ein reiner
+TCP-Passthrough** (nginx `stream` ohne `ssl`, haproxy `mode tcp`), oder gar kein Proxy.
+
+Das ist der Punkt, den man beim Aufsetzen falsch macht, deshalb ist er hier gemessen —
+mit `socat` als Ersatz für stunnel, weil `stunnel` auf dem Entwicklungshost nicht liegt
+(`which stunnel` → nichts) und `socat` es tut:
+
+```bash
+# Serverzertifikat für "peer.test", nur für diesen Versuch
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout srv.key -out srv.crt -days 2 -subj "/CN=peer.test" \
+  -addext "subjectAltName=DNS:peer.test"
+cat srv.key srv.crt > srv.pem
+
+# Platzhalter für den Klartext-Daemon; ein Echo genügt, geprüft wird das TLS davor.
+socat TCP-LISTEN:18873,bind=127.0.0.1,reuseaddr,fork EXEC:/bin/cat
+socat OPENSSL-LISTEN:18874,bind=127.0.0.1,reuseaddr,fork,cert=srv.pem,verify=0 \
+      TCP:127.0.0.1:18873                                            # "stunnel" auf 874
+socat TCP-LISTEN:18875,bind=127.0.0.1,reuseaddr,fork TCP:127.0.0.1:18874  # Passthrough-Proxy
+
+# durch den Proxy, CA bekannt, Name aus dem SAN:
+openssl s_client -connect 127.0.0.1:18875 -servername peer.test \
+  -verify_hostname peer.test -CAfile srv.crt -verify_return_error
+```
+
+| Weg | Ergebnis |
+|---|---|
+| direkt auf den TLS-Port | `Verify return code: 0 (ok)` |
+| **durch den TCP-Passthrough** | `Verify return code: 0 (ok)` — die Prüfung überlebt den Proxy |
+| Gegenprobe ohne die CA | `verify error:num=18:self-signed certificate`, `Verify return code: 18` |
+
+Die Gegenprobe steht dabei, weil die ersten zwei Zeilen ohne sie auch dann so aussähen,
+wenn gar nichts geprüft würde.
+
+**`proxy protocol` bleibt aus** — auf beiden Seiten. Nur eine Hälfte zu aktivieren ist
+der schlimmste Fall: rsync 3.4.3 setzt dann jede Verbindung zurück (`safe_read failed to
+read 1 bytes: Connection reset by peer (104)`, exit 12) und schreibt dazu **keine**
+Logzeile. Ein `proxy_protocol on;` im Proxy ist also kein „Zusatz", sondern ein Ausfall.
+Siehe „`proxy protocol` ist auf **beiden** Seiten aus".
+
+### Copy-&-Paste-Bausteine
+
+> **Nicht in diesem Repo gemessen:** nginx und haproxy liegen auf diesem Host nicht
+> (`which nginx haproxy` → nichts), die beiden Blöcke sind also **nicht** durch einen
+> Konfigurationstest gelaufen. Was gemessen ist, ist die Eigenschaft, auf die sie
+> zielen — der Passthrough-Versuch oben. Wer sie einsetzt, prüft sie mit `nginx -t` bzw.
+> `haproxy -c -f`.
+
+nginx als TCP-Passthrough (gehört auf **oberste** Ebene, nicht in `http`):
+
+```nginx
+stream {
+    upstream rclone_gui_rsync_tls {
+        server 127.0.0.1:874;
+    }
+    server {
+        listen 874;
+        listen [::]:874;
+        proxy_pass rclone_gui_rsync_tls;
+        proxy_timeout 1h;          # ein Sync-Lauf ist lang
+        proxy_connect_timeout 10s;
+        # KEIN ssl_certificate, KEIN ssl_preread, KEIN proxy_protocol:
+        # das TLS gehört stunnel, siehe oben.
+    }
+}
+```
+
+haproxy:
+
+```haproxy
+frontend rsync_tls_in
+    bind :874
+    mode tcp
+    option tcplog
+    timeout client 1h
+    default_backend rsync_tls_out
+
+backend rsync_tls_out
+    mode tcp
+    timeout server 1h
+    server rclone_gui 127.0.0.1:874    # kein "ssl", kein "send-proxy"
+```
+
+Docker-Compose-Portmapping — der Ist-Zustand aus `docker-compose.yml`, hier nur zitiert:
+
+```yaml
+    ports:
+      # Web-UI
+      - "8080:8080"
+      # rsync über TLS (registrierter Port). stunnel terminiert hier und
+      # reicht containerintern nach 127.0.0.1:873 weiter.
+      - "874:874"
+      # Port 873 (rsync-Daemon) wird BEWUSST NICHT gemappt.
+```
+
+**Auch rootlos wird nichts zusätzlich gemappt.** Der rootlose Port (8873) ist ein
+Host-Entwicklungsfall; im Container greift die Datei-Capability und der Daemon bleibt auf
+873. Wer 873 *oder* 8873 in ein Compose-File einträgt, hebt den Schutz auf.
+
+ufw:
+
+```bash
+sudo ufw allow 443/tcp comment 'rclone-gui Web-UI / OAuth'
+sudo ufw allow 874/tcp comment 'rclone-gui rsync ueber TLS'
+sudo ufw deny  873/tcp comment 'rsync-Daemon: niemals von aussen'
+sudo ufw deny  8873/tcp comment 'rsync-Daemon rootlos: niemals von aussen'
+sudo ufw status verbose
+```
+
+firewalld:
+
+```bash
+sudo firewall-cmd --permanent --add-port=443/tcp
+sudo firewall-cmd --permanent --add-port=874/tcp
+sudo firewall-cmd --reload
+# 873/8873 stehen bewusst NICHT drin. Gegenprobe, dass sie es auch nicht sind:
+sudo firewall-cmd --list-ports
+```
+
+Die beiden `deny`-Regeln in ufw sind Gürtel und Hosenträger: gemappt wird der Port
+ohnehin nicht, und der Daemon bindet nur Loopback. Sie stehen da, damit ein
+handgeschriebenes `docker run -p 873:873` nicht durchkommt.
+
+### Gegenprobe von aussen — was von Hand geht
+
+Ein Selbsttest **in der Anwendung** ist Ticket `24d7ad41` (Netzwerk: Selbsttest und
+Pairing-Diagnose) und steht noch aus; die Netzwerkseite in der Configuration ebenfalls.
+Bis dahin von der **Gegenseite** aus, nicht vom eigenen Host — von dort ist Loopback
+immer erreichbar und die Antwort damit wertlos:
+
+```bash
+# 874 muss antworten UND ein Zertifikat zeigen, dem die Pairing-CA traut:
+openssl s_client -connect <peer>:874 -servername <peer> \
+  -verify_hostname <peer> -CAfile ca.crt -verify_return_error </dev/null
+#   -> "Verify return code: 0 (ok)"
+
+# 873 und 8873 muessen VERWEIGERT werden. Ein "Connection refused" ist hier
+# das gute Ergebnis; ein Timeout heisst "Firewall verwirft", auch in Ordnung.
+# Was NICHT in Ordnung ist: eine Antwort.
+for p in 873 8873; do timeout 5 bash -c "echo | nc -v <peer> $p" ; done
+```
+
+Deutung der Ausgänge:
+
+| Befund | Nächster Schritt |
+|---|---|
+| 874 verweigert | Port-Mapping (`docker compose ps`), dann Firewall (`ufw status`), dann Port-Forwarding am Router |
+| 874 antwortet, aber `certificate verify failed` | Ein Proxy terminiert TLS selbst — auf Passthrough umstellen (siehe oben) |
+| 874 antwortet, aber `hostname mismatch` | `RCLONE_GUI_PEER_HOSTNAME` ist nicht der Name, den die Gegenstelle benutzt |
+| **873 oder 8873 antwortet** | Fehler, nicht Feinschliff: das Port-Mapping bzw. die Firewall-Regel entfernen und `GET /api/rsyncd/status` prüfen |
+| Basis-URL nicht erreichbar | `RCLONE_GUI_PUBLIC_BASE_URL` steht auf `localhost`, oder der Reverse Proxy vor der UI fehlt |
 
 ## Empfehlung
 

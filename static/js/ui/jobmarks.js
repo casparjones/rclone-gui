@@ -140,7 +140,16 @@ export function updateJobMarks(jobs) {
 // One pass over the rows and a map lookup per row — no selector is built from
 // a path, which would need escaping a file name into CSS.
 export function applyJobMarks(root) {
-    const scope = root || document;
+    // Without a root the scope is the left list, not the document. The remote
+    // pane renders the same .fb-row/.fb-name markup since 67b61d0d, and its
+    // data-path is a path *on the remote* — a remote folder that happens to be
+    // called like a local source of a running job would otherwise get a
+    // progress marker that means nothing there. Markers belong to the local
+    // browser, which is the only place a sync is started from.
+    const scope = root || document.getElementById('fb-items');
+    if (!scope) {
+        return;
+    }
 
     // The common case is "nothing is running": then only the rows that still
     // carry a marker have to be touched.

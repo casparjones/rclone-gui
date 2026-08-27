@@ -71,14 +71,223 @@ use tokio::sync::Mutex as TokioMutex;
 //     (ticket 3f276e8c); on musl 1.2.4 it broke every transfer with exit 23.
 //     It is the second layer under `refuse options`.
 //
+//     The one deployment that does not get it is a daemon started by a user who
+//     is neither root nor spawning a binary with `CAP_SYS_CHROOT`: `chroot()`
+//     would fail and no transfer would run at all. That case renders `use
+//     chroot = no`, drops `uid`/`gid`, moves to an unprivileged port and says
+//     so at startup — see [`Hardening`], and
+//     `module_boundaries_without_chroot_on_the_real_daemon` for what the
+//     boundary is still worth there.
+//
 //   * one module per pairing, writable by default — only push is supported,
 //     there is no second read-only module for pull.
 // ---------------------------------------------------------------------------
 
 /// The daemon listens on loopback only; stunnel on 874 is the sole entry point.
 pub const DAEMON_ADDRESS: &str = "127.0.0.1";
-/// Local rsync daemon port behind the TLS terminator.
+/// Local rsync daemon port behind the TLS terminator, where the daemon can be
+/// hardened. See [`Hardening`] for the port a rootless daemon takes instead.
 pub const DAEMON_PORT: u16 = 873;
+/// The port a rootless daemon binds instead of [`DAEMON_PORT`].
+///
+/// 873 is privileged (`net.ipv4.ip_unprivileged_port_start` is 1024 on an
+/// ordinary host), so a daemon started by a normal user cannot have it. The
+/// value keeps the 873 shape so that a `ss -ltnp` line stays recognisable, and
+/// it is above 1024, which is all that is required of it. Override with
+/// `RCLONE_GUI_RSYNCD_PORT`; the TLS terminator has to be pointed at the same
+/// value (`RCLONE_GUI_RSYNC_BACKEND`, see `config/rsync-tls.sh`).
+pub const ROOTLESS_DAEMON_PORT: u16 = 8873;
+/// The one property the value has to have: an unprivileged process can bind it.
+/// A compile error is the right place to find that out, not a start-up failure.
+const _: () = assert!(
+    ROOTLESS_DAEMON_PORT > 1023,
+    "the rootless daemon port has to be outside the privileged range"
+);
+/// The environment variable that overrides the daemon port in either mode.
+pub const PORT_ENV: &str = "RCLONE_GUI_RSYNCD_PORT";
+
+/// How much of the daemon hardening this machine can actually provide.
+///
+/// # Why this is detected and not configured
+///
+/// Three of the hardening decisions in this module need privilege the process
+/// may not have, and a start that walks into one of them fails with an error
+/// that names the *symptom*: `Permission denied` on the run directory,
+/// `chroot(...) failed: Operation not permitted`, `setgroups failed`. Ticket
+/// `50c8ec48` came out of a user hitting the first of the three on the host and
+/// asking whether the daemon needs root at all — it does not, but the generated
+/// configuration did.
+///
+/// A switch would have been the smaller change and the wrong one: an operator
+/// who sets `RCLONE_GUI_RSYNCD_ROOTLESS=1` in production silently loses the
+/// chroot, and nothing about the running system says so. So the mode is read
+/// off the machine, once, at startup, and announced (see
+/// [`Hardening::warnings`]).
+///
+/// # What is asked, and why it is not just `geteuid() == 0`
+///
+/// The container is the case that makes the obvious question wrong. It runs as
+/// `appuser` (uid 1001, `USER appuser` in the Dockerfile) and *still* gets the
+/// full hardening, because `setcap cap_sys_chroot,cap_setgid=ep
+/// /usr/bin/rsync` puts the two capabilities the daemon needs on the binary
+/// itself. A euid check alone would therefore have downgraded the shipped
+/// container to the rootless path — losing the chroot in exactly the
+/// deployment the chroot was built for.
+///
+/// The question asked is thus "will the daemon we are about to spawn be able to
+/// chroot": euid 0, or a file capability on the rsync binary. Both are read
+/// from the system — `/proc/self/status` and `getcap` — and anything that
+/// cannot be established counts as *not* privileged, which fails towards a
+/// daemon that comes up rather than one that dies on `chroot`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hardening {
+    /// chroot, the uid/gid drop and the privileged port are all available.
+    /// The container and any root deployment.
+    Full,
+    /// None of the three are. rsync's own path check is the only thing left
+    /// holding the module boundary; see [`Hardening::warnings`].
+    Rootless,
+}
+
+impl Hardening {
+    /// What this machine can do, for the rsync binary at `binary`.
+    ///
+    /// `binary` is what [`DaemonSettings`] will spawn, which is why it is a
+    /// parameter and not [`DEFAULT_RSYNC_BINARY`]: the capability sits on the
+    /// file, so asking about a different file would answer a different
+    /// question.
+    pub fn detect(binary: &Path) -> Self {
+        if effective_uid() == Some(0) {
+            return Self::Full;
+        }
+        if binary_can_chroot(binary) {
+            return Self::Full;
+        }
+        Self::Rootless
+    }
+
+    /// The daemon port for this mode, honouring [`PORT_ENV`].
+    ///
+    /// An unparsable or zero override is ignored rather than fatal: the port is
+    /// not a security boundary here (`address = 127.0.0.1` and the loopback
+    /// verdict are), and refusing to start over a typo in an optional variable
+    /// costs more than it buys.
+    pub fn port(self) -> u16 {
+        self.port_with_override(std::env::var(PORT_ENV).ok().as_deref())
+    }
+
+    /// [`Hardening::port`] with the override handed in.
+    ///
+    /// Split out so that the table of accepted and rejected override values can
+    /// be a test: `std::env::set_var` is process-wide, and a test that set it
+    /// would decide the port of every other test running beside it.
+    fn port_with_override(self, from_env: Option<&str>) -> u16 {
+        if let Some(port) = from_env
+            .and_then(|value| value.trim().parse::<u16>().ok())
+            .filter(|port| *port != 0)
+        {
+            return port;
+        }
+        match self {
+            Self::Full => DAEMON_PORT,
+            Self::Rootless => ROOTLESS_DAEMON_PORT,
+        }
+    }
+
+    /// Whether a module is served inside a chroot of its own root.
+    pub fn uses_chroot(self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    /// Whether the daemon can drop to the module's uid/gid.
+    pub fn drops_privileges(self) -> bool {
+        matches!(self, Self::Full)
+    }
+
+    /// What the operator has to be told, in order, or empty for [`Self::Full`].
+    ///
+    /// Separate from the printing so that a test can assert the mode says what
+    /// it costs — an announcement that only exists inside a `println!` is one
+    /// nobody can check.
+    pub fn warnings(self) -> Vec<String> {
+        match self {
+            Self::Full => Vec::new(),
+            Self::Rootless => vec![
+                "the rsync daemon runs ROOTLESS: no chroot, no uid/gid drop, and an unprivileged port"
+                    .to_string(),
+                "without `use chroot = yes` the module boundary rests on rsync's own path check alone — a second layer is missing, not a first one"
+                    .to_string(),
+                "without `uid`/`gid` the daemon serves every module as the user that started the application, so a module can reach whatever that user can reach"
+                    .to_string(),
+                format!(
+                    "this is meant for development on a host; the container keeps the hardened path (chroot, uid/gid, port {DAEMON_PORT}) through the file capabilities on /usr/bin/rsync"
+                ),
+            ],
+        }
+    }
+}
+
+/// The effective uid of this process, or `None` if it cannot be read.
+///
+/// `/proc/self/status` rather than `geteuid()`: `libc` is not a declared
+/// dependency of this crate, and everything else in this module that asks the
+/// kernel something (`/proc/locks`, `/proc/net/tcp`, `/proc/<pid>/cmdline`)
+/// already reads it out of `/proc`. The `Uid:` line is
+/// `real  effective  saved  filesystem`.
+fn effective_uid() -> Option<u32> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    status.lines().find_map(|line| {
+        line.strip_prefix("Uid:")?
+            .split_whitespace()
+            .nth(1)?
+            .parse()
+            .ok()
+    })
+}
+
+/// Whether the rsync binary carries `CAP_SYS_CHROOT` as a file capability.
+///
+/// This is what makes the shipped container privileged without running as root
+/// (Dockerfile: `setcap cap_sys_chroot,cap_setgid=ep /usr/bin/rsync`). The
+/// query goes through `getcap`, which the runtime image installs for exactly
+/// this purpose (`libcap`), because reading the `security.capability` extended
+/// attribute needs `getxattr` and thus `libc`.
+///
+/// Every negative outcome — no `getcap`, a non-zero exit, an unreadable path —
+/// is reported as "no capability". That is the direction that fails safe in the
+/// operational sense: the daemon comes up rootless and *says so*, rather than
+/// promising a chroot and dying in it.
+fn binary_can_chroot(binary: &Path) -> bool {
+    let Some(path) = resolve_in_path(binary) else {
+        return false;
+    };
+    let Ok(output) = std::process::Command::new("getcap")
+        .arg(&path)
+        .stdin(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&output.stdout).contains("cap_sys_chroot")
+}
+
+/// `binary` as a filesystem path, resolving a bare name through `PATH`.
+///
+/// [`DEFAULT_RSYNC_BINARY`] is the bare word `rsync`, which `getcap` cannot
+/// take — it wants a file, not a command. Returns `None` when nothing on `PATH`
+/// matches, which is also the case in which the daemon will not start at all.
+fn resolve_in_path(binary: &Path) -> Option<PathBuf> {
+    if binary.components().count() > 1 || binary.is_absolute() {
+        return binary.exists().then(|| binary.to_path_buf());
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(binary))
+        .find(|candidate| candidate.is_file())
+}
 /// Options every module refuses, regardless of chroot. See the note above.
 ///
 /// # Why the bare word `delete` and not `delete*`
@@ -619,7 +828,7 @@ impl ModuleConfig {
 
     /// Render the `[module]` section. `secrets_file` is the path the *daemon*
     /// will read at runtime, which is not necessarily where we write it now.
-    fn render(&self, secrets_file: &str) -> Result<String> {
+    fn render(&self, secrets_file: &str, hardening: Hardening) -> Result<String> {
         check_module_name(&self.name)?;
         check_conf_value("share root", &self.path)?;
         check_conf_value("secrets file", secrets_file)?;
@@ -631,6 +840,20 @@ impl ModuleConfig {
         } else {
             format!("    temp dir = /{MODULE_TEMP_DIR}\n")
         };
+        // Rootless: `chroot()` needs CAP_SYS_CHROOT and the uid/gid drop needs
+        // CAP_SETGID, so both are rendered as what the daemon can actually do
+        // rather than as what we would like. `munge symlinks` and `refuse
+        // options` stay untouched — neither needs privilege, and with the
+        // chroot gone they are what is left. See `Hardening`.
+        let identity = if hardening.drops_privileges() {
+            format!(
+                "\x20   uid = {uid}\n\x20   gid = {gid}\n",
+                uid = self.uid,
+                gid = self.gid
+            )
+        } else {
+            String::new()
+        };
         Ok(format!(
             "[{name}]\n\
              \x20   path = {path}\n\
@@ -638,10 +861,9 @@ impl ModuleConfig {
              \x20   secrets file = {secrets}\n\
              \x20   list = no\n\
              \x20   read only = {read_only}\n\
-             \x20   use chroot = yes\n\
+             \x20   use chroot = {chroot}\n\
              \x20   munge symlinks = yes\n\
-             \x20   uid = {uid}\n\
-             \x20   gid = {gid}\n\
+             {identity}\
              \x20   max connections = {max_connections}\n\
              {temp_dir}\
              \x20   refuse options = {refused}\n\
@@ -651,8 +873,7 @@ impl ModuleConfig {
             path = self.path,
             secrets = secrets_file,
             read_only = if self.read_only { "yes" } else { "no" },
-            uid = self.uid,
-            gid = self.gid,
+            chroot = if hardening.uses_chroot() { "yes" } else { "no" },
             max_connections = self.max_connections,
             refused = REFUSED_OPTIONS,
             log_format = MODULE_LOG_FORMAT,
@@ -689,6 +910,13 @@ pub struct DaemonConfig {
     /// See [`DaemonConfig::with_log_file`] for why this has to be in the file
     /// rather than on the command line.
     log_file: Option<PathBuf>,
+    /// How much hardening the generated configuration may ask for.
+    ///
+    /// Defaults to [`Hardening::Full`] — the shipped deployment, and the value
+    /// every test that does not say otherwise means. The one place that detects
+    /// it is the startup in `src/main.rs`; see [`Hardening`] for why it is
+    /// detected there and not configured here.
+    hardening: Hardening,
     modules: Vec<ModuleConfig>,
 }
 
@@ -702,8 +930,26 @@ impl DaemonConfig {
             secrets_file: secrets_file.into(),
             proxy_protocol_hosts: None,
             log_file: None,
+            hardening: Hardening::Full,
             modules: Vec::new(),
         }
+    }
+
+    /// Render for `hardening` instead of [`Hardening::Full`].
+    pub fn with_hardening(mut self, hardening: Hardening) -> Self {
+        self.hardening = hardening;
+        self
+    }
+
+    /// Set the hardening after construction. See
+    /// [`DaemonConfig::with_hardening`].
+    pub fn set_hardening(&mut self, hardening: Hardening) {
+        self.hardening = hardening;
+    }
+
+    /// What the generated configuration asks for.
+    pub fn hardening(&self) -> Hardening {
+        self.hardening
     }
 
     /// Write the daemon log to `path` — from the configuration file, not from
@@ -835,7 +1081,7 @@ impl DaemonConfig {
              # offers md5/md4 only. See docs/rsync-transport.md.\n",
         );
         out.push_str(&format!("address = {DAEMON_ADDRESS}\n"));
-        out.push_str(&format!("port = {DAEMON_PORT}\n"));
+        out.push_str(&format!("port = {}\n", self.hardening.port()));
         if let Some(log_file) = &self.log_file {
             let log_file = log_file
                 .to_str()
@@ -864,7 +1110,7 @@ impl DaemonConfig {
 
         for module in &self.modules {
             out.push('\n');
-            out.push_str(&module.render(secrets)?);
+            out.push_str(&module.render(secrets, self.hardening)?);
         }
         Ok(out)
     }
@@ -1057,6 +1303,22 @@ impl ModuleRegistry {
             conf_path: conf_path.into(),
             config: DaemonConfig::new(secrets_file),
         }
+    }
+
+    /// The same registry, generating for `hardening`.
+    ///
+    /// The startup in `src/main.rs` detects the mode once and hands it to the
+    /// registry and to [`DaemonSettings`] together; a registry that generated
+    /// `use chroot = yes` while the daemon was told to use the unprivileged
+    /// port would be the half-migrated state this exists to make impossible.
+    pub fn with_hardening(mut self, hardening: Hardening) -> Self {
+        self.config.set_hardening(hardening);
+        self
+    }
+
+    /// How much hardening the generated configuration asks for.
+    pub fn hardening(&self) -> Hardening {
+        self.config.hardening()
     }
 
     /// The path of the generated `rsyncd.conf`.
@@ -1511,6 +1773,17 @@ impl DaemonSettings {
 
     /// Listen on a different port. Only the probes need this; in production the
     /// port is [`DAEMON_PORT`] behind the TLS terminator.
+    /// Spawn for `hardening`: the port moves with it.
+    ///
+    /// The port is the only thing in [`DaemonSettings`] the mode touches — the
+    /// chroot and the uid/gid live in the generated configuration
+    /// ([`DaemonConfig::with_hardening`]) — but it has to move at the same
+    /// time, or the daemon binds a port nothing connects to.
+    pub fn with_hardening(mut self, hardening: Hardening) -> Self {
+        self.port = hardening.port();
+        self
+    }
+
     pub fn with_port(mut self, port: u16) -> Self {
         self.port = port;
         self
@@ -2920,7 +3193,9 @@ impl DaemonHandle {
             // A connect proves that *something* listens on the port; the pid
             // file lock proves *whose* it is. Both are needed — see
             // `pid_file_is_held_by_a_stranger`.
-            if TcpStream::connect(&address).await.is_ok() {
+            if TcpStream::connect(&address).await.is_ok()
+                && !self.pid_file_is_held_by_a_stranger().await
+            {
                 return Ok(());
             }
             if tokio::time::Instant::now() >= deadline {
@@ -4714,6 +4989,247 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Rootless operation (ticket 50c8ec48)
+    // -----------------------------------------------------------------------
+
+    /// The rootless configuration, byte for byte.
+    ///
+    /// The hardened counterpart is
+    /// `the_generated_configuration_matches_the_reviewed_template`, and the two
+    /// together are the whole of what the mode changes on paper: `use chroot`
+    /// flips, `uid`/`gid` disappear, the port moves. Written as a full
+    /// comparison rather than a handful of `contains` for the same reason as
+    /// that one — a `contains` cannot see a line that was *added*.
+    #[test]
+    fn a_rootless_configuration_drops_the_chroot_and_the_identity() {
+        let base = scratch("rootless-template");
+        let share = base.join("share");
+        fs::create_dir_all(&share).unwrap();
+        let module = module_in(&share, true);
+
+        let mut cfg = DaemonConfig::new("/etc/rsyncd/secrets").with_hardening(Hardening::Rootless);
+        cfg.add_module(module.clone());
+        let conf = cfg.render_conf().unwrap();
+
+        let expected = format!(
+            "# Generated by rclone-gui. Do not edit, this file is overwritten.\n\
+             # No \"auth digest\": rsync on Alpine is built without openssl-crypto and\n\
+             # offers md5/md4 only. See docs/rsync-transport.md.\n\
+             address = 127.0.0.1\n\
+             port = {port}\n\
+             # no \"proxy protocol\": rsync 3.4.3 resets every connection unless the\n\
+             # TLS terminator sends a PROXY header. See docs/rsync-transport.md.\n\
+             \n\
+             [{name}]\n\
+             \x20   path = {path}\n\
+             \x20   auth users = {name}\n\
+             \x20   secrets file = /etc/rsyncd/secrets\n\
+             \x20   list = no\n\
+             \x20   read only = no\n\
+             \x20   use chroot = no\n\
+             \x20   munge symlinks = yes\n\
+             \x20   max connections = 4\n\
+             \x20   temp dir = /.rsync-tmp\n\
+             \x20   refuse options = copy-links copy-dirlinks copy-unsafe-links delete \
+             remove-source-files remove-sent-files force\n\
+             \x20   transfer logging = yes\n\
+             \x20   log format = rclone-gui-audit %a %u %m %o %l %b %f\n",
+            port = ROOTLESS_DAEMON_PORT,
+            name = module.name(),
+            path = module.path(),
+        );
+        assert_eq!(conf, expected);
+
+        // What must survive the mode: the two layers that are left once the
+        // chroot is gone, and the parameter that would undo them.
+        assert!(conf.contains("    munge symlinks = yes\n"));
+        assert!(conf.contains(&format!("    refuse options = {REFUSED_OPTIONS}\n")));
+        assert!(!mentions_insecure_links(&conf));
+        assert!(conf.contains("address = 127.0.0.1\n"));
+        fs::remove_dir_all(&base).ok();
+    }
+
+    /// The default is the hardened mode, everywhere.
+    ///
+    /// A [`DaemonConfig`] built without saying anything renders the container's
+    /// configuration; only the startup, which detects the mode, moves it. If
+    /// this ever flips, every hardening assertion in this module starts
+    /// measuring the weaker path without saying so.
+    #[test]
+    fn hardening_defaults_to_the_container_path() {
+        assert_eq!(
+            DaemonConfig::new("/etc/rsyncd/secrets").hardening(),
+            Hardening::Full
+        );
+        assert_eq!(
+            ModuleRegistry::new("/etc/rsyncd/rsyncd.conf", "/etc/rsyncd/secrets").hardening(),
+            Hardening::Full
+        );
+        assert_eq!(
+            DaemonSettings::new("/etc/rsyncd/rsyncd.conf", "/etc/rsyncd/run").port,
+            DAEMON_PORT
+        );
+        assert_eq!(
+            DaemonSettings::new("/etc/rsyncd/rsyncd.conf", "/etc/rsyncd/run")
+                .with_hardening(Hardening::Rootless)
+                .port,
+            ROOTLESS_DAEMON_PORT
+        );
+        assert!(Hardening::Full.uses_chroot() && Hardening::Full.drops_privileges());
+        assert!(!Hardening::Rootless.uses_chroot() && !Hardening::Rootless.drops_privileges());
+    }
+
+    /// The port follows the mode, and the override is validated.
+    ///
+    /// `0` and anything unparsable fall back rather than abort: the port is not
+    /// the boundary here (`address = 127.0.0.1` and the loopback verdict are),
+    /// and a start that dies over a typo in an optional variable costs more
+    /// than it buys. Fixed as a table so the choice is visible.
+    #[test]
+    fn the_daemon_port_follows_the_mode_and_a_checked_override() {
+        for (mode, default) in [
+            (Hardening::Full, DAEMON_PORT),
+            (Hardening::Rootless, ROOTLESS_DAEMON_PORT),
+        ] {
+            assert_eq!(mode.port_with_override(None), default);
+            assert_eq!(mode.port_with_override(Some("9137")), 9137);
+            assert_eq!(mode.port_with_override(Some("  9137  ")), 9137);
+            for bad in ["", "0", "abc", "-1", "70000", "873 874"] {
+                assert_eq!(
+                    mode.port_with_override(Some(bad)),
+                    default,
+                    "{bad:?} must not become a port"
+                );
+            }
+        }
+    }
+
+    /// The rootless mode says what it costs, and the hardened one says nothing.
+    ///
+    /// The announcement is the whole reason the mode is detected instead of
+    /// switched: an operator who is not told has lost the chroot without
+    /// knowing. Asserted here rather than trusted to a `println!` in
+    /// `src/main.rs`, which no test can see.
+    #[test]
+    fn the_rootless_mode_announces_what_it_gives_up() {
+        assert!(Hardening::Full.warnings().is_empty());
+        let said = Hardening::Rootless.warnings().join("\n").to_lowercase();
+        assert!(!said.is_empty());
+        for term in ["rootless", "chroot", "uid", "port", "development"] {
+            assert!(
+                said.contains(term),
+                "the warning never mentions {term:?}: {said}"
+            );
+        }
+    }
+
+    /// What the detection reads, and that it fails towards a daemon that runs.
+    ///
+    /// The verdict itself depends on the machine — root, a file capability, or
+    /// neither — so what is asserted is the two inputs and the direction of the
+    /// fallback. `getcap` on a path that is not there, or no `getcap` at all,
+    /// has to mean "no capability": that yields [`Hardening::Rootless`], a
+    /// daemon that comes up and *says* what it lacks, rather than one that
+    /// promises a chroot and dies in it.
+    #[test]
+    fn hardening_detection_reads_the_machine_and_fails_towards_running() {
+        // The uid comes out of /proc and agrees with what the filesystem says
+        // about a file this process has just created.
+        let base = scratch("hardening-uid");
+        fs::create_dir_all(&base).unwrap();
+        let probe = base.join("mine");
+        fs::write(&probe, "x").unwrap();
+        let owner = fs::metadata(&probe).unwrap().uid();
+        assert_eq!(
+            effective_uid(),
+            Some(owner),
+            "the uid read from /proc/self/status has to be the one the kernel              stamps on a file this process creates"
+        );
+
+        // A bare command name is resolved through PATH; a path that does not
+        // exist resolves to nothing and can therefore carry no capability.
+        assert_eq!(
+            resolve_in_path(Path::new("/definitely/not/here/rsync")),
+            None
+        );
+        assert!(!binary_can_chroot(Path::new("/definitely/not/here/rsync")));
+        assert!(!binary_can_chroot(&base.join("mine")));
+        if let Some(found) = resolve_in_path(Path::new("sh")) {
+            assert!(
+                found.is_absolute() && found.is_file(),
+                "{}",
+                found.display()
+            );
+        }
+
+        // And the verdict is one of the two, for a binary that is not there as
+        // well — nothing about an unanswerable question may panic.
+        let verdict = Hardening::detect(Path::new("/definitely/not/here/rsync"));
+        assert_eq!(verdict, Hardening::Rootless);
+        // On this machine, whatever it is: root gets the full path, and so does
+        // a binary carrying cap_sys_chroot. Nothing else does.
+        let here = Hardening::detect(Path::new(DEFAULT_RSYNC_BINARY));
+        let privileged =
+            effective_uid() == Some(0) || binary_can_chroot(Path::new(DEFAULT_RSYNC_BINARY));
+        assert_eq!(here == Hardening::Full, privileged);
+        fs::remove_dir_all(&base).ok();
+    }
+
+    /// The TLS terminator computes the same default port as the application.
+    ///
+    /// The rule lives twice — `Hardening::port` here and `rsyncd_default_port`
+    /// in `config/rsync-tls.sh` — because stunnel cannot ask the application
+    /// what it decided. Two copies of a rule drift, and the drift is invisible:
+    /// the daemon runs, stunnel connects to a closed port, and the peer sees a
+    /// TLS handshake that leads nowhere. So the shell function is executed here
+    /// and its answer compared with this module's.
+    #[test]
+    fn the_tls_script_computes_the_same_daemon_port() {
+        use std::process::Command;
+        let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("config")
+            .join("rsync-tls.sh");
+        assert!(script.is_file(), "{} is missing", script.display());
+
+        let ask = |port_env: Option<&str>| -> String {
+            let mut command = Command::new("bash");
+            command
+                .arg("-c")
+                .arg(
+                    "set -u; . \"$1\" >/dev/null 2>&1; \
+                     printf '%s|%s' \"$(rsyncd_default_port)\" \"$RCLONE_GUI_RSYNC_BACKEND\"",
+                )
+                .arg("bash")
+                .arg(&script)
+                // Never inherited: the backend override would make the second
+                // half of the answer say nothing about the port rule.
+                .env_remove("RCLONE_GUI_RSYNC_BACKEND")
+                .env_remove(PORT_ENV);
+            if let Some(value) = port_env {
+                command.env(PORT_ENV, value);
+            }
+            let out = command.output().expect("cannot run bash");
+            assert!(
+                out.status.success(),
+                "the script could not be sourced: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        // Without an override the script has to agree with the mode this
+        // machine is actually in — that is the value stunnel would use.
+        let mine = Hardening::detect(Path::new(DEFAULT_RSYNC_BINARY)).port_with_override(None);
+        assert_eq!(
+            ask(None),
+            format!("{mine}|127.0.0.1:{mine}"),
+            "the script and this module disagree about the daemon port"
+        );
+        // With one, both sides read the same variable.
+        assert_eq!(ask(Some("9137")), "9137|127.0.0.1:9137");
+    }
+
+    // -----------------------------------------------------------------------
     // Secrets, rate limits and the TLS obligation (ticket 4292d027)
     // -----------------------------------------------------------------------
 
@@ -6365,7 +6881,9 @@ mod tests {
         let writable = ModuleConfig::new(&share, true, 1000, 1000, 4).unwrap();
         let read_only = ModuleConfig::new(&share, false, 1000, 1000, 4).unwrap();
 
-        let rendered = writable.render("/etc/rsyncd/secrets").unwrap();
+        let rendered = writable
+            .render("/etc/rsyncd/secrets", Hardening::Full)
+            .unwrap();
         assert!(
             rendered.contains(&format!("temp dir = /{MODULE_TEMP_DIR}")),
             "a writable module must keep its temp files out of the share root: {rendered}"
@@ -6375,7 +6893,7 @@ mod tests {
         assert!(!rendered.contains(&format!("temp dir = {}", share.display())));
         assert!(
             !read_only
-                .render("/etc/rsyncd/secrets")
+                .render("/etc/rsyncd/secrets", Hardening::Full)
                 .unwrap()
                 .contains("temp dir"),
             "a read-only module never receives a file and needs no temp directory"
@@ -6780,18 +7298,14 @@ mod tests {
     /// *same* socket and the *same* lock, but the lock held by the pid this
     /// handle calls its own, the wait has to succeed. Without it the riegel
     /// could be "never return Ok" and still pass.
-    /// **Bewusst `#[ignore]` — dieser Test schlaegt fehl, und zwar zu Recht.**
+    /// # Status (Ticket 466dc997 behoben)
     ///
-    /// Er ist die ausfuehrbare Fassung der Diagnose zu Ticket `466dc997`:
-    /// `wait_until_listening` prueft Bereitschaft per TCP-Connect auf den Port und
-    /// nimmt daher auch den Socket eines **fremden** Daemons als Beweis, dass *unser*
-    /// Kind lauscht. Der Test wurde vor dem Fix geschrieben; der Fix fehlt noch.
-    ///
-    /// Er ist ausgeschaltet, damit `cargo test` nicht dauerhaft rot ist — ein rot
-    /// bleibender Lauf wird ignoriert, und damit auch der echte Fehlschlag daneben.
-    /// **Wer `466dc997` uebernimmt: dieses Attribut entfernen, dann ist der Test die
-    /// Vorgabe.**
-    #[ignore = "466dc997: Bereitschaft haengt am Port, nicht an unserem Kind"]
+    /// Der Test lief unter `#[ignore]`, weil er vor dem Fix geschrieben wurde.
+    /// Der Fix ist da: `wait_until_listening` verlangt zum TCP-Connect zusaetzlich,
+    /// dass die PID-Datei **nicht** von einem Fremden gehalten wird
+    /// (`pid_file_is_held_by_a_stranger`). Das Attribut ist entfernt; der Test ist
+    /// jetzt der Waechter darueber, dass die Bereitschaft am eigenen Kind haengt und
+    /// nicht am Port.
     #[tokio::test]
     async fn a_stranger_on_the_port_cannot_bless_our_start() {
         use std::process::Command;
@@ -7218,8 +7732,27 @@ mod real_rsync_probe {
     enum Backend {
         /// The rsync on this machine, inside a user namespace.
         Host,
+        /// The rsync on this machine, as the invoking user, with the
+        /// configuration [`Hardening::Rootless`] generates: no chroot, no
+        /// uid/gid, an unprivileged port. Ticket `50c8ec48`.
+        ///
+        /// No user namespace, and that is the point rather than a shortcut —
+        /// this is the deployment a developer actually gets when they start the
+        /// application as themselves, and the only way to measure what the
+        /// module boundary is worth there.
+        HostRootless,
         /// The rsync of the runtime image, inside a container.
         Docker,
+    }
+
+    impl Backend {
+        /// The hardening the generated configuration is rendered for.
+        fn hardening(self) -> Hardening {
+            match self {
+                Self::Host | Self::Docker => Hardening::Full,
+                Self::HostRootless => Hardening::Rootless,
+            }
+        }
     }
 
     struct Probe {
@@ -7255,6 +7788,12 @@ mod real_rsync_probe {
                 // Inside the user namespace the probe user *is* root, and only
                 // root is mapped, so the module cannot drop to anything else.
                 Backend::Host => (0, 0),
+                // Rootless the daemon never drops anything, so these values do
+                // not reach the generated configuration at all (see
+                // `ModuleConfig::render`). They still have to be the real ones:
+                // `ModuleConfig::new` stores them, and a module whose share it
+                // could not stat would not be created.
+                Backend::HostRootless => (uid, gid),
                 // The daemon is really root here and drops to the owner of the
                 // bind-mounted share directories.
                 Backend::Docker => (uid, gid),
@@ -7310,6 +7849,9 @@ mod real_rsync_probe {
                     ]);
                     c
                 }
+                // Plain rsync, as the invoking user: no namespace, no
+                // capabilities, nothing the rootless deployment does not have.
+                Backend::HostRootless => Command::new("rsync"),
                 Backend::Docker => {
                     self.start_container();
                     let mut c = Command::new("docker");
@@ -7405,7 +7947,7 @@ mod real_rsync_probe {
         fn client_command(&self, extra: &[&str], module: &ModuleConfig, source: &Path) -> Command {
             let password = self.password_file(module);
             let mut command = match self.backend {
-                Backend::Host => Command::new("rsync"),
+                Backend::Host | Backend::HostRootless => Command::new("rsync"),
                 Backend::Docker => {
                     let owner = fs::metadata(&self.base).expect("scratch dir");
                     let mut c = Command::new("docker");
@@ -7702,6 +8244,22 @@ mod real_rsync_probe {
             dir
         }
 
+        /// Settings for a daemon started the way an unprivileged user gets it:
+        /// plain `rsync`, no user namespace, the rootless port.
+        ///
+        /// Deliberately *not* a flag on [`LifecycleProbe::settings`] — the two
+        /// differ in the launcher, in `strict modes` (nothing changes identity
+        /// here, so the real check applies) and in the port, and a boolean
+        /// parameter threading through three of those is how one of them ends
+        /// up wrong.
+        fn rootless_settings(&self) -> DaemonSettings {
+            DaemonSettings::new(self.path("etc/rsyncd.conf"), self.path("run"))
+                .with_port(self.port)
+                .with_temp_file_min_age(Duration::ZERO)
+                .without_stunnel_log()
+                .without_audit_file()
+        }
+
         fn settings(&self) -> DaemonSettings {
             DaemonSettings::new(self.path("etc/rsyncd.conf"), self.path("run"))
                 .with_binary(&self.launcher)
@@ -7792,6 +8350,126 @@ mod real_rsync_probe {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         panic!("timed out waiting for: {what}");
+    }
+
+    /// The application's own start path, rootless (ticket `50c8ec48`).
+    ///
+    /// # What this measures that the boundary probe does not
+    ///
+    /// `module_boundaries_without_chroot_on_the_real_daemon` starts rsync by
+    /// hand. This one goes through [`DaemonHandle::start`] — the code path a
+    /// user gets when they run the application as themselves, which is where
+    /// ticket `50c8ec48` began (`cannot create the daemon run directory
+    /// /etc/rsyncd/run: Permission denied`). Nothing here is privileged: no
+    /// `unshare`, no launcher script, no capability, and no `strict modes=no`
+    /// concession, because rootless the daemon and the files really do belong
+    /// to the same user.
+    ///
+    /// Readiness is not read off a log line. `start` returning `Ok` already
+    /// means the port answered *and* the pid file lock is ours (see
+    /// `wait_until_listening`), and on top of that a push and a pull-back run
+    /// over the socket: the acceptance criterion is "a transfer works
+    /// end-to-end", and only a byte that arrives proves that.
+    ///
+    /// `#[ignore]`d because it needs `RSYNCD_PROBE_DIR`, like every probe here.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn a_rootless_daemon_starts_and_transfers_on_the_host_rsync() {
+        let probe = LifecycleProbe::new();
+        // The real ids of the invoking user. They never reach the generated
+        // configuration in this mode — that is asserted below — but a module
+        // still records them.
+        let owner = fs::metadata(&probe.base).expect("scratch dir");
+        let (uid, gid) = (owner.uid(), owner.gid());
+
+        let share = probe.share("share");
+        fs::write(share.join("already-here.txt"), "server side\n").unwrap();
+        let source = probe.path("src");
+        fs::write(source.join("payload.txt"), "rootless payload\n").unwrap();
+
+        let mut registry =
+            ModuleRegistry::new(probe.path("etc/rsyncd.conf"), probe.path("etc/secrets"))
+                .with_hardening(Hardening::Rootless);
+        let module = registry
+            .add_pairing(&share, true, uid, gid, 4)
+            .expect("pairing");
+        let registry = Arc::new(TokioMutex::new(registry));
+
+        let handle = DaemonHandle::start(probe.rootless_settings(), Arc::clone(&registry))
+            .await
+            .expect("a rootless daemon has to come up");
+
+        // 1. It holds the port. `start` proved it with a connect against the
+        //    pid file lock; this is the same question asked from outside, so
+        //    that the criterion does not rest on our own bookkeeping.
+        assert!(
+            TcpStream::connect(format!("{DAEMON_ADDRESS}:{}", probe.port))
+                .await
+                .is_ok(),
+            "nothing answers on the rootless port"
+        );
+        let status = handle.status().await;
+        assert!(status.running && status.pid.is_some(), "{status:?}");
+        assert_eq!(status.port, probe.port);
+
+        // 2. The configuration on disk is the rootless one — no chroot, no
+        //    identity drop. Without this the transfer below could be passing
+        //    because the daemon was hardened after all.
+        let generated = fs::read_to_string(probe.path("etc/rsyncd.conf")).expect("rsyncd.conf");
+        assert!(generated.contains("use chroot = no"), "{generated}");
+        assert!(
+            !generated.contains("    uid = ") && !generated.contains("    gid = "),
+            "{generated}"
+        );
+        assert!(
+            generated.contains("    munge symlinks = yes"),
+            "{generated}"
+        );
+
+        // 3. End to end: a push in, and a pull back out.
+        let out = probe.client(&[], &module, &source.join("payload.txt"));
+        assert!(out.status.success(), "rootless push: {}", stderr(&out));
+        assert_eq!(
+            fs::read_to_string(share.join("payload.txt")).unwrap_or_default(),
+            "rootless payload\n",
+            "the pushed file did not arrive in the share"
+        );
+
+        let back = probe.path("back");
+        fs::create_dir_all(&back).unwrap();
+        let password = probe.password_file(&module);
+        let out = Command::new("rsync")
+            .arg("-a")
+            .arg(format!("--password-file={}", password.display()))
+            .arg(format!(
+                "rsync://{name}@127.0.0.1:{port}/{name}/",
+                name = module.name(),
+                port = probe.port
+            ))
+            .arg(format!("{}/", back.display()))
+            .output()
+            .expect("cannot run rsync");
+        assert!(out.status.success(), "rootless pull: {}", stderr(&out));
+        assert_eq!(
+            fs::read_to_string(back.join("already-here.txt")).unwrap_or_default(),
+            "server side\n",
+            "the pull delivered nothing, so the transfer is not proven"
+        );
+
+        // 4. And it goes away again, releasing the lock.
+        let pid = status.pid.expect("a pid");
+        handle.shutdown().await;
+        until(
+            "the rootless daemon to exit",
+            Duration::from_secs(10),
+            || !process_alive(pid),
+        )
+        .await;
+        assert!(
+            pid_file_holder(&probe.path("run/rsyncd.pid")).is_none(),
+            "the pid file lock outlived the daemon"
+        );
+        let _ = fs::remove_dir_all(&probe.base);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -8894,7 +9572,7 @@ mod real_rsync_probe {
         fn rsync(&self, module: &ModuleConfig, args: &[&str]) -> Output {
             let password = self.password_file(module);
             let mut command = match self.backend {
-                Backend::Host => Command::new("rsync"),
+                Backend::Host | Backend::HostRootless => Command::new("rsync"),
                 Backend::Docker => {
                     let owner = fs::metadata(&self.base).expect("scratch dir");
                     let mut c = Command::new("docker");
@@ -8943,7 +9621,42 @@ mod real_rsync_probe {
     #[test]
     #[ignore]
     fn module_boundaries_on_the_real_daemon() {
-        let mut probe = Probe::new(Backend::Host);
+        module_boundary_probe(Backend::Host);
+    }
+
+    /// The same nine boundaries, against the configuration a rootless daemon
+    /// gets (ticket `50c8ec48`).
+    ///
+    /// # Why this is the important half of that ticket
+    ///
+    /// Rootless there is no chroot, so the module root is no longer `/` for the
+    /// serving process, and the second layer under `refuse options` is simply
+    /// gone. What is left is rsync's own path handling plus `munge symlinks`
+    /// plus the refusal list — and "left" is a claim, not a measurement, until
+    /// the escapes are fired at it. So they are: the same function, the same
+    /// assertions, the same [`WeakDaemon`] counter-proof, one value changed.
+    ///
+    /// The counter-proof is what makes it worth running. `WeakDaemon` also
+    /// serves without a chroot; the difference between it and this daemon is
+    /// `munge symlinks`, `refuse options` and the absence of `insecure links`.
+    /// It leaks `/etc/passwd` (2597 bytes, measured) and this one must not, so a
+    /// green run here says the remaining layers do the work — not that the
+    /// harness transferred nothing.
+    ///
+    /// Host only, and on purpose: rsync 3.4.3 in the image refuses to follow a
+    /// symlink out of a module whatever the configuration says (`Cross-device
+    /// link`), so the counter-proof cannot be produced there. See the note on
+    /// [`WeakDaemon`].
+    #[test]
+    #[ignore]
+    fn module_boundaries_without_chroot_on_the_real_daemon() {
+        module_boundary_probe(Backend::HostRootless);
+    }
+
+    /// The body of the two probes above. `backend` decides which hardening the
+    /// configuration is generated for; everything measured is identical.
+    fn module_boundary_probe(backend: Backend) {
+        let mut probe = Probe::new(backend);
         let (uid, gid) = (probe.uid, probe.gid);
 
         // The file the escapes are after: one level above the share root.
@@ -8962,10 +9675,25 @@ mod real_rsync_probe {
         std::os::unix::fs::symlink("/etc/passwd", share.join("passwd.link")).unwrap();
 
         let mut registry =
-            ModuleRegistry::new(probe.path("etc/rsyncd.conf"), probe.path("etc/secrets"));
+            ModuleRegistry::new(probe.path("etc/rsyncd.conf"), probe.path("etc/secrets"))
+                .with_hardening(backend.hardening());
         let module = registry
             .add_pairing(&share, true, uid, gid, 4)
             .expect("pairing");
+        // The mode really did reach the file: an assertion here rather than a
+        // trusted builder call, because a probe that silently measured the
+        // hardened configuration twice would pass and prove nothing.
+        let generated = fs::read_to_string(probe.path("etc/rsyncd.conf")).expect("rsyncd.conf");
+        if backend.hardening().uses_chroot() {
+            assert!(generated.contains("use chroot = yes"), "{generated}");
+            assert!(generated.contains("    uid = "), "{generated}");
+        } else {
+            assert!(generated.contains("use chroot = no"), "{generated}");
+            assert!(
+                !generated.contains("    uid = ") && !generated.contains("    gid = "),
+                "a rootless configuration must not ask for a uid/gid drop:\n{generated}"
+            );
+        }
         probe.start_daemon();
 
         let passwd = passwd_marker();
@@ -9273,7 +10001,7 @@ mod real_rsync_probe {
             !log.to_lowercase().contains("unknown parameter"),
             "the generated configuration produced parser warnings:\n{log}"
         );
-        println!("--- hardened daemon log ---\n{log}");
+        println!("--- {backend:?} daemon log ---\n{log}");
 
         // -------------------------------------------------------------------
         // The counter-proof

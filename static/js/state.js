@@ -51,8 +51,11 @@ export const state = {
     // both modes — only the layout around it changes.
     workspaceMode: 'browser',
 
-    // Width of the left column in sync mode, in percent of the workspace
-    splitRatio: 55,
+    // Width of the left column in sync mode, in percent of the workspace.
+    // Half and half: both panes render the same grid, so anything else makes
+    // one of them truncate names earlier (67b61d0d). The CSS fallback in
+    // static/index.html (.ws.is-split) carries the same number.
+    splitRatio: 50,
 
     // Sync backend: what the right pane syncs against.
     //   'rclone' – the target is an rclone remote from the configuration

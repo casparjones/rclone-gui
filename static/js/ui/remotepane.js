@@ -30,6 +30,9 @@
 
 import { registerRemotePane, getSyncBackend, onSyncBackendChange } from './syncmode.js';
 import { fetchRemoteFiles, createRemoteFolder } from '../api.js';
+// formatBytes is shared with the left browser on purpose: the pane used to carry
+// a private copy, and the two disagreed on the same file (67b61d0d).
+import { formatBytes } from '../util/format.js';
 
 // ---------------------------------------------------------------------------
 // Data source
@@ -423,8 +426,14 @@ function buildSkeleton(container) {
     // Listing --------------------------------------------------------------
     const listBox = createElement('div', 'overflow-x-auto');
 
+    // Six cells, in the order of #file-head in static/index.html: the row grid
+    // (.fb-head/.fb-row) has six columns, and a header with five would put
+    // "Name" into the 2rem icon column — that was the bug of 67b61d0d. The
+    // first cell stays empty on purpose: this pane has no selection, but the
+    // column has to be there or head and rows drift apart.
     const head = createElement('div', 'fb-head');
     head.append(
+        createElement('div', 'fb-check'),
         createElement('div'),
         createElement('div', null, 'Name'),
         createElement('div', 'fb-size', 'Size'),
@@ -1239,17 +1248,35 @@ function entryRow(entry) {
         row.style.cursor = 'default';
     }
 
-    const icon = createElement('div', 'fb-icon', isDir ? '📁' : '📄');
+    // The cells mirror the left browser one for one (browser-render.js): an
+    // empty .fb-check, the icon inside a .fb-thumb-box, name, size, modified,
+    // actions. Six cells for six grid columns — with five the name landed in
+    // the 2rem icon column and was cut after about two characters (67b61d0d).
+    //
+    // Empty rather than absent: this pane has no selection and no per row
+    // action, and the columns are only kept so the name gets the same 1fr and
+    // the same ellipsis as on the left.
+    const check = createElement('div', 'fb-check');
+
+    const thumb = createElement('div', 'fb-thumb-box');
+    thumb.append(createElement('div', 'fb-icon', isDir ? '📁' : '📄'));
 
     const name = createElement('div', 'fb-name');
     name.textContent = entry.name;
     name.title = entry.name;
 
-    const size = createElement('div', 'fb-meta fb-size', isDir ? '—' : formatBytes(entry.size));
+    // Size stays a dash for folders: `rclone lsjson` reports whatever the
+    // backend has (an inode size for local, -1 for S3), and neither says
+    // anything about the folder. The modification time is real, so the column
+    // is not empty and both stay.
+    // An unknown size reads as an em dash, exactly like a folder: formatBytes
+    // returns '' for -1 (object stores) and for a missing value, and an empty
+    // cell in the grid looks like a rendering fault.
+    const size = createElement('div', 'fb-meta fb-size', isDir ? '—' : (formatBytes(entry.size) || '—'));
     const modified = createElement('div', 'fb-meta fb-modified', formatTimestamp(entry.modified));
     const actions = createElement('div', 'fb-actions');
 
-    row.append(icon, name, size, modified, actions);
+    row.append(check, thumb, name, size, modified, actions);
     return row;
 }
 
@@ -1309,9 +1336,9 @@ function handleBreadcrumbClick(event) {
 // Helpers
 // ---------------------------------------------------------------------------
 //
-// Small local copies instead of imports from util/format.js: that module
-// formats for the local file system (fileIcon() knows about local previews)
-// and the remote side only needs these two.
+// formatBytes comes from util/format.js — one formatter for both panes, see the
+// import above. formatTimestamp stays local: remotes are inconsistent about the
+// unit (seconds, milliseconds, ISO) where the local backend is not.
 
 function createElement(tag, className, text) {
     const element = document.createElement(tag);
@@ -1358,25 +1385,6 @@ function segmentsFor(path) {
     });
 
     return segments;
-}
-
-function formatBytes(bytes) {
-    const value = Number(bytes);
-    if (!Number.isFinite(value) || value < 0) {
-        return '';
-    }
-    if (value < 1024) {
-        return value + ' B';
-    }
-
-    const units = ['KB', 'MB', 'GB', 'TB'];
-    let size = value / 1024;
-    let unit = 0;
-    while (size >= 1024 && unit < units.length - 1) {
-        size /= 1024;
-        unit++;
-    }
-    return size.toFixed(1) + ' ' + units[unit];
 }
 
 // Seconds or milliseconds since the epoch, or an ISO string — remotes are not

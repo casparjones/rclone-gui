@@ -424,16 +424,74 @@ Dasselbe Skript funktioniert auch auf dem Host für den Entwicklungsbetrieb.
 
 #### Ports
 
-| Port | Gemappt | Bedeutung |
-|---|---|---|
-| 8080 | ja | Web-UI |
-| 874 | ja | rsync über TLS, von stunnel terminiert (siehe „TLS-Terminierung auf Port 874") |
-| 873 | **nein** | rsync-Daemon, bleibt containerintern |
+| Port | Gemappt | Richtung | Bedeutung |
+|---|---|---|---|
+| 8080 | ja | eingehend | Web-UI / OAuth (im Betrieb hinter einem Reverse Proxy auf 443) |
+| 874 | ja | eingehend | rsync über TLS, von stunnel terminiert (siehe „TLS-Terminierung auf Port 874") |
+| 873 | **nein** | **nur localhost** | rsync-Daemon, gehärteter Modus — bleibt containerintern |
+| 8873 | **nein** | **nur localhost** | derselbe Daemon im **rootlosen** Modus, siehe „Härtungsmodi" |
 
-Port 873 wird bewusst **nicht** nach aussen gemappt: der rsync-Daemon spricht
-unverschlüsselt und ohne TLS-Peer-Prüfung. Erreichbar ist er ausschliesslich über
-die TLS-Terminierung auf 874. Wer 873 in `docker-compose.yml` ergänzt, hebt den
-Schutz auf.
+Der Daemon-Port wird bewusst **nicht** nach aussen gemappt: der rsync-Daemon spricht
+unverschlüsselt, authentifiziert allein über MD5-Challenge-Response und ohne
+TLS-Peer-Prüfung. Erreichbar ist er ausschliesslich über die TLS-Terminierung auf 874.
+Wer 873 **oder** 8873 in `docker-compose.yml` ergänzt, hebt den Schutz auf.
+
+Dass er von aussen nicht erreichbar ist, ist **kein Ratschlag, sondern eine Zusage** — und
+sie hängt an drei voneinander unabhängigen Riegeln (`address = 127.0.0.1` plus eine
+dparam-Prüfung vor dem Start, ein `/proc/net/tcp`-Verdikt nach dem Start, und ein Abbruch
+von `config/rsync-tls.sh` bei einem Backend, das nicht Loopback ist). Einzelheiten und
+Messwerte: `docs/rsync-transport.md`, Abschnitt „Netzwerk-Voraussetzungen".
+
+#### Härtungsmodi: Port 873 oder Port 8873
+
+**Der Daemon-Port ist nicht fest** — eine ältere Fassung dieses README behauptete das, und
+wer ihr folgte, richtete die TLS-Terminierung auf den falschen Port. Er hängt daran, ob
+der Daemon sich härten kann:
+
+| Modus | Erkennung | Port | `use chroot` | `uid`/`gid` |
+|---|---|---|---|---|
+| gehärtet (`Hardening::Full`) | euid 0 **oder** Datei-Capability `cap_sys_chroot` auf dem rsync-Binary | 873 | ja | ja |
+| rootlos (`Hardening::Rootless`) | keins von beidem | **8873** | nein | nein |
+
+**Der ausgelieferte Container ist der gehärtete Fall** — obwohl er als `appuser` (uid 1001)
+läuft, denn `setcap cap_sys_chroot,cap_setgid=ep /usr/bin/rsync` im `Dockerfile` gibt dem
+Binary die beiden Capabilities. Genau deshalb fragt die Erkennung **nicht** nur
+`geteuid() == 0`: eine reine euid-Prüfung hätte den Container als rootlos eingestuft und
+die chroot-Härtung **stillschweigend** abgeschaltet. Gefragt werden euid (aus
+`/proc/self/status`) **oder** die Capability (über `getcap`), und jede unbeantwortbare
+Frage zählt als „nicht privilegiert" — der Daemon kommt dann rootlos hoch und **sagt es**,
+statt chroot zu versprechen und darin zu sterben.
+
+**Rootlos kostet echte Absicherung**, und das steht beim Start als Warnung auf stderr und
+im Log: kein chroot (die Modulgrenze hängt dann allein an rsyncs eigener Pfadprüfung —
+eine fehlende *zweite* Schicht, nicht eine fehlende erste), kein `uid`/`gid`-Wechsel (jedes
+Modul wird als der Nutzer bedient, der die Anwendung gestartet hat). Der Modus ist für die
+**Host-Entwicklung** gedacht, nicht für den Betrieb.
+
+Gebraucht wird er, weil auf einem gewöhnlichen Host `/etc/rsyncd` nicht beschreibbar ist
+(`Permission denied (os error 13)`) und Port 873 nicht bindbar
+(`net.ipv4.ip_unprivileged_port_start = 1024`) — es fehlt dort **kein** Binary, sondern der
+Port.
+
+| Variable | Bedeutung |
+|---|---|
+| `RCLONE_GUI_RSYNCD_PORT` | überschreibt den Port in **beiden** Modi. App und `config/rsync-tls.sh` lesen dieselbe Variable, es wird also nur eine Seite gesetzt. |
+| `RCLONE_GUI_RSYNCD_DIR` | Verzeichnis für `rsyncd.conf`, `secrets/` und `run/`. Standard: `/etc/rsyncd` gehärtet, `<cwd>/data/rsyncd` rootlos. |
+
+> **`RCLONE_GUI_RSYNCD_DIR` muss ein absoluter Pfad sein.** rsync löst `secrets file`
+> selbst auf, und sein Arbeitsverzeichnis ist nicht das der Anwendung. Ein relativer Wert
+> bringt den Daemon nicht hoch — gemessen:
+>
+> ```
+> RCLONE_GUI_RSYNCD_DIR=relconf
+>   ❌ the rsync daemon did not start: … relconf/secrets/rsyncd.secrets
+>      must be an absolute path
+> ```
+>
+> Der Server läuft dann ohne rsync-Transport weiter; die Ursache steht auf der Konsole und
+> unter `GET /api/rsyncd/status`. Also **`RCLONE_GUI_RSYNCD_DIR=$PWD/data/rsyncd`**, nicht
+> `data/rsyncd`. Absolut gemacht wird nur der *eingebaute Standardwert*, ein ausdrücklich
+> gesetzter Wert wird unverändert übernommen.
 
 #### Isolation des Daemons: `use chroot` ohne root
 
@@ -523,10 +581,11 @@ einsammeln, danach stunnel. Gemessen am ausgelieferten Image:
 
 #### TLS-Terminierung auf Port 874
 
-Der rsync-Daemon selbst spricht Klartext und bindet nur auf `127.0.0.1:873`. Von
-aussen erreichbar ist er ausschliesslich über **stunnel**, das auf Port 874 TLS
-terminiert und containerintern nach `127.0.0.1:873` weiterreicht — das Rezept aus
-`man rsyncd.conf`, Abschnitt *SSL/TLS Daemon Setup*:
+Der rsync-Daemon selbst spricht Klartext und bindet nur auf `127.0.0.1` — im Container auf
+Port 873, rootlos auf 8873 (siehe „Härtungsmodi"). Von aussen erreichbar ist er
+ausschliesslich über **stunnel**, das auf Port 874 TLS terminiert und containerintern auf
+denselben Loopback-Port weiterreicht — das Rezept aus `man rsyncd.conf`, Abschnitt
+*SSL/TLS Daemon Setup*:
 
 ```
 Peer --TLS--> stunnel 0.0.0.0:874 --Klartext--> rsyncd 127.0.0.1:873
@@ -541,7 +600,7 @@ Eingerichtet wird das beim Containerstart von `start.sh` über
 |---|---|---|
 | `RCLONE_GUI_RSYNC_TLS` | `1` | `0` schaltet die Terminierung ab. Dann ist der Daemon von aussen gar nicht erreichbar — einen Klartextweg gibt es nicht. |
 | `RCLONE_GUI_RSYNC_TLS_PORT` | `874` | Port, auf dem terminiert wird |
-| `RCLONE_GUI_RSYNC_BACKEND` | `127.0.0.1:873` | Backend dahinter |
+| `RCLONE_GUI_RSYNC_BACKEND` | `127.0.0.1:873`, rootlos `127.0.0.1:8873` | Backend dahinter. `config/rsync-tls.sh` rechnet den Standardwert mit derselben Regel aus wie die App (`rsyncd_default_port()`) und **bricht ab**, wenn der Wert nicht Loopback ist — `127.0.0.1.evil.com:873` wird abgewiesen. |
 | `RCLONE_GUI_PEER_HOSTNAME` | aus `RCLONE_GUI_PUBLIC_BASE_URL`, sonst `hostname` | Name(n) im Zertifikat, komma-getrennt |
 | `RCLONE_GUI_TLS_CERT` / `_KEY` | leer | eigenes Zertifikat statt der internen CA |
 
@@ -660,7 +719,47 @@ Gegenstelle auf einem anderen Host läuft.
 RCLONE_GUI_PUBLIC_BASE_URL=https://rclone.example.org
 ```
 
-#### Zwei Instanzen koppeln
+#### Zwei Instanzen verbinden
+
+##### Was offen sein muss — und was nicht
+
+**Es gibt nur einen Modus: TLS.** Ein unverschlüsselter Direktmodus auf 873 war im
+Entwurf vorgesehen und ist **gestrichen** (Entscheidung E2, `docs/rsync-transport.md`) —
+die App kennt nur `address = 127.0.0.1` und hat keinen Zweig, der etwas anderes rendern
+könnte. Die Empfehlung ist damit keine Wahl, sondern die einzige Bauweise.
+
+| Zweck | Port | Richtung | Nötig wann |
+|---|---|---|---|
+| Web-UI / OAuth | 443, bzw. der konfigurierte Port (Compose-Standard 8080) | eingehend | immer |
+| rsync über TLS | 874 (`RCLONE_GUI_RSYNC_TLS_PORT`) | eingehend | immer |
+| Daemon-Backend | 873, rootlos **8873** (`RCLONE_GUI_RSYNCD_PORT`) | **nur localhost** | nie nach aussen |
+
+Dazu zwei Namen, die stimmen müssen, sonst schlägt die Kopplung mit einer Meldung fehl,
+die nach etwas anderem aussieht:
+
+* `RCLONE_GUI_PUBLIC_BASE_URL` — die von aussen erreichbare Adresse dieser Instanz. Ziel
+  der OAuth-Redirects und Pairing-Links; `http://localhost:8080` funktioniert nur, solange
+  beide Instanzen auf demselben Host laufen.
+* `RCLONE_GUI_PEER_HOSTNAME` — muss **exakt** der Name sein, unter dem die Gegenstelle
+  diese Instanz anspricht. `rsync-ssl` prüft ihn gegen den SAN; eine IP genügt nur, wenn
+  sie als `IP:`-SAN im Zertifikat steht.
+
+**Ein Reverse Proxy vor 874 muss durchreichen, nicht terminieren** (nginx `stream` ohne
+`ssl`, haproxy `mode tcp`, kein `proxy_protocol`). Das TLS auf 874 gehört stunnel mit dem
+Zertifikat dieser Instanz, und die Gegenstelle prüft es gegen die beim Pairing erhaltene
+CA — ein Proxy, der selbst terminiert, zeigt das falsche Zertifikat. Lauffähige
+Beispielblöcke für nginx, haproxy, ufw und firewalld: `docs/rsync-transport.md`, Abschnitt
+„Netzwerk-Voraussetzungen".
+
+Firewall, kurz:
+
+```bash
+sudo ufw allow 874/tcp comment 'rclone-gui rsync ueber TLS'
+sudo ufw deny  873/tcp   # rsync-Daemon: niemals von aussen
+sudo ufw deny  8873/tcp  # derselbe Daemon rootlos
+```
+
+##### Aufsetzen
 
 Auf beiden Seiten:
 
@@ -674,8 +773,36 @@ docker compose logs -f rclone-gui   # Versionen und Startup-Check prüfen
 ```
 
 Nach oben genanntem Lauf steht auf beiden Seiten: Web-UI auf 8080, Port 874 nach
-aussen offen, 873 nur intern, Share-Root unter `./shares`, und ein leeres,
+aussen offen, der Daemon-Port nur intern, Share-Root unter `./shares`, und ein leeres,
 persistentes `./rsyncd` für Konfiguration, Secrets und Zertifikate.
+
+##### Gegenprobe von aussen
+
+Von der **Gegenseite** aus, nicht vom eigenen Host — von dort ist Loopback immer
+erreichbar und die Antwort damit wertlos:
+
+```bash
+# 874 muss antworten und ein Zertifikat zeigen, dem die Pairing-CA traut:
+openssl s_client -connect <peer>:874 -servername <peer> \
+  -verify_hostname <peer> -CAfile ca.crt -verify_return_error </dev/null
+#   -> "Verify return code: 0 (ok)"
+
+# 873 und 8873 muessen verweigert werden oder ins Timeout laufen.
+# Eine Antwort ist ein Fehler, kein Feinschliff.
+for p in 873 8873; do timeout 5 bash -c "echo | nc -v <peer> $p"; done
+```
+
+| Befund | Nächster Schritt |
+|---|---|
+| 874 verweigert | Port-Mapping (`docker compose ps`), dann Firewall, dann Port-Forwarding am Router |
+| 874 antwortet, `certificate verify failed` | Ein Proxy terminiert TLS selbst — auf Passthrough umstellen |
+| 874 antwortet, `hostname mismatch` | `RCLONE_GUI_PEER_HOSTNAME` ist nicht der Name, den die Gegenstelle benutzt |
+| **873 oder 8873 antwortet** | Port-Mapping bzw. Firewall-Regel entfernen, dann `GET /api/rsyncd/status` prüfen |
+| Basis-URL nicht erreichbar | `RCLONE_GUI_PUBLIC_BASE_URL` steht auf `localhost`, oder der Reverse Proxy vor der UI fehlt |
+
+Ein **Selbsttest in der Anwendung** und eine Netzwerk-Übersichtsseite in der
+Configuration sind noch offen (Ticket `24d7ad41`); bis dahin ist die Tabelle oben der
+Weg von Hand.
 
 Die **TLS-Terminierung auf 874 ist damit vollständig eingerichtet**: stunnel
 lauscht nach `docker compose up` auf `0.0.0.0:874`, stellt CA und
@@ -687,7 +814,7 @@ Transfer über 874 mit identischer Prüfsumme). Einzelheiten im Abschnitt
 > **Was noch fehlt: die Modulregistrierung.** Der rsync-Daemon selbst *wird*
 > gestartet — allerdings nur mit `RCLONE_GUI_RSYNCD=1`, und seine Modulliste ist
 > beim Start leer, weil es noch keine gespeicherten Pairings gibt. Der Daemon
-> läuft dann zwar (auf `127.0.0.1:873`, hinter stunnel) und ist über 874
+> läuft dann zwar (auf `127.0.0.1:873` im Container, hinter stunnel) und ist über 874
 > erreichbar, hat aber kein Modul, das eine Gegenstelle ansprechen könnte. Bis
 > das Ticket zur Pairing-Speicherung durch ist, endet die Kopplung also hier:
 > Infrastruktur, TLS und Daemon stehen, die eigentliche Freigabe fehlt.

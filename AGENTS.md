@@ -396,6 +396,35 @@ Token trägt, geht durch (steht als Test `known_gap_…` ausdrücklich drin). Eb
 ungeprüft bleiben `Display`, `Serialize` und Panic-Meldungen. **Der Test ist eine
 Bremse, keine Garantie.**
 
+> ⚠️ **Und er ist blind für eine Form, zu der dieser Abschnitt dich gleich unten selbst
+> schickt.** Ein Tester hat es gemessen:
+>
+> ```rust
+> #[derive(Debug)] pub struct ApiTokenT1(pub String);   // Wächter: 13/13 grün
+> ```
+>
+> Eine **Tupel-Struct hat keinen Feldnamen** — der namensbasierte Scanner sieht nichts,
+> und der Parser-Selbsttest schweigt ebenfalls, weil er Typ**zahlen** vergleicht, nicht
+> Feldabdeckung. Gemessen druckt sie `ApiTokenT1("s3cr3t-live-token")`.
+>
+> Das ist tückisch, weil Antwort 2 unten dir **genau diese Gestalt** empfiehlt. Wer dem
+> Rat folgt und das `derive` stehen lässt, baut die blinde Stelle. **Ein redigierender
+> Newtype heisst: `derive(Debug)` weg, `Debug` von Hand** — sonst hast du das Geheimnis
+> nur umverpackt.
+>
+> Zweiter blinder Fleck derselben Klasse: ein von **rustfmt selbst** auf die nächste
+> Zeile umgebrochener Feldtyp.
+>
+> **Beide sind inzwischen geschlossen.** Der Wächter beurteilt Tupel-Structs jetzt am
+> **Typnamen** (gegen eine bewusst kürzere Liste, damit `auth`/`session`/`url` in
+> Typnamen keine Fehlalarme erzeugen), fasst Fortsetzungszeilen zusammen, und deckt
+> **Tupelvarianten von Enums** mit ab — dieselbe Klasse eine Ebene tiefer, die sofort
+> einen echten Treffer erzeugte.
+>
+> Das Kriterium bleibt: verdächtiger Name **und abgeleitetes** `Debug`. `SessionToken`,
+> `ResetToken`, `ShareToken`, `ModuleSecret` werden also **nicht** gemeldet — sie haben
+> `Debug` von Hand. Trotzdem gilt weiter: **ein Newtype heisst `derive(Debug)` weg.**
+
 Wenn er anspringt, gibt es genau drei richtige Antworten:
 
 1. `Debug` **von Hand** implementieren und den Wert **redigieren, nicht entfernen** —

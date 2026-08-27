@@ -11,6 +11,7 @@ use clap::Parser;
 use dotenvy::{dotenv, from_filename_override};
 use std::env;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
@@ -847,9 +848,42 @@ async fn start_rsync_daemon() -> RsyncdState {
         return RsyncdState::Disabled;
     }
 
+    // How much hardening this machine can give the daemon. Detected once, here,
+    // and handed to the registry *and* the settings together — the chroot and
+    // the uid/gid live in the generated configuration, the port lives in the
+    // settings, and a half-applied mode means a daemon on a port nothing
+    // connects to. See `handlers::rsyncd::Hardening` for what is asked and why
+    // it is not a switch.
+    let hardening = handlers::rsyncd::Hardening::detect(std::path::Path::new(
+        handlers::rsyncd::DEFAULT_RSYNC_BINARY,
+    ));
+
     // The layout the image creates (see the Dockerfile): /etc/rsyncd for the
     // configuration, /etc/rsyncd/secrets (mode 700) for the secrets file.
-    let base = env::var("RCLONE_GUI_RSYNCD_DIR").unwrap_or_else(|_| "/etc/rsyncd".to_string());
+    //
+    // Rootless it has to be somewhere the invoking user can write, and that is
+    // the application's own data directory — next to `tasks.db`, `cfg/` and
+    // `log/`. `/etc/rsyncd` was the whole of ticket 50c8ec48's first symptom:
+    // `cannot create the daemon run directory /etc/rsyncd/run: Permission
+    // denied (os error 13)`. An explicit `RCLONE_GUI_RSYNCD_DIR` still wins in
+    // either mode.
+    //
+    // Absolute, and not as a matter of taste: `DaemonConfig::write` refuses a
+    // relative secrets path, because the daemon resolves `secrets file` itself
+    // and its working directory is not ours. A bare `data/rsyncd` therefore
+    // came up as `data/rsyncd/secrets/rsyncd.secrets must be an absolute path`
+    // — measured, and the reason this is not simply a string literal.
+    let default_base = match hardening {
+        handlers::rsyncd::Hardening::Full => PathBuf::from("/etc/rsyncd"),
+        handlers::rsyncd::Hardening::Rootless => env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("data")
+            .join("rsyncd"),
+    };
+    let base = env::var("RCLONE_GUI_RSYNCD_DIR")
+        .map(PathBuf::from)
+        .unwrap_or(default_base);
+    let base = base.display();
     let conf = format!("{base}/rsyncd.conf");
     let secrets = format!("{base}/secrets/rsyncd.secrets");
     let run_dir = format!("{base}/run");
@@ -857,11 +891,26 @@ async fn start_rsync_daemon() -> RsyncdState {
     println!("🔗 Starting the rsync daemon:");
     println!("   📄 Configuration: {}", conf);
     println!("   📂 Run directory: {}", run_dir);
+    println!("   🔌 Port: {}", hardening.port());
+    // Never silent: without a chroot and without the uid/gid drop the module
+    // boundary rests on rsync's own path check alone, and an operator who is
+    // not told that cannot weigh it. The lines come from `Hardening::warnings`
+    // so that a test can assert what is said.
+    for warning in hardening.warnings() {
+        eprintln!("   ⚠️  {warning}");
+        tracing::warn!("{warning}");
+    }
+    if hardening == handlers::rsyncd::Hardening::Rootless {
+        eprintln!(
+            "      point the TLS terminator at it: RCLONE_GUI_RSYNC_BACKEND=127.0.0.1:{}",
+            hardening.port()
+        );
+    }
 
     let registry = Arc::new(tokio::sync::Mutex::new(
-        handlers::rsyncd::ModuleRegistry::new(&conf, &secrets),
+        handlers::rsyncd::ModuleRegistry::new(&conf, &secrets).with_hardening(hardening),
     ));
-    let settings = handlers::rsyncd::DaemonSettings::new(&conf, &run_dir);
+    let settings = handlers::rsyncd::DaemonSettings::new(&conf, &run_dir).with_hardening(hardening);
 
     match handlers::rsyncd::DaemonHandle::start(settings, registry).await {
         Ok(handle) => {

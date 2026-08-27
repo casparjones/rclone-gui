@@ -228,7 +228,7 @@ function updateSelectionBar() {
 
     // Folder sizes are not part of a listing (rclone lsjson does not walk into
     // them), so they are named instead of silently counted as zero.
-    const total = formatBytes(bytes) || '0 Bytes';
+    const total = formatBytes(bytes) || '0 B';
     sizeLabel.textContent = folders === 0
         ? total
         : `${total} in ${files} file${files === 1 ? '' : 's'} · ${folders} folder${folders === 1 ? '' : 's'} (size unknown)`;

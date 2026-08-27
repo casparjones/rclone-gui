@@ -185,14 +185,32 @@
             display: block;
         }
         /* The column width comes from --ws-left, which syncmode.js writes as an
-           inline custom property (a continuous value has no utility class). */
+           inline custom property (a continuous value has no utility class).
+           The fallback is 50%: both panes show the same rows with the same
+           columns, so an unequal default made the right one cut names earlier
+           for no reason (67b61d0d). It has to stay in step with
+           state.splitRatio in static/js/state.js, which is what is actually
+           written once the script runs. */
         .ws.is-split {
             display: grid;
-            grid-template-columns: var(--ws-left, 55%) 0.75rem minmax(0, 1fr);
+            /* Half the divider comes off each side, so --ws-left: 50% really
+               gives both panes the same width. Without the subtraction the
+               left pane got the full 50% and the right one 50% minus the
+               divider — twelve pixels less name for the same rows. It also
+               puts the divider's centre exactly where the pointer is during a
+               drag, which is what the drag math in syncmode.js assumes. */
+            grid-template-columns: calc(var(--ws-left, 50%) - 0.375rem) 0.75rem minmax(0, 1fr);
             align-items: start;
         }
         .ws-pane {
             min-width: 0;
+            /* Query container for the file browser columns. The rows have to
+               react to the width of *this pane*, not of the window: once the
+               split can be dragged, the window says nothing about how much
+               room a row has. Both panes carry .ws-pane, so left and right ask
+               the same question and get the same answer. See the @container
+               block next to .fb-row below (dd323829). */
+            container: fbpane / inline-size;
         }
         .ws-divider,
         .ws-pane-remote {
@@ -436,6 +454,95 @@
             outline: 2px solid currentColor;
             outline-offset: -2px;
         }
+        /* The columns follow the pane, not the window ------------------------
+           In split mode each pane is half as wide, and the fixed columns
+           (7rem size, 11rem date, 5rem actions plus five 0.75rem gaps and the
+           row padding) ate the name: 62px left at a 1400px window, 22px at
+           1200px, and below ~1000px the row scrolled sideways (dd323829).
+
+           Why a container query and not a media query: the question is how
+           wide *this pane* is. With a draggable split the window width does not
+           answer it — at 1600px a pane dragged to 20% is narrower than the
+           whole window at 640px. @container asks the pane directly, so the
+           same rule serves single mode, split mode and every drag position,
+           and left and right stay identical by construction.
+
+           Two things this deliberately does NOT do:
+           * No `.ws.is-split .fb-row` rule. At 0-3-0 it would beat
+             `.fb-mode-icon .fb-row` (0-2-0) and turn the tiles back into grid
+             rows — the trap 67b61d0d walked around. The rules below stay at
+             0-1-0, exactly like the base rule, so every `.fb-mode-*` override
+             still wins.
+           * No tier that changes only the template. Each one also states the
+             display of both meta columns. A template with six tracks while
+             another rule hides a cell is what left head and rows shifted
+             against each other at the 640/641 boundary once before.
+
+           Ordered wide → narrow so the narrowest match wins, and placed
+           *before* the 640px media query below: on a phone the window rule
+           keeps the last word.
+
+           Container queries are Chrome 105+/Safari 16+/Firefox 110+. An older
+           browser ignores the block and gets today's behaviour, which is the
+           bug but not a regression. Tailwind does not interfere: this lives in
+           the static <style> block, not in generated utilities. */
+        @container fbpane (max-width: 60rem) {
+            .fb-head,
+            .fb-row {
+                grid-template-columns: 1.5rem 2rem minmax(0, 1fr) 4.5rem 8rem 4.5rem;
+                gap: 0.5rem;
+            }
+            .fb-size,
+            .fb-modified {
+                display: block;
+            }
+        }
+        /* Below this the date has to go: at 11rem, then 8rem, it is the largest
+           single item, and the name is what the user reads. */
+        @container fbpane (max-width: 36rem) {
+            .fb-head,
+            .fb-row {
+                grid-template-columns: 1.5rem 2rem minmax(0, 1fr) 4.5rem 4.5rem;
+                gap: 0.5rem;
+            }
+            .fb-size {
+                display: block;
+            }
+            .fb-modified {
+                display: none;
+            }
+        }
+        /* A pane dragged towards its 20% minimum. Same four columns the 640px
+           window rule below uses, so the two never disagree, plus a tighter
+           checkbox, icon, gap and padding — every one of those is width the
+           name does not get.
+
+           The name stays minmax(0, 1fr) and gets no minimum width on purpose.
+           A floor was tried and dropped: below about a 210px pane the fixed
+           columns alone are wider than the row, so a floor makes the row
+           overflow — and the header sits in a different scroll container
+           (.overflow-x-auto) than the rows (#file-list, whose overflow-y turns
+           its overflow-x into a scroller), so the two would drift apart as soon
+           as anyone scrolled. Alignment beats four more pixels of name.
+
+           What this leaves standing: dragged to the 20% minimum in a 1000px
+           window the pane is ~190px and the name reaches zero again. The per
+           row actions (download, sync) are kept instead — hiding them would be
+           a loss of function at a width the user chose by hand, and the default
+           50/50 split measures clean down to a 480px window. */
+        @container fbpane (max-width: 26rem) {
+            .fb-head,
+            .fb-row {
+                grid-template-columns: 1.25rem 1.5rem minmax(0, 1fr) 4.25rem;
+                gap: 0.375rem;
+                padding: 0.5rem 0.375rem;
+            }
+            .fb-size,
+            .fb-modified {
+                display: none;
+            }
+        }
+
         /* Narrow screens: hide size and date columns, keep name and actions. */
         @media (max-width: 640px) {
             .fb-head,

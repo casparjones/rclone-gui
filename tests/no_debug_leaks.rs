@@ -21,6 +21,21 @@
 //! veraltet, und eine veraltete Ausnahmeliste ist die nächste Entwarnung, die
 //! falsch war.
 //!
+//! Erfasste Formen: benannte Felder (auch in Enum-Struct-Varianten), `pub(crate)`
+//! und Generics, mehrzeilige `derive`-Listen, **von `rustfmt` nach dem
+//! Doppelpunkt umgebrochene Feldtypen** und — ohne Feldnamen, deshalb am Typ-
+//! bzw. Variantennamen beurteilt — **Tupel-Structs** (`struct ApiToken(String);`)
+//! und **Tupelvarianten** (`Token(String)`).
+//!
+//! Die letzten drei Formen fehlten in der ersten Fassung, und ein Tester hat mit
+//! zwei `rustfmt`-stabilen Sonden gezeigt, dass der Wächter dabei schwieg. Das
+//! Tupel-Struct war der unangenehmere Fall: `AGENTS.md` schickt Entwickler
+//! ausdrücklich zu einem redigierenden Newtype — wer dem folgt und das
+//! `derive(Debug)` stehen lässt, baut genau die Gestalt, die die Absicherung
+//! nicht erkannte. Deshalb prüft [`the_parser_reaches_every_field`] jetzt die
+//! **Feldabdeckung** und nicht nur, ob jeder Typ gefunden wurde: das schließt die
+//! Klasse und nicht nur die zwei bekannten Fälle.
+//!
 //! # Was er *nicht* leistet
 //!
 //! Er kennt **nur Namen**. Ein Feld `payload: String`, das ein Token trägt, geht
@@ -58,6 +73,31 @@ const SUSPICIOUS: &[&str] = &[
     "uri",
 ];
 
+/// Wortstämme, die im **Typnamen** eines Tupel-Structs oder im Namen einer
+/// Tupelvariante auf ein Geheimnis hindeuten.
+///
+/// Warum eine zweite Liste: ein Tupel-Struct (`struct ApiToken(String);`) hat
+/// **keinen Feldnamen** — die Wortstammliste für Felder greift dort nie, und
+/// genau diese Form entsteht, wenn jemand dem Rat in `AGENTS.md` folgt und ein
+/// Geheimnis in einen Newtype steckt, das `derive(Debug)` aber stehen lässt.
+///
+/// Absichtlich kürzer als [`SUSPICIOUS`]: `auth`, `session`, `url` und `uri`
+/// fehlen, weil sie in *Typnamen* massenhaft harmlos vorkommen (`AuthLayer`,
+/// `SessionConfig`, `ParsedUrl`). Ein Wächter, der bei jedem zweiten Newtype
+/// anspringt, wird abgeschaltet — und dann ist er schlechter als keiner.
+/// `SessionToken` und `ResetToken` sind über `token` weiterhin erfasst.
+const SUSPICIOUS_TYPE_NAMES: &[&str] = &[
+    "bearer",
+    "cookie",
+    "credential",
+    "hash",
+    "key",
+    "pass",
+    "secret",
+    "signature",
+    "token",
+];
+
 /// Typen, die ihr `Debug` selbst redigieren und deshalb in einem abgeleiteten
 /// `Debug` gefahrlos auftauchen dürfen. Wer hier etwas einträgt, muss belegen,
 /// dass der Typ `Debug` **von Hand** implementiert und den Wert maskiert.
@@ -92,6 +132,15 @@ const ACKNOWLEDGED: &[Ack] = &[
         pending: false,
         why: "Der *Name* des Cookies, nicht sein Wert. Ist ohnehin öffentlich, \
               er steht in jedem `Set-Cookie`.",
+    },
+    Ack {
+        key: "src/handlers/auth.rs::PasswordResetOutcome::WeakPassword(..)",
+        pending: false,
+        why: "Tupelvariante, beurteilt am Variantennamen (`pass`) — es gibt \
+              keinen Feldnamen. Sie traegt `PasswordPolicyError` \
+              (auth.rs:236), also `TooShort { min }` / `TooLong { max }` / \
+              `Blank` / `TooCommon`: Grenzwerte und ein Grund, nie das \
+              Passwort selbst.",
     },
     Ack {
         key: "src/handlers/auth_web.rs::CurrentUser::session",
@@ -221,11 +270,44 @@ struct Finding {
     hit: String,
 }
 
-/// Ein Typ mit abgeleitetem `Debug` und den Feldern, die dazu gefunden wurden.
+/// Woran ein Platz beurteilt wird, an dem ein Wert liegt.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Judge {
+    /// Benanntes Feld: der Feldname gegen [`SUSPICIOUS`].
+    ByFieldName,
+    /// Tupelelement oder Tupelvariante: es gibt **keinen** Feldnamen, also
+    /// bleibt nur der Typ- bzw. Variantenname, gegen [`SUSPICIOUS_TYPE_NAMES`].
+    ByTypeName,
+}
+
+/// Ein Platz, an dem in einem Typ mit abgeleitetem `Debug` ein Wert liegt.
+struct Slot {
+    /// Was hinter `Typ::` im Schlüssel steht — der Feldname, `<tuple>` bei
+    /// einem Tupel-Struct oder `Variante(..)` bei einer Tupelvariante.
+    key_suffix: String,
+    /// Der Name, der auf einen Wortstamm geprüft wird.
+    judged_name: String,
+    /// Der Typtext des Werts (für [`is_redacting`]).
+    ty: String,
+    /// Zeile, 1-basiert.
+    line: usize,
+    judge: Judge,
+}
+
+/// Ein Typ mit abgeleitetem `Debug` und den Plätzen, die dazu gefunden wurden.
 struct DerivedDebugType {
     name: String,
-    /// `(feldname, typtext, zeile)`
-    fields: Vec<(String, String, usize)>,
+    slots: Vec<Slot>,
+    /// Der Körper ist ein `{ … }`-Block (Struct mit benannten Feldern, Enum).
+    has_brace_body: bool,
+    /// Zeilen im Körper, die **naiv** wie eine Felddeklaration aussehen —
+    /// unabhängig davon, ob der Parser daraus ein Feld gemacht hat. Grundlage
+    /// von [`the_parser_reaches_every_field`].
+    field_like_lines: usize,
+    /// Bei einem Tupel-Struct: der rohe Text zwischen den Klammern. Grundlage
+    /// der Zusicherung, dass ein Tupel-Struct nicht mit **null** Plätzen
+    /// durchgeht — das war die Form, die den Wächter stumm gelassen hat.
+    tuple_text: Option<String>,
 }
 
 /// Findet in einem Quelltext alle Typen mit abgeleitetem `Debug`.
@@ -286,9 +368,15 @@ fn scan_source(src: &str) -> Vec<DerivedDebugType> {
 
             if derives_debug(&attr) && j < lines.len() {
                 if let Some(name) = type_name(lines[j]) {
-                    let (fields, end) = collect_fields(&lines, j);
-                    out.push(DerivedDebugType { name, fields });
-                    i = end + 1;
+                    let body = collect_body(&lines, j, &name);
+                    out.push(DerivedDebugType {
+                        name,
+                        slots: body.slots,
+                        has_brace_body: body.has_brace_body,
+                        field_like_lines: body.field_like_lines,
+                        tuple_text: body.tuple_text,
+                    });
+                    i = body.end + 1;
                     continue;
                 }
             }
@@ -358,63 +446,305 @@ fn type_name(line: &str) -> Option<String> {
     None
 }
 
-/// Sammelt die Felder eines Typs ab der Deklarationszeile `decl`.
+/// Ergebnis von [`collect_body`].
+struct Body {
+    slots: Vec<Slot>,
+    has_brace_body: bool,
+    field_like_lines: usize,
+    tuple_text: Option<String>,
+    /// Zeile der schließenden Klammer bzw. des `;`.
+    end: usize,
+}
+
+/// Sammelt die Wertplätze eines Typs ab der Deklarationszeile `decl`.
 ///
-/// Deckt Structs (Tiefe 1) und Enums mit Struct-Varianten (Tiefe 2) ab.
-/// Gibt die Felder und die Zeile der schließenden Klammer zurück.
-fn collect_fields(lines: &[&str], decl: usize) -> (Vec<(String, String, usize)>, usize) {
-    let mut fields = Vec::new();
+/// Deckt ab:
+/// * Structs mit benannten Feldern (Tiefe 1) und Enums mit Struct-Varianten
+///   (Tiefe 2),
+/// * **Tupel-Structs** (`struct Foo(pub String);`) — dort gibt es keinen
+///   Feldnamen, also wird der Platz am Typnamen beurteilt,
+/// * **Tupelvarianten** eines Enums (`Token(String)`) — beurteilt am
+///   Variantennamen,
+/// * von `rustfmt` nach dem Doppelpunkt umgebrochene Feldtypen; die
+///   Fortsetzungszeile wird angehängt, bevor das Feld geparst wird.
+fn collect_body(lines: &[&str], decl: usize, type_name: &str) -> Body {
+    // Tupel-Struct: nach dem Typnamen (und etwaigen Generics) folgt `(`.
+    if let Some(open) = tuple_paren_start(lines[decl]) {
+        let (inner, end) = tuple_inner(lines, decl, open);
+        return Body {
+            slots: tuple_slots(&inner, decl, type_name),
+            has_brace_body: false,
+            field_like_lines: 0,
+            tuple_text: Some(inner),
+            end,
+        };
+    }
+
+    let mut slots = Vec::new();
+    let mut field_like_lines = 0usize;
+    let mut has_brace_body = false;
     let mut depth = 0i32;
     let mut i = decl;
 
     while i < lines.len() {
-        let line = lines[i];
         let before = depth;
+        // Fortsetzungszeilen anhängen: `rustfmt` bricht einen langen Feldtyp
+        // nach dem Doppelpunkt um, die Zeile endet dann mit `:`.
+        let mut last = i;
+        let logical = join_continuation(lines, i, &mut last);
 
         if before >= 1 {
-            if let Some((name, ty)) = field_decl(line) {
-                fields.push((name, ty, i + 1));
+            if split_field(&logical).is_some() {
+                field_like_lines += 1;
+            }
+            if let Some((name, ty)) = field_decl(&logical) {
+                slots.push(Slot {
+                    key_suffix: name.clone(),
+                    judged_name: name,
+                    ty,
+                    line: i + 1,
+                    judge: Judge::ByFieldName,
+                });
+            } else if let Some((variant, open)) = tuple_variant_start(lines[i]) {
+                // Tupelvariante eines Enums: `Token(String),`
+                let (inner, _end) = tuple_inner(lines, i, open);
+                for mut slot in tuple_slots(&inner, i, &variant) {
+                    slot.key_suffix = format!("{variant}(..)");
+                    slots.push(slot);
+                }
             }
         }
 
-        for c in line.chars() {
-            match c {
-                '{' => depth += 1,
-                '}' => depth -= 1,
-                _ => {}
+        for line in &lines[i..=last] {
+            for c in line.chars() {
+                match c {
+                    '{' => {
+                        depth += 1;
+                        has_brace_body = true;
+                    }
+                    '}' => depth -= 1,
+                    _ => {}
+                }
             }
         }
 
+        let line = lines[last];
         // Tuple-Struct oder Unit-Struct: endet mit `;` auf Tiefe 0.
-        if depth == 0 && i >= decl && line.trim_end().ends_with(';') && before == 0 {
-            return (fields, i);
+        if depth == 0 && last >= decl && line.trim_end().ends_with(';') && before == 0 {
+            return Body {
+                slots,
+                has_brace_body,
+                field_like_lines,
+                tuple_text: None,
+                end: last,
+            };
         }
-        if depth == 0 && i > decl {
-            return (fields, i);
+        if depth == 0 && last > decl {
+            return Body {
+                slots,
+                has_brace_body,
+                field_like_lines,
+                tuple_text: None,
+                end: last,
+            };
         }
-        if depth == 0 && i == decl && line.contains('{') && line.contains('}') {
-            return (fields, i);
+        if depth == 0 && last == decl && line.contains('{') && line.contains('}') {
+            return Body {
+                slots,
+                has_brace_body,
+                field_like_lines,
+                tuple_text: None,
+                end: last,
+            };
         }
-        i += 1;
+        i = last + 1;
     }
-    (fields, lines.len().saturating_sub(1))
+    Body {
+        slots,
+        has_brace_body,
+        field_like_lines,
+        tuple_text: None,
+        end: lines.len().saturating_sub(1),
+    }
 }
 
-/// Erkennt `[pub] name: Typ,` als Felddeklaration.
-fn field_decl(line: &str) -> Option<(String, String)> {
+/// Hängt Fortsetzungszeilen an, solange die logische Zeile mit `:` endet.
+///
+/// Das ist die Form, die `rustfmt` bei langen Feldtypen **selbst erzeugt**:
+/// ```text
+///     pub session_token_cache_for_every_peer:
+///         HashMap<String, Arc<Mutex<Vec<String>>>>,
+/// ```
+/// Ohne das Zusammenfügen sieht [`field_decl`] einen leeren Typ und gibt
+/// `None` zurück — das Feld existierte für den Wächter nicht. Kommentare und
+/// Attribute werden nicht angefasst: ein Kommentar, der auf `:` endet, würde
+/// sonst die darunterliegende Felddeklaration verschlucken.
+fn join_continuation(lines: &[&str], start: usize, last: &mut usize) -> String {
+    let mut out = lines[start].to_string();
+    *last = start;
+    let t = out.trim();
+    if t.starts_with("//") || t.starts_with("#[") || t.starts_with('*') {
+        return out;
+    }
+    // Höchstens drei Fortsetzungszeilen — mehr ist kein rustfmt-Umbruch mehr.
+    for _ in 0..3 {
+        if !out.trim_end().ends_with(':') || out.trim_end().ends_with("::") {
+            break;
+        }
+        let next = *last + 1;
+        if next >= lines.len() {
+            break;
+        }
+        out.push(' ');
+        out.push_str(lines[next].trim());
+        *last = next;
+    }
+    out
+}
+
+/// Beginnt in dieser Deklarationszeile ein Tupel-Struct? Gibt den Byte-Index
+/// der öffnenden Klammer zurück.
+fn tuple_paren_start(line: &str) -> Option<usize> {
+    let name = type_name(line)?;
+    let t = line;
+    let name_at = t.find(&name)?;
+    let mut angle = 0i32;
+    for (idx, c) in t[name_at + name.len()..].char_indices() {
+        match c {
+            '<' => angle += 1,
+            '>' => angle -= 1,
+            '(' if angle <= 0 => return Some(name_at + name.len() + idx),
+            '{' | ';' if angle <= 0 => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Beginnt in dieser Zeile eine Tupelvariante eines Enums (`Token(String),`)?
+/// Gibt Variantennamen und den Byte-Index der öffnenden Klammer zurück.
+fn tuple_variant_start(line: &str) -> Option<(String, usize)> {
+    let t = line.trim_start();
+    if t.starts_with("//") || t.starts_with("#[") {
+        return None;
+    }
+    let indent = line.len() - t.len();
+    let name: String = t
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || *c == '_')
+        .collect();
+    if name.is_empty() || !name.starts_with(|c: char| c.is_ascii_uppercase()) {
+        return None;
+    }
+    let rest = &t[name.len()..];
+    if !rest.starts_with('(') {
+        return None;
+    }
+    let open = indent + name.len();
+    Some((name, open))
+}
+
+/// Liest den rohen Text zwischen den Klammern einer Tupelform.
+/// Gibt ihn und die Zeile der schließenden Klammer zurück.
+fn tuple_inner(lines: &[&str], decl: usize, open: usize) -> (String, usize) {
+    let mut inner = String::new();
+    let mut depth = 0i32;
+    let mut i = decl;
+    let mut done = false;
+    while i < lines.len() && !done {
+        let from = if i == decl { open } else { 0 };
+        for c in lines[i][from..].chars() {
+            match c {
+                '(' => {
+                    depth += 1;
+                    if depth == 1 {
+                        continue;
+                    }
+                }
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        done = true;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            if depth >= 1 {
+                inner.push(c);
+            }
+        }
+        if !done {
+            inner.push(' ');
+            i += 1;
+        }
+    }
+    (inner, i.min(lines.len().saturating_sub(1)))
+}
+
+/// Zerlegt den Klammertext einer Tupelform in Plätze.
+///
+/// `judged` ist der Name, an dem sie beurteilt werden — beim Tupel-Struct der
+/// Typname, bei einer Tupelvariante der Variantenname. Einen Feldnamen gibt es
+/// nicht, also ist das die einzige Angabe, die es überhaupt gibt.
+fn tuple_slots(inner: &str, decl: usize, judged: &str) -> Vec<Slot> {
+    let mut slots = Vec::new();
+    for (n, raw) in split_top_level(inner).into_iter().enumerate() {
+        let t = raw.trim();
+        let ty = t
+            .strip_prefix("pub(crate) ")
+            .unwrap_or_else(|| t.strip_prefix("pub ").unwrap_or(t))
+            .trim()
+            .to_string();
+        if ty.is_empty() {
+            continue;
+        }
+        slots.push(Slot {
+            key_suffix: format!("<tuple.{n}>"),
+            judged_name: judged.to_string(),
+            ty,
+            line: decl + 1,
+            judge: Judge::ByTypeName,
+        });
+    }
+    slots
+}
+
+/// Teilt an Kommas auf oberster Ebene (`<>`, `()`, `[]` werden respektiert).
+fn split_top_level(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (idx, c) in s.char_indices() {
+        match c {
+            '<' | '(' | '[' => depth += 1,
+            '>' | ')' | ']' => depth -= 1,
+            ',' if depth <= 0 => {
+                out.push(&s[start..idx]);
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&s[start..]);
+    out
+}
+
+/// Trennt `[pub] name: Typ,` in Name und Typtext — der Typ darf **leer** sein.
+///
+/// Das ist die naive Erkennung: sie sagt nur „diese Zeile sieht wie eine
+/// Felddeklaration aus". [`the_parser_reaches_every_field`] hält sie gegen
+/// [`field_decl`]; divergieren beide, hat der Parser ein Feld verloren.
+fn split_field(line: &str) -> Option<(String, String)> {
     let t = line.trim();
-    if t.starts_with("//") || t.starts_with("#[") || t.is_empty() {
+    if t.starts_with("//") || t.starts_with("#[") || t.starts_with('*') || t.is_empty() {
         return None;
     }
     let t = t.strip_prefix("pub(crate) ").unwrap_or(t);
     let t = t.strip_prefix("pub ").unwrap_or(t);
     let colon = t.find(':')?;
     let name = t[..colon].trim();
-    if name.is_empty()
-        || !name
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '_' || c == 'r')
-    {
+    if name.is_empty() || !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
         return None;
     }
     if !name.chars().next()?.is_alphabetic() && !name.starts_with('_') {
@@ -429,10 +759,16 @@ fn field_decl(line: &str) -> Option<(String, String)> {
         .trim_end_matches(',')
         .trim()
         .to_string();
+    Some((name.to_string(), ty))
+}
+
+/// Erkennt `[pub] name: Typ,` als vollständige Felddeklaration.
+fn field_decl(line: &str) -> Option<(String, String)> {
+    let (name, ty) = split_field(line)?;
     if ty.is_empty() {
         return None;
     }
-    Some((name.to_string(), ty))
+    Some((name, ty))
 }
 
 /// Springt einer der Wortstämme in diesem Feldnamen an?
@@ -441,9 +777,43 @@ fn suspicious_stem(name: &str) -> Option<&'static str> {
     SUSPICIOUS.iter().copied().find(|s| lower.contains(s))
 }
 
+/// Springt einer der Wortstämme in diesem **Typ- oder Variantennamen** an?
+fn suspicious_type_stem(name: &str) -> Option<&'static str> {
+    let lower = name.to_ascii_lowercase();
+    SUSPICIOUS_TYPE_NAMES
+        .iter()
+        .copied()
+        .find(|s| lower.contains(s))
+}
+
 /// Trägt das Feld einen Typ, der sein `Debug` selbst redigiert?
 fn is_redacting(ty: &str) -> bool {
     REDACTING_TYPES.iter().any(|t| ty.contains(t))
+}
+
+/// Alle Treffer eines Quelltexts. `rel` ist der Dateipfad für den Schlüssel.
+fn findings_for(rel: &str, src: &str) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for ty in scan_source(src) {
+        for slot in &ty.slots {
+            if is_redacting(&slot.ty) {
+                continue;
+            }
+            let hit = match slot.judge {
+                Judge::ByFieldName => suspicious_stem(&slot.judged_name),
+                Judge::ByTypeName => suspicious_type_stem(&slot.judged_name),
+            };
+            if let Some(hit) = hit {
+                out.push(Finding {
+                    key: format!("{rel}::{}::{}", ty.name, slot.key_suffix),
+                    line: slot.line,
+                    hit: hit.to_string(),
+                });
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 /// Sucht einen kompletten Quellbaum ab.
@@ -456,20 +826,7 @@ fn scan_tree(root: &Path) -> Vec<Finding> {
             .to_string_lossy()
             .replace('\\', "/");
         let src = fs::read_to_string(&path).expect("Quelldatei lesbar");
-        for ty in scan_source(&src) {
-            for (field, field_ty, line) in &ty.fields {
-                if is_redacting(field_ty) {
-                    continue;
-                }
-                if let Some(hit) = suspicious_stem(field) {
-                    out.push(Finding {
-                        key: format!("{rel}::{}::{}", ty.name, field),
-                        line: *line,
-                        hit: hit.to_string(),
-                    });
-                }
-            }
-        }
+        out.extend(findings_for(&rel, &src));
     }
     out.sort();
     out
@@ -789,21 +1146,12 @@ fn known_gap_a_harmless_name_carrying_a_secret_slips_through() {
     );
 }
 
-/// Hilfsfunktion der Positivkontrollen: `Typ::feld` für jeden Treffer.
+/// Hilfsfunktion der Positivkontrollen: `Typ::platz` für jeden Treffer.
 fn fields_flagged(src: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for ty in scan_source(src) {
-        for (field, field_ty, _) in &ty.fields {
-            if is_redacting(field_ty) {
-                continue;
-            }
-            if suspicious_stem(field).is_some() {
-                out.push(format!("{}::{}", ty.name, field));
-            }
-        }
-    }
-    out.sort();
-    out
+    findings_for("x.rs", src)
+        .into_iter()
+        .map(|f| f.key.trim_start_matches("x.rs::").to_string())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -871,4 +1219,210 @@ fn count_debug_derive_attrs(src: &str) -> usize {
         i += 1;
     }
     n
+}
+
+/// Der Parser muss **jedes Feld** erreichen, nicht nur jeden Typ.
+///
+/// [`the_parser_reaches_every_derive_debug_site`] vergleicht Typ*zahlen*. Genau
+/// daran ist die erste Fassung dieses Wächters durchgefallen: bei einem von
+/// `rustfmt` nach dem Doppelpunkt umgebrochenen Feldtyp fand der Parser den Typ
+/// korrekt und las nur seine Felder nicht — die Zahlen stimmten, der Test war
+/// grün, das Feld war ungeprüft. Ein Tester hat zwei geladene Waffen in `src/`
+/// gelegt und der Wächter schwieg.
+///
+/// Deshalb hier eine Zusicherung auf **Feldebene**, gegen einen absichtlich
+/// viel naiveren Zähler ([`split_field`], der einen leeren Typ zulässt):
+/// divergieren beide, hat der Parser ein Feld verloren. Das schließt die
+/// Klasse, nicht nur die zwei bekannten Formen.
+#[test]
+fn the_parser_reaches_every_field() {
+    for path in rust_files(&src_dir()) {
+        let src = fs::read_to_string(&path).expect("lesbar");
+        for ty in scan_source(&src) {
+            let named = ty
+                .slots
+                .iter()
+                .filter(|s| s.judge == Judge::ByFieldName)
+                .count();
+            let shape = if ty.has_brace_body {
+                "`{ … }`-Koerper"
+            } else {
+                "Tupel- oder Unit-Form"
+            };
+            assert_eq!(
+                named,
+                ty.field_like_lines,
+                "{}: Typ `{}` ({shape}) mit abgeleitetem `Debug` — {} Zeilen sehen wie eine \
+                 Felddeklaration aus, aber nur {} Felder wurden geparst. Der \
+                 Parser verliert hier ein Feld (Fortsetzungszeile? ungewoehnliche \
+                 Form?); bis das geklaert ist, ist dieses Feld ungeprueft.",
+                path.display(),
+                ty.name,
+                ty.field_like_lines,
+                named
+            );
+            if let Some(inner) = &ty.tuple_text {
+                if !inner.trim().is_empty() {
+                    assert!(
+                        !ty.slots.is_empty(),
+                        "{}: Tupel-Struct `{}` mit abgeleitetem `Debug`, aber der \
+                         Parser hat kein einziges Element erkannt — genau die Form, \
+                         in der ein Newtype-Geheimnis still durchgeht.",
+                        path.display(),
+                        ty.name
+                    );
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Positivkontrollen für die zwei Formen, an denen der Waechter durchgefallen ist
+// ---------------------------------------------------------------------------
+
+/// Form A, die gefährlichere: ein Tupel-Struct hat **keinen** Feldnamen, also
+/// greift die Feldnamen-Liste nie. `AGENTS.md` schickt Entwickler ausdrücklich
+/// zu einem redigierenden Newtype — wer dem folgt und das `derive(Debug)`
+/// stehen lässt, baut genau diese Form. Gemessen druckt sie
+/// `ApiToken("s3cr3t-live-token")`.
+#[test]
+fn control_a_tuple_struct_newtype_with_a_derived_debug_is_caught() {
+    let src = r#"
+        #[derive(Debug, Clone)]
+        pub struct ApiToken(pub String);
+    "#;
+    assert_eq!(fields_flagged(src), vec!["ApiToken::<tuple.0>"]);
+
+    // Auch mit mehreren Elementen und Generics.
+    let two = r#"
+        #[derive(Debug)]
+        pub(crate) struct SecretPair(pub String, pub Option<Vec<u8>>);
+    "#;
+    assert_eq!(
+        fields_flagged(two),
+        vec!["SecretPair::<tuple.0>", "SecretPair::<tuple.1>"]
+    );
+}
+
+/// Ein Tupel-Struct mit harmlosem Namen darf **nicht** anspringen. Ein Wächter,
+/// der bei jedem Newtype meldet, wird abgeschaltet — und dann ist er
+/// schlechter als keiner.
+#[test]
+fn control_a_harmless_tuple_struct_is_not_flagged() {
+    let src = r#"
+        #[derive(Debug)]
+        pub struct Dir(PathBuf);
+
+        #[derive(Debug)]
+        struct Rebinding(AtomicUsize);
+
+        #[derive(Debug)]
+        struct VecBody(Option<Vec<u8>>);
+    "#;
+    assert!(fields_flagged(src).is_empty());
+}
+
+/// Die drei bestehenden Newtypes sind **korrekt** gebaut: handgeschriebenes
+/// `Debug`, also gar kein `derive` — sie dürfen auch mit verdächtigem Namen
+/// nicht gemeldet werden. Beurteilt wird „Tupel-Struct mit verdächtigem Namen
+/// **und** abgeleitetem `Debug`", nicht der Name allein.
+#[test]
+fn control_a_hand_written_newtype_is_not_flagged() {
+    let src = r#"
+        #[derive(Clone)]
+        pub struct SessionToken(String);
+
+        impl std::fmt::Debug for SessionToken {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("SessionToken(<redacted>)")
+            }
+        }
+    "#;
+    assert!(fields_flagged(src).is_empty());
+
+    // Gegenprobe zur Gegenprobe: mit `Debug` in der Ableitungsliste schlaegt es an.
+    let derived = src.replace("#[derive(Clone)]", "#[derive(Clone, Debug)]");
+    assert_eq!(fields_flagged(&derived), vec!["SessionToken::<tuple.0>"]);
+}
+
+/// Ein redigierender Newtype als Tupelelement entschärft das umgebende
+/// `derive(Debug)` — wie bei benannten Feldern.
+#[test]
+fn control_a_tuple_over_a_redacting_newtype_is_not_flagged() {
+    let src = r#"
+        #[derive(Debug)]
+        pub struct TokenHolder(pub SessionToken);
+    "#;
+    assert!(fields_flagged(src).is_empty());
+}
+
+/// Dieselbe Lücke in einer Enum-**Tupelvariante**: auch dort gibt es keinen
+/// Feldnamen. Beurteilt wird der Variantenname.
+#[test]
+fn control_a_tuple_variant_of_an_enum_is_caught() {
+    let src = r#"
+        #[derive(Debug)]
+        pub enum Credential {
+            Anonymous,
+            Token(String),
+            Basic { user: String, pw: String },
+        }
+    "#;
+    let flagged = fields_flagged(src);
+    assert!(
+        flagged.contains(&"Credential::Token(..)".to_string()),
+        "Tupelvariante nicht gefunden: {flagged:?}"
+    );
+}
+
+/// Form B: `rustfmt` bricht einen langen Feldtyp **selbst** nach dem
+/// Doppelpunkt um. Vorher sah [`field_decl`] einen leeren Typ und gab `None`
+/// zurück — das Feld existierte für den Wächter nicht.
+#[test]
+fn control_a_field_type_wrapped_by_rustfmt_is_caught() {
+    let src = r#"
+        #[derive(Debug, Clone)]
+        pub struct WrappedSecrets {
+            pub session_token_cache_for_every_connected_peer:
+                std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<Vec<String>>>>,
+        }
+    "#;
+    assert_eq!(
+        fields_flagged(src),
+        vec!["WrappedSecrets::session_token_cache_for_every_connected_peer"]
+    );
+}
+
+/// Ein Kommentar, der auf `:` endet, darf die darunterliegende
+/// Felddeklaration **nicht** verschlucken — das wäre der Weg, wie das
+/// Zusammenfügen von Fortsetzungszeilen selbst eine Lücke aufreißt.
+#[test]
+fn control_a_comment_ending_in_a_colon_does_not_swallow_the_field() {
+    let src = r#"
+        #[derive(Debug)]
+        pub struct Careful {
+            /// Achtung:
+            pub token: String,
+        }
+    "#;
+    assert_eq!(fields_flagged(src), vec!["Careful::token"]);
+}
+
+/// Auch bei den neuen Formen bleibt es dabei: der Wächter kennt **nur Namen**.
+/// Ein Tupel-Struct mit harmlosem Typnamen, das ein Geheimnis trägt, geht
+/// durch. Steht als Test da, damit die Lücke nicht in Vergessenheit gerät —
+/// zumal ein harmloser Typname bei einem Newtype wahrscheinlicher ist als bei
+/// einem Feld (`struct Payload(String)`).
+#[test]
+fn known_gap_a_harmless_tuple_name_carrying_a_secret_slips_through() {
+    let src = r#"
+        #[derive(Debug)]
+        pub struct Payload(pub String);
+    "#;
+    assert!(
+        fields_flagged(src).is_empty(),
+        "der Scanner kennt nur Namen; wenn das hier anspringt, ist er besser \
+         geworden — dann diesen Test anpassen"
+    );
 }

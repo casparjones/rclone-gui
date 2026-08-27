@@ -11,6 +11,10 @@
 #
 #     Peer --TLS--> stunnel 0.0.0.0:874 --Klartext--> rsyncd 127.0.0.1:873
 #
+# 873 gilt fuer den gehaerteten Betrieb (Container, root). Rootlos ist 873 nicht
+# bindbar, und der Daemon nimmt einen unprivilegierten Port; das Backend folgt
+# ueber rsyncd_default_port() weiter unten (Ticket 50c8ec48).
+#
 # Der Daemon bindet nur auf Loopback (src/handlers/rsyncd.rs, DAEMON_ADDRESS)
 # und Port 873 wird nicht nach aussen gemappt. stunnel ist damit der einzige
 # Weg von aussen zum Daemon.
@@ -34,7 +38,36 @@ RCLONE_GUI_RSYNC_TLS="${RCLONE_GUI_RSYNC_TLS:-1}"
 # Port, auf dem terminiert wird, und Backend dahinter.
 RCLONE_GUI_RSYNC_TLS_PORT="${RCLONE_GUI_RSYNC_TLS_PORT:-874}"
 RCLONE_GUI_RSYNC_TLS_BIND="${RCLONE_GUI_RSYNC_TLS_BIND:-0.0.0.0}"
-RCLONE_GUI_RSYNC_BACKEND="${RCLONE_GUI_RSYNC_BACKEND:-127.0.0.1:873}"
+# Der Daemon-Port haengt daran, ob der Daemon sich haerten kann: als root oder
+# mit CAP_SYS_CHROOT auf /usr/bin/rsync (so macht es das Image, siehe
+# Dockerfile) nimmt er 873, rootlos einen unprivilegierten Port. Die
+# **maszgebliche** Stelle ist `Hardening` in src/handlers/rsyncd.rs; hier steht
+# dieselbe Regel ein zweites Mal, weil stunnel die Entscheidung der App nicht
+# erfragen kann und ein Backend auf dem falschen Port bedeutet: der Daemon
+# laeuft und niemand erreicht ihn.
+#
+# Wer RCLONE_GUI_RSYNCD_PORT setzt, setzt beide Seiten gleichzeitig — die App
+# liest dieselbe Variable. RCLONE_GUI_RSYNC_BACKEND ueberschreibt weiterhin
+# alles.
+rsyncd_default_port() {
+    if [ -n "${RCLONE_GUI_RSYNCD_PORT:-}" ]; then
+        printf '%s' "$RCLONE_GUI_RSYNCD_PORT"
+        return 0
+    fi
+    if [ "$(id -u 2>/dev/null || echo 1000)" = "0" ]; then
+        printf '873'
+        return 0
+    fi
+    # `getcap` liegt im Image (Paket libcap) und wird dort auch vom
+    # Startup-Check benutzt. Fehlt es, gilt "keine Capability" — dann rechnet
+    # diese Funktion mit dem rootlosen Port, genau wie die App.
+    if getcap /usr/bin/rsync 2>/dev/null | grep -q 'cap_sys_chroot'; then
+        printf '873'
+        return 0
+    fi
+    printf '8873'
+}
+RCLONE_GUI_RSYNC_BACKEND="${RCLONE_GUI_RSYNC_BACKEND:-127.0.0.1:$(rsyncd_default_port)}"
 # Hostname(n), die ins Zertifikat gehören. Komma-getrennt. Leer -> aus
 # RCLONE_GUI_PUBLIC_BASE_URL abgeleitet, sonst `hostname`.
 RCLONE_GUI_PEER_HOSTNAME="${RCLONE_GUI_PEER_HOSTNAME:-}"
