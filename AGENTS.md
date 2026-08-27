@@ -415,11 +415,30 @@ Bremse, keine Garantie.**
 > Zweiter blinder Fleck derselben Klasse: ein von **rustfmt selbst** auf die nächste
 > Zeile umgebrochener Feldtyp.
 >
-> **Beide sind inzwischen geschlossen.** Der Wächter beurteilt Tupel-Structs jetzt am
+> **Diese beiden Formen sind geschlossen** — der Wächter beurteilt Tupel-Structs am
 > **Typnamen** (gegen eine bewusst kürzere Liste, damit `auth`/`session`/`url` in
 > Typnamen keine Fehlalarme erzeugen), fasst Fortsetzungszeilen zusammen, und deckt
 > **Tupelvarianten von Enums** mit ab — dieselbe Klasse eine Ebene tiefer, die sofort
 > einen echten Treffer erzeugte.
+>
+> **Die Klasse ist damit nicht zu, und dieser Satz stand hier schon dreimal falsch.**
+> Zweimal hiess es, die Serie sei „bei fünf geschlossen" — sie erreichte acht. Dann
+> hiess es hier „beide sind inzwischen geschlossen", und ein Tester fand **fünf
+> weitere** Formen, die durchgehen (Ticket `1e6aa483` zurück in `Todo`): einzeilige
+> **Struct**-Variante eines Enums, `where`-Klausel, rohes Identifier-Feld (`r#token`),
+> `#[derive(std::fmt::Debug)]` mit vollem Pfad, und `is_redacting` als reine
+> Substring-Prüfung ohne Zusicherung.
+>
+> **Der lehrreichste Fund ist Nummer 4.** `scan_source` und der „absichtlich naive"
+> Zähler des Selbsttests teilen dieselbe Primitive `derives_debug`. Bei
+> `#[derive(std::fmt::Debug)]` sind deshalb **beide** bei 0, und `attrs == types` ist
+> erfüllt: **der Selbsttest kann seine eigene Blindheit nicht sehen.** Das ist derselbe
+> Mechanismus, an dem die fünf Handsuchen gescheitert sind, nur eine Ebene höher — und
+> der Grund, warum ein Selbsttest, der die Primitive des Prüflings benutzt, kein
+> Selbsttest ist.
+>
+> Wer hier künftig etwas als „geschlossen" schreibt, schreibt **welche Formen**
+> geschlossen sind, nicht dass die Klasse es wäre.
 >
 > Das Kriterium bleibt: verdächtiger Name **und abgeleitetes** `Debug`. `SessionToken`,
 > `ResetToken`, `ShareToken`, `ModuleSecret` werden also **nicht** gemeldet — sie haben
@@ -438,6 +457,20 @@ Wenn er anspringt, gibt es genau drei richtige Antworten:
    Felder, die noch einen bräuchten, steht als `_NEWTYPE_CANDIDATES` im Testmodul.
 3. Ist es **kein** Geheimnis: mit **Begründung** in `ACKNOWLEDGED` eintragen. Ein
    Eintrag ohne Begründung lässt einen eigenen Test durchfallen.
+
+**Und eine vierte, die keine richtige Antwort ist:** den Typnamen so wählen, dass
+`is_redacting` anspringt. Das ist eine **Substring-Prüfung des Typtexts** ohne jede
+Zusicherung, dass der Typ ein handgeschriebenes `Debug` hat — `ShareTokenPlain` oder
+`pub type ShareToken = String;` schalten die Meldung ab, ohne etwas zu redigieren. Wer
+so „aufräumt", baut die blinde Stelle, die der Wächter melden sollte.
+
+**Ein handgeschriebenes `Debug` sieht der Wächter per Konstruktion nicht an** — dort
+zählt nur, was du selbst hineinschreibst. Real im Baum: `RcloneConfig` und
+`ConfigRequest` (`src/models.rs:47`, `:167`) redigieren `password` und die Zusatzfelder
+sorgfältig und drucken `url` daneben **wörtlich**. Ein WebDAV-Remote heisst
+`https://nutzer:geheim@host/dav`. Bei einer URL ist die richtige Antwort deshalb nie
+„steht schon in einem eigenen `Debug`", sondern `redact_userinfo`
+(`src/handlers/downloader.rs`).
 
 Die Ausnahmeliste darf nicht verrotten: **ein verschwundener Treffer bricht den Test
 ebenfalls**. Wer ein Feld umbenennt oder entfernt, räumt seinen Eintrag mit weg.

@@ -17,10 +17,12 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 use tokio::process::Command;
 
-use crate::config_manager::{ensure_configured_remote, RCLONE_CONFIG_PATH};
+use crate::config_manager::{
+    ensure_configured_remote, host_reach_of_remote, HostReach, RCLONE_CONFIG_PATH,
+};
 use crate::handlers::auth_web::CurrentUser;
 use crate::handlers::download::{
-    is_within_root, resolve_within_root, scope_from_map, user_root, DownloadError,
+    is_within_root, resolve_within_root, scope_from_map, user_root, DownloadError, RootScope,
 };
 use crate::models::{ApiResponse, FileEntry};
 
@@ -88,7 +90,14 @@ pub async fn list_local_files(
     })))
 }
 
+/// `GET /api/files/remote` – Inhalt eines Ordners auf einem rclone-Remote.
+///
+/// Der angemeldete Nutzer wird gebraucht, weil die Grenze auch hier gilt: zeigt
+/// das Remote auf das Dateisystem des Wirtssystems (`type = local` und alles,
+/// was so etwas umhüllt), wird der Pfad gegen das Home des Nutzers kanonisiert
+/// und geprüft – genau wie im lokalen Pane. Siehe [`bounded_remote_target`].
 pub async fn list_remote_files(
+    Extension(current): Extension<CurrentUser>,
     Query(params): Query<HashMap<String, String>>,
 ) -> ResponseJson<ApiResponse<Vec<FileEntry>>> {
     let remote_name = match params.get("remote") {
@@ -102,7 +111,7 @@ pub async fn list_remote_files(
         .unwrap_or(&default_remote_path)
         .to_string();
 
-    match list_remote_directory(remote_name, &remote_path).await {
+    match list_remote_directory(&current, remote_name, &remote_path).await {
         Ok(files) => ResponseJson(ApiResponse::success(files)),
         Err(e) => ResponseJson(ApiResponse::error(&e.to_string())),
     }
@@ -255,16 +264,167 @@ fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }
 
+/// Das rclone-Ziel für einen Remote-Pane-Aufruf – **mit** der Grenze, die im
+/// lokalen Pane längst gilt.
+///
+/// Ticket `514ce5f5`. Der Remote-Weg war die eine Stelle, an der `user_root`
+/// nicht griff: ein rclone-Remote mit `type = local` zeigt auf das Dateisystem
+/// des Wirtssystems, und damit las jeder Nutzer über den rechten Pane das ganze
+/// System, während links sein `home_path` hielt.
+///
+/// Die Entscheidung dazu: `type = local` bleibt **für alle** erlaubt — kein
+/// Verbot, keine Admin-Ausnahme —, aber der Home-Pfad greift auch dort. Ein
+/// bestehender Eintrag wird dadurch nicht unbenutzbar; er zeigt nur noch das
+/// Home des jeweiligen Nutzers.
+///
+/// Drei Fälle, und der erste ist der Bestand:
+///
+/// | [`HostReach`] | Bedeutung | Was passiert |
+/// |---|---|---|
+/// | `None` | Netz-Backend | Pfad geht unverändert an rclone |
+/// | `Direct` | `type = local` | Wurzel des Remotes **ist** das Home; rclone bekommt den kanonisierten absoluten Pfad |
+/// | `Rooted(p)` | umhüllt einen festen Pfad | `p` muss selbst im Home liegen, der Pfad wird darin aufgelöst |
+/// | `Unbounded` | Ansatzpunkt unbestimmbar | abgewiesen |
+///
+/// `child` ist ein bereits geprüftes **einzelnes** Segment, das noch nicht
+/// existiert (`mkdir`). Es wird angehängt, nachdem der Elternpfad kanonisiert
+/// und geprüft ist — kanonisieren liesse sich ein nicht existierender Pfad
+/// nicht.
+///
+/// Die Funktion läuft **vor** dem Bau der Kommandozeile: wird sie abgelehnt,
+/// startet kein rclone.
+async fn bounded_remote_target(
+    current: &CurrentUser,
+    remote_name: &str,
+    remote_path: &str,
+    child: Option<&str>,
+) -> anyhow::Result<String> {
+    // Zuerst der Name: `:local:` wäre rclones On-the-fly-Syntax für ein nicht
+    // konfiguriertes Backend und führte am gesamten Pfad-Jail vorbei
+    // (`5d31b2f7`). Diese Prüfung bleibt die zentrale und wird nicht umgangen.
+    ensure_configured_remote(remote_name).await?;
+
+    let reach = host_reach_of_remote(remote_name).await?;
+
+    if reach.is_none() {
+        // Ein Netz-Backend berührt kein lokales Dateisystem. Hier gibt es
+        // nichts zu begrenzen, und der Pfad geht unverändert an rclone — auch
+        // das Home wird dafür nicht gebraucht.
+        let path = match child {
+            None => remote_path.to_string(),
+            Some(name) => join_remote_path(remote_path, name),
+        };
+        return Ok(format!("{}:{}", remote_name, path));
+    }
+
+    // `RootScope::Home` ist fest verdrahtet, nicht aus der Anfrage genommen:
+    // der Remote-Pane hat keinen sichtbaren System-Modus, und ein Admin, der
+    // das ganze System sehen will, hat den lokalen Pane mit `scope=system`.
+    let home = user_root(current, RootScope::Home)
+        .await
+        .map_err(|_| anyhow::anyhow!("Das Home-Verzeichnis ist nicht verfügbar"))?;
+
+    bounded_target_in(&home, reach, remote_name, remote_path, child).await
+}
+
+/// Der Pfadteil von [`bounded_remote_target`], getrennt von der Frage, wer der
+/// Aufrufer ist und was in der `rclone.conf` steht.
+///
+/// `home` ist bereits kanonisiert (so liefert `user_root` es). Die Trennung ist
+/// nicht Kosmetik: nur so ist die Grenze mit einem Wegwerf-Baum und ohne
+/// laufenden Server prüfbar — und geprüft ist sie das, worauf es hier ankommt.
+async fn bounded_target_in(
+    home: &Path,
+    reach: Option<HostReach>,
+    remote_name: &str,
+    remote_path: &str,
+    child: Option<&str>,
+) -> anyhow::Result<String> {
+    let Some(reach) = reach else {
+        let path = match child {
+            None => remote_path.to_string(),
+            Some(name) => join_remote_path(remote_path, name),
+        };
+        return Ok(format!("{}:{}", remote_name, path));
+    };
+
+    // Ab hier gilt dieselbe Grenze wie im lokalen Pane, und über dieselben
+    // beiden Funktionen: `user_root` liefert die kanonisierte Wurzel,
+    // `resolve_within_root` kanonisiert den Kandidaten und prüft ihn dagegen —
+    // auch über aufgelöste Symlinks.
+    let (base, absolute_for_rclone) = match reach {
+        HostReach::Direct => (home.to_path_buf(), true),
+        HostReach::Rooted(configured) => {
+            // Der Ansatzpunkt steht in der Konfiguration, nicht in der Anfrage
+            // — er muss trotzdem im Home liegen, sonst ist jeder Pfad darunter
+            // ausserhalb.
+            let canonical = tokio::fs::canonicalize(&configured)
+                .await
+                .map_err(|_| anyhow::anyhow!("Das Ziel dieser Verbindung ist nicht verfügbar"))?;
+            if !is_within_root(home, &canonical) {
+                anyhow::bail!("Diese Verbindung zeigt aus dem eigenen Bereich hinaus");
+            }
+            (canonical, false)
+        }
+        HostReach::Unbounded => {
+            anyhow::bail!("Diese Verbindung lässt sich nicht auf den eigenen Bereich begrenzen")
+        }
+    };
+
+    // Der Pfad kommt aus dem Pfadraum des **Remotes**: dort ist `/` seine
+    // Wurzel, nicht die des Wirtssystems. Also relativ zu `base` lesen — sonst
+    // wäre `/etc/shadow` ein absoluter Pfad, und `resolve_within_root` würde
+    // ihn nur noch abweisen, statt ihn ins Home zu übersetzen.
+    let relative = remote_path.trim().trim_start_matches('/');
+    let dir = if relative.is_empty() {
+        base.clone()
+    } else {
+        // „liegt draussen" und „gibt es nicht" sind bewusst dieselbe Meldung:
+        // sie geht an den Client und soll nicht verraten, was es oberhalb des
+        // Homes gibt.
+        resolve_within_root(&base, relative).await.map_err(|_| {
+            anyhow::anyhow!("Pfad nicht gefunden oder ausserhalb des erlaubten Bereichs")
+        })?
+    };
+
+    // Doppelter Boden: `resolve_within_root` prüft gegen `base`, hier steht
+    // noch einmal das Home. Fällt eine der beiden Grenzen weg, hält die andere.
+    if !is_within_root(home, &dir) {
+        anyhow::bail!("Pfad nicht gefunden oder ausserhalb des erlaubten Bereichs");
+    }
+
+    let full = match child {
+        None => dir,
+        // Ein bereits geprüftes **einzelnes** Segment, das noch nicht existiert
+        // (`mkdir`) — kanonisieren liesse sich ein solcher Pfad nicht, also
+        // wird es erst nach der Prüfung des Elternpfads angehängt.
+        Some(name) => dir.join(name),
+    };
+
+    if absolute_for_rclone {
+        // `type = local`: rclone bekommt den Pfad im Wirtssystem, und der ist
+        // bereits kanonisiert und geprüft.
+        return Ok(format!("{}:{}", remote_name, path_to_string(&full)));
+    }
+
+    // Umhüllendes Backend: rclone rechnet den Pfad gegen seinen eigenen
+    // Ansatzpunkt, also gehört hier der Pfad **relativ dazu** hin.
+    let relative_to_base = full.strip_prefix(&base).unwrap_or(Path::new(""));
+    Ok(format!(
+        "{}:/{}",
+        remote_name,
+        path_to_string(relative_to_base)
+    ))
+}
+
 async fn list_remote_directory(
+    current: &CurrentUser,
     remote_name: &str,
     remote_path: &str,
 ) -> anyhow::Result<Vec<FileEntry>> {
-    // Zuerst der Name, dann erst der Prozess: `:local:` wäre rclones
-    // On-the-fly-Syntax für ein nicht konfiguriertes Backend und führte am
-    // gesamten Pfad-Jail vorbei. Wird hier abgelehnt, startet kein rclone.
-    ensure_configured_remote(remote_name).await?;
-
-    let remote_full_path = format!("{}:{}", remote_name, remote_path);
+    // Beides vor dem Bau der Kommandozeile, damit bei einem unzulässigen Ziel
+    // gar kein rclone startet.
+    let remote_full_path = bounded_remote_target(current, remote_name, remote_path, None).await?;
 
     let output = Command::new("rclone")
         .args(["lsjson", "--config", RCLONE_CONFIG_PATH, &remote_full_path])
@@ -354,15 +514,10 @@ fn mkdir_error(status: StatusCode, message: &str) -> MkdirResponse {
 /// Frist. Nur was sich nicht zuordnen lässt, bleibt bei 200 mit
 /// `success:false` – das ist der dokumentierte Sammelfall des Kontrakts, nicht
 /// ein vergessener Statuscode.
-pub async fn create_remote_directory(Json(request): Json<RemoteMkdirRequest>) -> MkdirResponse {
-    // Zuerst der Name, dann erst der Prozess: `:local:` wäre rclones
-    // On-the-fly-Syntax für ein nicht konfiguriertes Backend und führte am
-    // gesamten Pfad-Jail vorbei (siehe `5d31b2f7`). Wird hier abgelehnt,
-    // startet kein rclone.
-    if let Err(e) = ensure_configured_remote(&request.remote).await {
-        return mkdir_error(StatusCode::BAD_REQUEST, &e.to_string());
-    }
-
+pub async fn create_remote_directory(
+    Extension(current): Extension<CurrentUser>,
+    Json(request): Json<RemoteMkdirRequest>,
+) -> MkdirResponse {
     let name = match validate_remote_dir_name(&request.name) {
         Ok(name) => name,
         Err(e) => return mkdir_error(StatusCode::BAD_REQUEST, &e),
@@ -374,7 +529,18 @@ pub async fn create_remote_directory(Json(request): Json<RemoteMkdirRequest>) ->
     };
 
     let created = join_remote_path(&parent, &name);
-    let target = format!("{}:{}", request.remote, created);
+
+    // Der Name, dann die Grenze, dann erst der Prozess: `:local:` wäre rclones
+    // On-the-fly-Syntax für ein nicht konfiguriertes Backend und führte am
+    // gesamten Pfad-Jail vorbei (`5d31b2f7`); ein Remote auf das Wirtssystem
+    // führte am Home vorbei (`514ce5f5`). Geprüft wird der **anzulegende**
+    // Pfad, nicht der Elternordner — sonst legte ein `..` im Namen den Ordner
+    // ausserhalb an. Wird hier abgelehnt, startet kein rclone.
+    let target = match bounded_remote_target(&current, &request.remote, &parent, Some(&name)).await
+    {
+        Ok(target) => target,
+        Err(e) => return mkdir_error(StatusCode::BAD_REQUEST, &e.to_string()),
+    };
 
     match run_rclone_mkdir(&target).await {
         Ok(()) => (
@@ -621,6 +787,211 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("Testverzeichnis anlegen");
         dir
+    }
+
+    // -----------------------------------------------------------------------
+    // Ticket `514ce5f5`: die Grenze im Remote-Pane
+    // -----------------------------------------------------------------------
+
+    /// Ein Wegwerf-Baum: `home/` mit einem Unterordner, `outside/` daneben mit
+    /// einer Datei, die nie sichtbar werden darf, und ein Symlink aus dem Home
+    /// hinaus.
+    struct BoundaryTree {
+        base: PathBuf,
+        home: PathBuf,
+        outside: PathBuf,
+    }
+
+    fn boundary_tree(label: &str) -> BoundaryTree {
+        let base = temp_dir(label);
+        let home = base.join("home");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(home.join("daten")).expect("home/daten");
+        std::fs::create_dir_all(&outside).expect("outside");
+        std::fs::write(outside.join("secret.txt"), b"geheim").expect("secret");
+        std::os::unix::fs::symlink(&outside, home.join("weg")).expect("Symlink");
+
+        BoundaryTree {
+            // Kanonisiert, wie `user_root` es liefert — auf macOS und in
+            // manchen Containern ist `/tmp` selbst ein Symlink, und ohne das
+            // scheiterte jeder `starts_with`-Vergleich.
+            home: std::fs::canonicalize(&home).expect("home kanonisch"),
+            outside: std::fs::canonicalize(&outside).expect("outside kanonisch"),
+            base,
+        }
+    }
+
+    /// Akzeptanzkriterium: über ein `type=local`-Remote ist ausserhalb des
+    /// Homes nichts erreichbar — `..`, ein absoluter Fremdpfad und ein Symlink,
+    /// der hinausführt, werden abgewiesen.
+    #[tokio::test]
+    async fn a_local_remote_is_bounded_to_the_home() {
+        let tree = boundary_tree("514ce5f5-direct");
+        let reach = || Some(HostReach::Direct);
+
+        // Die Wurzel des Remotes **ist** das Home. rclone bekommt den
+        // kanonisierten absoluten Pfad, nicht das `/` des Clients.
+        assert_eq!(
+            bounded_target_in(&tree.home, reach(), "hostfs", "/", None)
+                .await
+                .expect("Wurzel erlaubt"),
+            format!("hostfs:{}", tree.home.display())
+        );
+        assert_eq!(
+            bounded_target_in(&tree.home, reach(), "hostfs", "/daten", None)
+                .await
+                .expect("Unterordner erlaubt"),
+            format!("hostfs:{}/daten", tree.home.display())
+        );
+
+        // Und alles, was hinausführt, wird abgewiesen.
+        for path in [
+            "/..",
+            "/../outside",
+            "/daten/../../outside",
+            // Ein absoluter Fremdpfad ist im Pfadraum des Remotes ein Pfad
+            // **unter** dem Home — und existiert dort nicht.
+            "/etc",
+            "/etc/shadow",
+            // Symlink aus dem Home hinaus. Die Prüfung kanonisiert, der
+            // Symlink ändert daran nichts.
+            "/weg",
+            "/weg/secret.txt",
+        ] {
+            let result = bounded_target_in(&tree.home, reach(), "hostfs", path, None).await;
+            assert!(
+                result.is_err(),
+                "{:?} haette abgewiesen werden muessen, wurde {:?}",
+                path,
+                result.ok()
+            );
+        }
+
+        // Der eigentliche Punkt: der Pfad des fremden Baums taucht in keinem
+        // erlaubten Ziel auf.
+        let outside = tree.outside.to_string_lossy().to_string();
+        for path in ["/", "/daten"] {
+            let target = bounded_target_in(&tree.home, reach(), "hostfs", path, None)
+                .await
+                .expect("erlaubt");
+            assert!(!target.contains(&outside), "Ziel zeigt hinaus: {}", target);
+        }
+
+        let _ = std::fs::remove_dir_all(&tree.base);
+    }
+
+    /// Gegenprobe, ohne die der Test oben nichts belegt: **ohne** die Grenze
+    /// — also so, wie der Remote-Pane bis `514ce5f5` gebaut war — landet
+    /// derselbe Pfad ungeprüft in der Kommandozeile.
+    #[tokio::test]
+    async fn without_the_bound_the_same_path_would_reach_the_host() {
+        let tree = boundary_tree("514ce5f5-gegenprobe");
+
+        // Die alte Fassung war genau das: `format!("{}:{}", name, path)`.
+        let old = format!("{}:{}", "hostfs", "/etc/shadow");
+        assert_eq!(old, "hostfs:/etc/shadow");
+
+        // Und für ein Netz-Backend ist das immer noch richtig — dort gibt es
+        // kein lokales Dateisystem zu begrenzen, und ein Umbau hätte nur
+        // funktionierende Verbindungen zerstört.
+        assert_eq!(
+            bounded_target_in(&tree.home, None, "cloud", "/etc/shadow", None)
+                .await
+                .expect("Netz-Backend unverändert"),
+            "cloud:/etc/shadow"
+        );
+
+        let _ = std::fs::remove_dir_all(&tree.base);
+    }
+
+    /// Ein umhüllendes Backend hängt an einem festen Punkt. Liegt der im Home,
+    /// bleibt es benutzbar; liegt er draussen, ist nichts zu begrenzen.
+    #[tokio::test]
+    async fn a_wrapping_remote_must_hang_inside_the_home() {
+        let tree = boundary_tree("514ce5f5-rooted");
+
+        // Ansatzpunkt im Home: der Pfad wird darin aufgelöst, und rclone
+        // bekommt ihn **relativ** zu seinem eigenen Ansatzpunkt.
+        let inside = HostReach::Rooted(tree.home.join("daten"));
+        assert_eq!(
+            bounded_target_in(&tree.home, Some(inside.clone()), "innen", "/", None)
+                .await
+                .expect("Wurzel erlaubt"),
+            "innen:/"
+        );
+        std::fs::create_dir_all(tree.home.join("daten/tief")).expect("tief");
+        assert_eq!(
+            bounded_target_in(&tree.home, Some(inside.clone()), "innen", "/tief", None)
+                .await
+                .expect("Unterordner erlaubt"),
+            "innen:/tief"
+        );
+        assert!(
+            bounded_target_in(&tree.home, Some(inside), "innen", "/../..", None)
+                .await
+                .is_err(),
+            "ein Ausbruch aus dem Ansatzpunkt muss scheitern"
+        );
+
+        // Ansatzpunkt draussen: schon der Ansatzpunkt scheitert, unabhängig
+        // vom Pfad.
+        let outside = HostReach::Rooted(tree.outside.clone());
+        assert!(
+            bounded_target_in(&tree.home, Some(outside), "aussen", "/", None)
+                .await
+                .is_err(),
+            "ein Ansatzpunkt ausserhalb des Homes muss scheitern"
+        );
+
+        // Unbestimmbar: kein Weg, eine Grenze zu ziehen, also abweisen.
+        assert!(
+            bounded_target_in(&tree.home, Some(HostReach::Unbounded), "unklar", "/", None)
+                .await
+                .is_err()
+        );
+
+        let _ = std::fs::remove_dir_all(&tree.base);
+    }
+
+    /// `mkdir` legt einen Ordner an, der noch nicht existiert — kanonisieren
+    /// liesse sich der nicht. Geprüft wird deshalb der Elternpfad, und das
+    /// Segment kommt erst danach dazu.
+    #[tokio::test]
+    async fn the_new_folder_stays_inside_the_home_too() {
+        let tree = boundary_tree("514ce5f5-mkdir");
+
+        assert_eq!(
+            bounded_target_in(
+                &tree.home,
+                Some(HostReach::Direct),
+                "hostfs",
+                "/daten",
+                Some("neu")
+            )
+            .await
+            .expect("anlegen erlaubt"),
+            format!("hostfs:{}/daten/neu", tree.home.display())
+        );
+
+        // Der Elternpfad wird geprüft, und ein Elternpfad ausserhalb scheitert,
+        // bevor der Name überhaupt zählt.
+        for parent in ["/weg", "/../outside", "/etc"] {
+            assert!(
+                bounded_target_in(
+                    &tree.home,
+                    Some(HostReach::Direct),
+                    "hostfs",
+                    parent,
+                    Some("neu")
+                )
+                .await
+                .is_err(),
+                "Elternpfad {:?} haette abgewiesen werden muessen",
+                parent
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&tree.base);
     }
 
     #[test]

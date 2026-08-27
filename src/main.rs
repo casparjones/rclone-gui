@@ -236,6 +236,7 @@ async fn main() {
     println!("   GET    /api/sync-log/:job_id          -> get_sync_log_for (temp route)");
     println!("   DELETE /api/sync-delete/:job_id       -> delete_job_for (temp route)");
     println!("   GET    /api/sync/:job_id/log          -> get_sync_log_for");
+    println!("   POST   /api/sync/:job_id/cancel       -> cancel_sync_for");
     println!("   GET    /api/sync/:job_id              -> get_sync_progress_for");
     println!("   DELETE /api/sync/:job_id              -> delete_job_for");
     println!("   GET    /api/tasks                     -> get_tasks");
@@ -323,6 +324,10 @@ async fn main() {
         )
         .route("/api/sync-log/:job_id", get(get_sync_log_handler))
         .route("/api/sync-delete/:job_id", delete(delete_sync_job_handler))
+        // Abbruch eines laufenden Übertragungsjobs. Vor `/api/sync/:job_id`,
+        // damit beim Lesen klar ist, dass `cancel` kein Job-Bezeichner ist —
+        // axum unterscheidet die drei Segmente ohnehin.
+        .route("/api/sync/:job_id/cancel", post(cancel_sync_handler))
         .route("/api/sync/:job_id/log", get(get_sync_log_handler))
         .route("/api/sync/:job_id", get(get_sync_progress_handler))
         .route("/api/sync/:job_id", delete(delete_sync_job_handler))
@@ -579,6 +584,18 @@ async fn cancel_url_fetch_handler(
         Some(handlers::sync::JobKind::UrlFetch) => handlers::downloader::cancel_job(job_id).await,
         _ => axum::response::Json(models::ApiResponse::error(handlers::sync::JOB_UNAVAILABLE)),
     }
+}
+
+/// `POST /api/sync/:job_id/cancel` — bricht einen laufenden Job ab.
+///
+/// Wie `cancel_url_fetch_handler` nur die Hülle: die Besitzprüfung, die
+/// Idempotenz und der Signalweg stehen in `handlers::sync::cancel_sync_for`.
+/// Eine Prüfung hier wäre eine zweite Wahrheit neben der Schleuse.
+async fn cancel_sync_handler(
+    Extension(current): Extension<handlers::auth_web::CurrentUser>,
+    Path(job_id): Path<String>,
+) -> axum::response::Json<models::ApiResponse<String>> {
+    handlers::sync::cancel_sync_for(&current, job_id).await
 }
 
 async fn get_sync_progress_handler(
@@ -843,6 +860,85 @@ enum RsyncdState {
 /// wrong trade. The failure is visible at `/api/rsyncd/status`, as a *start
 /// failure with its cause* — not as "switched off", which is what a caller
 /// would otherwise read out of an absent handle.
+/// Where the daemon's configuration, secrets and run directory live.
+///
+/// `configured` is `RCLONE_GUI_RSYNCD_DIR` as the operator wrote it. Everything
+/// this function does is **make it absolute**, and that is not cosmetic:
+/// `DaemonConfig::write` refuses a relative secrets path, because the daemon
+/// resolves `secrets file` itself and its working directory is not ours. A bare
+/// `data/rsyncd` therefore came back as
+/// `data/rsyncd/secrets/rsyncd.secrets must be an absolute path` — measured at a
+/// real server start.
+///
+/// **The reason this is worth a function of its own is what happened before it.**
+/// Only the built-in default was resolved against the working directory; an
+/// explicitly set relative value went through verbatim, the daemon failed to
+/// start, and *the server carried on without the rsync transport*. Not a crash —
+/// a **silent partial outage**. Whoever set the relative path had no reason to
+/// suspect their transport was gone, and no test had found it (ticket
+/// `22c1b001`).
+///
+/// So a relative value is **resolved, not refused**: refusing it would keep the
+/// outage and only move the blame. `~` and `~/…` are expanded against `$HOME`
+/// for the same reason — a literal `~` fails exactly like a relative path, and
+/// it is an easy thing to write in a shell that does not expand it (inside
+/// quotes, in a `docker run -e`, in a unit file).
+///
+/// The second return value is a line for the operator, and it is only `Some`
+/// where something was **not** taken at face value: a `~user` form, which is not
+/// expanded here (that needs the password database), and a `~` with no `$HOME`.
+/// Those fall back to the default base — and say so, loudly, because a
+/// substituted directory that nobody mentions is the same class of bug this
+/// ticket is about.
+fn resolve_rsyncd_base(
+    configured: Option<&str>,
+    default_base: PathBuf,
+    cwd: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> (PathBuf, Option<String>) {
+    // An unset *and* an empty value mean the same thing: nothing was chosen.
+    // `RCLONE_GUI_RSYNCD_DIR=` is how a shell "unsets" a variable it already
+    // exported, and reading it as the path `""` would join into the working
+    // directory itself.
+    let raw = match configured.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(raw) => raw,
+        None => return (default_base, None),
+    };
+
+    if let Some(rest) = raw.strip_prefix('~') {
+        // `~` alone, or `~/…`. Anything else after the tilde names another
+        // user, and resolving that needs the password database.
+        if rest.is_empty() || rest.starts_with('/') {
+            return match home {
+                Some(home) => (home.join(rest.trim_start_matches('/')), None),
+                None => (
+                    default_base,
+                    Some(format!(
+                        "RCLONE_GUI_RSYNCD_DIR={raw} cannot be resolved because HOME is not set; \
+                         using the default directory instead. Give an absolute path."
+                    )),
+                ),
+            };
+        }
+        return (
+            default_base,
+            Some(format!(
+                "RCLONE_GUI_RSYNCD_DIR={raw} is not expanded: a '~user' path needs the password \
+                 database. Using the default directory instead. Give an absolute path, or '~/…' \
+                 for your own home."
+            )),
+        );
+    }
+
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        (path, None)
+    } else {
+        // The one line this ticket exists for.
+        (cwd.join(path), None)
+    }
+}
+
 async fn start_rsync_daemon() -> RsyncdState {
     if env::var("RCLONE_GUI_RSYNCD").unwrap_or_default() != "1" {
         return RsyncdState::Disabled;
@@ -873,16 +969,19 @@ async fn start_rsync_daemon() -> RsyncdState {
     // and its working directory is not ours. A bare `data/rsyncd` therefore
     // came up as `data/rsyncd/secrets/rsyncd.secrets must be an absolute path`
     // — measured, and the reason this is not simply a string literal.
+    let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let default_base = match hardening {
         handlers::rsyncd::Hardening::Full => PathBuf::from("/etc/rsyncd"),
-        handlers::rsyncd::Hardening::Rootless => env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join("data")
-            .join("rsyncd"),
+        handlers::rsyncd::Hardening::Rootless => cwd.join("data").join("rsyncd"),
     };
-    let base = env::var("RCLONE_GUI_RSYNCD_DIR")
-        .map(PathBuf::from)
-        .unwrap_or(default_base);
+    let configured = env::var("RCLONE_GUI_RSYNCD_DIR").ok();
+    let home = env::var_os("HOME").map(PathBuf::from);
+    let (base, note) =
+        resolve_rsyncd_base(configured.as_deref(), default_base, &cwd, home.as_deref());
+    if let Some(note) = note {
+        eprintln!("   ⚠️  {note}");
+        tracing::warn!("{note}");
+    }
     let base = base.display();
     let conf = format!("{base}/rsyncd.conf");
     let secrets = format!("{base}/secrets/rsyncd.secrets");
@@ -1900,5 +1999,128 @@ mod bind_tests {
             addr.ip().is_loopback(),
             "default bind address {BIND_DEFAULT} is not loopback"
         );
+    }
+}
+
+/// `RCLONE_GUI_RSYNCD_DIR`, and the silent partial outage a relative value used
+/// to cause (ticket `22c1b001`).
+///
+/// The function under test is pure: the environment is read at the call site and
+/// handed in. That is deliberate — `set_var` is process-wide and `cargo test`
+/// runs everything in one process, so an env-reading test here would have to
+/// serialise against every other test that reads `HOME` or the working
+/// directory.
+#[cfg(test)]
+mod rsyncd_dir_tests {
+    use super::resolve_rsyncd_base;
+    use std::path::{Path, PathBuf};
+
+    fn default_base() -> PathBuf {
+        PathBuf::from("/cwd/data/rsyncd")
+    }
+
+    /// **The regression.** A relative value is resolved against the working
+    /// directory, exactly as the built-in default always was.
+    ///
+    /// Before the fix this came out as `data/rsyncd` verbatim, `DaemonConfig::write`
+    /// refused the relative secrets path
+    /// (`data/rsyncd/secrets/rsyncd.secrets must be an absolute path`), and the
+    /// server carried on **without the rsync transport** — no crash, no reason
+    /// for the operator to suspect anything.
+    ///
+    /// Shown to bite: put `.map(PathBuf::from)` back in place of the resolution
+    /// and this test fails on the first assertion.
+    #[test]
+    fn a_relative_value_is_resolved_against_the_working_directory() {
+        let cwd = Path::new("/cwd");
+        for relative in ["data/rsyncd", "./data/rsyncd", "rsyncd", "../shared/rsyncd"] {
+            let (base, note) = resolve_rsyncd_base(
+                Some(relative),
+                default_base(),
+                cwd,
+                Some(Path::new("/home/u")),
+            );
+            assert!(
+                base.is_absolute(),
+                "{relative} blieb relativ: {} — der Daemon startet damit nicht, und der \
+                 Server läuft ohne rsync-Transport weiter",
+                base.display()
+            );
+            assert_eq!(base, cwd.join(relative), "{relative}");
+            assert!(note.is_none(), "{relative}: unerwartete Meldung {:?}", note);
+        }
+    }
+
+    /// A literal `~` fails exactly like a relative path, and it is easy to
+    /// write in a shell that does not expand it. So it is expanded here.
+    #[test]
+    fn a_tilde_is_expanded_against_home() {
+        let cwd = Path::new("/cwd");
+        let home = Path::new("/home/u");
+
+        let (base, note) = resolve_rsyncd_base(Some("~/rsyncd"), default_base(), cwd, Some(home));
+        assert_eq!(base, PathBuf::from("/home/u/rsyncd"));
+        assert!(note.is_none());
+
+        let (base, note) = resolve_rsyncd_base(Some("~"), default_base(), cwd, Some(home));
+        assert_eq!(base, PathBuf::from("/home/u"));
+        assert!(note.is_none());
+    }
+
+    /// The two `~` forms that are **not** silently substituted: another user's
+    /// home, and a `~` with no `$HOME`. Both fall back to the default — and both
+    /// say so. A substituted directory that nobody mentions is the same class of
+    /// bug this ticket is about.
+    #[test]
+    fn an_unexpandable_tilde_falls_back_and_says_why() {
+        let cwd = Path::new("/cwd");
+
+        let (base, note) = resolve_rsyncd_base(
+            Some("~other/rsyncd"),
+            default_base(),
+            cwd,
+            Some(Path::new("/home/u")),
+        );
+        assert_eq!(base, default_base());
+        let note = note.expect("eine Meldung, die den Grund nennt");
+        assert!(note.contains("~other/rsyncd"), "{note}");
+        assert!(note.contains("password database"), "{note}");
+
+        let (base, note) = resolve_rsyncd_base(Some("~/rsyncd"), default_base(), cwd, None);
+        assert_eq!(base, default_base());
+        let note = note.expect("eine Meldung, die den Grund nennt");
+        assert!(note.contains("HOME is not set"), "{note}");
+    }
+
+    /// Absolute values, values with spaces and a not-yet-existing parent go
+    /// through untouched — measured as working before the fix, and they must
+    /// stay that way.
+    #[test]
+    fn an_absolute_value_is_taken_as_it_is() {
+        let cwd = Path::new("/cwd");
+        for absolute in [
+            "/etc/rsyncd",
+            "/tmp/mit leerzeichen/rsyncd",
+            "/tmp/gibtsnochnicht/tief/rsyncd",
+        ] {
+            let (base, note) = resolve_rsyncd_base(Some(absolute), default_base(), cwd, None);
+            assert_eq!(base, PathBuf::from(absolute));
+            assert!(note.is_none());
+        }
+    }
+
+    /// Unset and empty mean the same thing: nothing was chosen.
+    ///
+    /// `RCLONE_GUI_RSYNCD_DIR=` is how a shell "unsets" a variable it has
+    /// already exported; reading that as the path `""` would join into the
+    /// working directory itself.
+    #[test]
+    fn unset_and_empty_both_give_the_default() {
+        let cwd = Path::new("/cwd");
+        for value in [None, Some(""), Some("   ")] {
+            let (base, note) = resolve_rsyncd_base(value, default_base(), cwd, None);
+            assert_eq!(base, default_base(), "{value:?}");
+            assert!(note.is_none());
+        }
     }
 }

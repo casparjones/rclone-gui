@@ -48,8 +48,22 @@
 //!   nirgends gesetzt (siehe [`production_policy`]).
 //!   Nachweis: `tests::production_policy_erlaubt_keine_privaten_adressen` und
 //!   `tests::ipv4_literal_bleibt_geprueft` — beide feuern, wenn
-//!   `production_policy` das Feld setzt. Dass `start_url_fetch` genau dieses
-//!   Regelwerk weitergibt, ist dagegen **nur durch Codelesen** belegt.
+//!   `production_policy` das Feld setzt.
+//!
+//!   Dass `start_url_fetch` genau dieses Regelwerk **weitergibt**, war lange
+//!   nur durch Codelesen belegt — und war damit die eigentliche Lücke
+//!   (Ticket `4d739b23`): tauschte man an der Aufrufstelle
+//!   `production_policy()` gegen `GuardPolicy::for_tests()`, blieb die ganze
+//!   Testreihe grün und `http://169.254.169.254/…` landete im Home. Ein
+//!   Riegel, der nur dort geprüft ist, wo er definiert wird, ist keiner.
+//!   Nachweis jetzt: `tests::handler_weist_die_metadaten_adresse_ab_und_legt_nichts_im_home_an`
+//!   und `tests::handler_weist_alle_privaten_ziele_ab` — sie fahren
+//!   `start_url_fetch` selbst, mit dem Regelwerk, das der Handler sich holt.
+//!   Gemessen: derselbe Tausch macht genau diese zwei Tests rot (612/2), alle
+//!   anderen bleiben grün. Dazu
+//!   `tests::positivkontrolle_derselbe_weg_laesst_ein_erlaubtes_ziel_durch`,
+//!   damit die Ablehnung nicht daran liegen kann, dass die Route gar nichts
+//!   tut.
 //! * **Kein `scope=system`.** Wurzel ist immer das Home des anfragenden
 //!   Nutzers — dieselbe Begründung wie beim Sync: ein Hintergrundlauf, der
 //!   irgendwohin schreiben darf, ist nicht zurücknehmbar.
@@ -1622,6 +1636,240 @@ mod tests {
             assert!(parse_url(url).is_err(), "{url} muss abgelehnt werden");
         }
         assert!(parse_url("http://example.com/x").is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Regel 4 **an der Aufrufstelle**: der Axum-Handler selbst
+    //
+    // Die beiden Tests weiter oben pruefen `production_policy()` — also die
+    // Stelle, an der das Regelwerk *definiert* wird. Sie sagen nichts darueber,
+    // welches Regelwerk `start_url_fetch` tatsaechlich *weitergibt*. Genau
+    // diese Luecke war Ticket 4d739b23: tauschte man den Aufruf von
+    // `production_policy()` in `start_url_fetch` gegen `GuardPolicy::for_tests()`,
+    // blieben alle Tests gruen, und `http://169.254.169.254/…` lief durch.
+    //
+    // Die Tests hier fahren deshalb `start_url_fetch` selbst — mit dem echten
+    // Resolver, dem echten Transport und dem Regelwerk, das der Handler sich
+    // selbst holt. Kein Parameter, an dem ein Test etwas beschoenigen koennte.
+    // -----------------------------------------------------------------------
+
+    /// Ein angemeldeter Nutzer, dessen Home `home` ist.
+    ///
+    /// `user_root(.., RootScope::Home)` liest ausschliesslich `home_path`, es
+    /// braucht dafuer also keine Datenbank. Die `id` ist je Aufruf neu, damit
+    /// die Job-Tabelle (prozessweit und von parallelen Tests geteilt) nach
+    /// Eigentuemer gefiltert werden kann.
+    fn angemeldeter_nutzer(home: &Path) -> CurrentUser {
+        let id = format!("u-4d739b23-{}", Uuid::new_v4());
+        let now = Utc::now();
+        CurrentUser {
+            user: crate::database::User {
+                id: id.clone(),
+                // Auch der Name ist je Aufruf neu: `DownloadSlots` zaehlt
+                // gleichzeitige Abrufe **je Nutzername**, und parallele Tests
+                // wuerden sich sonst gegenseitig die Plaetze wegnehmen.
+                username: format!("handlertest-{}", Uuid::new_v4()),
+                password_hash: String::new(),
+                role: "user".to_string(),
+                home_path: home.to_string_lossy().to_string(),
+                is_active: true,
+                created_at: now,
+                last_login_at: None,
+            },
+            session: crate::database::Session {
+                id: "s-4d739b23".to_string(),
+                user_id: id,
+                created_at: now,
+                expires_at: now + chrono::Duration::hours(1),
+                user_agent: None,
+                ip: None,
+            },
+        }
+    }
+
+    /// Fuehrt den **echten** Handler aus.
+    async fn ueber_den_handler(
+        current: &CurrentUser,
+        url: &str,
+        target_path: Option<&str>,
+    ) -> ApiResponse<String> {
+        start_url_fetch(
+            Extension(current.clone()),
+            Json(UrlFetchRequest {
+                url: url.to_string(),
+                target_path: target_path.map(str::to_string),
+                filename: None,
+            }),
+        )
+        .await
+        .0
+    }
+
+    /// Wie viele Jobs dieser Nutzer in der gemeinsamen Tabelle hat.
+    async fn eigene_jobs(current: &CurrentUser) -> usize {
+        crate::handlers::sync::list_jobs_for(current)
+            .await
+            .0
+            .data
+            .map(|v| v.len())
+            .unwrap_or(0)
+    }
+
+    /// Die Meldung, die eine gesperrte Adresse erzeugt — wortgleich mit
+    /// `user_message(GuardError::BlockedAddress(_))`.
+    const GESPERRT: &str =
+        "Diese Adresse liegt in einem gesperrten Bereich und wird nicht abgerufen";
+
+    #[tokio::test]
+    async fn handler_weist_die_metadaten_adresse_ab_und_legt_nichts_im_home_an() {
+        let dir = tempdir("handler-metadaten");
+        let current = angemeldeter_nutzer(&dir);
+
+        let response =
+            ueber_den_handler(&current, "http://169.254.169.254/latest/meta-data/", None).await;
+
+        // Nicht nur „irgendein Fehler": genau die Meldung der Adresspruefung.
+        // Ein DNS-Fehler oder ein nicht erreichbarer Zielordner wuerde hier
+        // auffallen statt als Erfolg der Pruefung durchzugehen.
+        assert!(!response.success, "muss abgewiesen werden");
+        assert_eq!(response.error.as_deref(), Some(GESPERRT));
+        assert!(response.data.is_none(), "kein Job-Handle");
+
+        // Und keine Nebenwirkung: keine Datei im Home, kein Job.
+        assert_eq!(
+            std::fs::read_dir(&dir).expect("lesbar").count(),
+            0,
+            "im Home darf nichts entstehen"
+        );
+        assert_eq!(eigene_jobs(&current).await, 0, "kein Job angelegt");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn handler_weist_alle_privaten_ziele_ab() {
+        let dir = tempdir("handler-privat");
+        let current = angemeldeter_nutzer(&dir);
+
+        // Port 9 (discard) ueberall, damit ein durchgelassener Versuch nicht
+        // an einem geschlossenen Port haengt, sondern messbar durchlaeuft.
+        for url in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1:9/x",
+            "http://[::1]:9/x",
+            "http://0.0.0.0:9/x",
+            "http://10.0.0.1:9/x",
+            "http://192.168.0.1:9/x",
+            "http://172.16.0.1:9/x",
+            // Userinfo: darf die Ablehnung nicht aendern — und die
+            // Zugangsdaten stehen nicht in der Antwort.
+            "http://nutzer:geheim@127.0.0.1:9/x",
+            // Dezimalschreibweise derselben Loopback-Adresse.
+            "http://[::ffff:127.0.0.1]:9/x",
+        ] {
+            let response = ueber_den_handler(&current, url, None).await;
+            assert!(!response.success, "{url} muss abgewiesen werden");
+            assert_eq!(response.error.as_deref(), Some(GESPERRT), "{url}");
+            let message = response.error.unwrap_or_default();
+            assert!(
+                !message.contains("geheim"),
+                "{url}: Zugangsdaten in der Antwort"
+            );
+        }
+
+        // Ein Name, der auf Loopback zeigt — hier laeuft der **echte**
+        // Resolver. Schlaegt die Namensauflösung in der Testumgebung fehl,
+        // waere die Meldung eine andere; dann ist dieser Fall unbrauchbar und
+        // wird uebersprungen, statt einen Fehlschlag vorzutaeuschen.
+        let response = ueber_den_handler(&current, "http://localhost:9/x", None).await;
+        assert!(!response.success, "localhost muss abgewiesen werden");
+        if response.error.as_deref() != Some(GESPERRT) {
+            eprintln!(
+                "Hinweis: 'localhost' nicht aufloesbar, Fall uebersprungen: {:?}",
+                response.error
+            );
+        }
+
+        // Nicht-HTTP-Schemata: dieselbe Route, andere Pruefung (`parse_url`).
+        for url in ["file:///etc/passwd", "ftp://127.0.0.1/x", "gopher://x/"] {
+            let response = ueber_den_handler(&current, url, None).await;
+            assert!(!response.success, "{url} muss abgewiesen werden");
+        }
+
+        assert_eq!(
+            std::fs::read_dir(&dir).expect("lesbar").count(),
+            0,
+            "im Home darf nichts entstehen"
+        );
+        assert_eq!(eigene_jobs(&current).await, 0, "kein Job angelegt");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Positivkontrolle.
+    ///
+    /// Ohne sie beweisen die Tests darueber nur, dass die Route *irgendetwas*
+    /// ablehnt — moeglicherweise den Zielordner, den Dateinamen oder die
+    /// Job-Tabelle. Hier laeuft **derselbe** Weg (`start_url_fetch_for`, also
+    /// der Kern, den `start_url_fetch` aufruft) mit demselben Nutzer, demselben
+    /// Home und demselben Transport; geaendert ist ausschliesslich das
+    /// Regelwerk. Ergebnis: Job entsteht, Datei landet im Home.
+    ///
+    /// Ein Ziel mit oeffentlicher Adresse liesse sich im Test nicht binden —
+    /// jede lokal bindbare Adresse liegt in einem gesperrten Bereich. Genau
+    /// deshalb ist die Kontrolle hier auf `start_url_fetch_for` gesetzt und
+    /// nicht auf `start_url_fetch`.
+    #[tokio::test]
+    async fn positivkontrolle_derselbe_weg_laesst_ein_erlaubtes_ziel_durch() {
+        let dir = tempdir("handler-positiv");
+        let current = angemeldeter_nutzer(&dir);
+        let body = b"positivkontrolle";
+        let mut response =
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).into_bytes();
+        response.extend_from_slice(body);
+        let addr = serve_once(response).await;
+
+        let answer = start_url_fetch_for(
+            &current,
+            UrlFetchRequest {
+                url: format!("http://{}/kontrolle.txt", addr),
+                target_path: None,
+                filename: None,
+            },
+            Arc::new(SystemResolver),
+            Arc::new(StreamingHttpTransport),
+            // Der **einzige** Unterschied zum produktiven Weg.
+            GuardPolicy::for_tests(),
+        )
+        .await
+        .0;
+
+        assert!(
+            answer.success,
+            "erlaubtes Ziel muss durchgehen: {:?}",
+            answer.error
+        );
+        let job_id = answer.data.clone().expect("Job-Handle");
+
+        // Auf die Datei warten — der Abruf laeuft im Hintergrund.
+        let mut landed = None;
+        for _ in 0..100 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if let Ok(mut entries) = std::fs::read_dir(&dir) {
+                if let Some(Ok(e)) = entries.find(|e| {
+                    e.as_ref()
+                        .map(|e| !e.file_name().to_string_lossy().starts_with(".rclone-gui-"))
+                        .unwrap_or(false)
+                }) {
+                    landed = Some(e.path());
+                    break;
+                }
+            }
+        }
+        let landed = landed.expect("Datei landet im Home");
+        assert_eq!(std::fs::read(&landed).expect("lesbar"), body.to_vec());
+
+        crate::handlers::sync::drop_job_for_test(&job_id).await;
+        let _ = std::fs::remove_file(log_path(&job_id));
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

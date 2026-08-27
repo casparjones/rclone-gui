@@ -1,7 +1,7 @@
 use crate::models::{ConfigRequest, RcloneConfig};
 use configparser::ini::Ini;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Component, Path};
 use std::process::Stdio;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
@@ -286,6 +286,7 @@ fn is_allowed_remote_name_char(c: char) -> bool {
 /// `ensure_configured_remote_at(&config_path_for(&user.id)?, name)` und geben
 /// **denselben** Pfad als `--config` an rclone weiter. Solange das nicht
 /// geschehen ist, ist die Prüfung bewusst global.
+///
 pub async fn ensure_configured_remote(name: &str) -> anyhow::Result<()> {
     ensure_configured_remote_at(&shared_config_path(), name).await
 }
@@ -307,9 +308,9 @@ pub async fn ensure_configured_remote_at(config_path: &Path, name: &str) -> anyh
         .await
         .map_err(|e| anyhow::anyhow!("rclone configuration is not readable: {}", e))?;
 
-    if configured_remote_names(&contents)
+    if parse_conf_sections(&contents)
         .iter()
-        .any(|configured| configured.eq_ignore_ascii_case(name))
+        .any(|section| section.name.eq_ignore_ascii_case(name))
     {
         Ok(())
     } else {
@@ -318,20 +319,333 @@ pub async fn ensure_configured_remote_at(config_path: &Path, name: &str) -> anyh
     }
 }
 
-/// Abschnitts-Kopfzeilen aus dem Inhalt einer `rclone.conf`.
+/// rclone-`type` und `vendor` aus dem Untertyp, den die Oberfläche schickt.
 ///
-/// Bewusst ein eigener, minimaler Parser statt `Ini`: `Ini` normalisiert die
-/// Gross-/Kleinschreibung, hier wird der Name aber so gebraucht, wie er in der
-/// Datei steht.
-fn configured_remote_names(contents: &str) -> Vec<String> {
-    contents
-        .lines()
-        .map(|line| line.trim())
-        .filter_map(|line| line.strip_prefix('['))
-        .filter_map(|line| line.strip_suffix(']'))
-        .map(|name| name.trim().to_string())
-        .filter(|name| !name.is_empty())
-        .collect()
+/// Die Abbildung stand wörtlich an zwei Stellen (`save_to_file`,
+/// `render_configs_ini`) und wird seit `514ce5f5` an einer dritten gebraucht
+/// (`request_reaches_host_filesystem`) – dort entscheidet sie über die
+/// Zulässigkeit eines Backends. Drei Kopien einer Abbildung, von der eine
+/// Sicherheitsprüfung abhängt, laufen auseinander; also nur noch eine.
+fn rclone_type_and_vendor(config_type: &str) -> (&str, Option<&str>) {
+    match config_type {
+        "webdav-nextcloud" => ("webdav", Some("nextcloud")),
+        "webdav-owncloud" => ("webdav", Some("owncloud")),
+        "webdav-sharepoint" => ("webdav", Some("sharepoint")),
+        "webdav-fastmail" => ("webdav", Some("fastmail")),
+        "webdav-other" => ("webdav", Some("other")),
+        other => (other, None),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wo ein Remote im Dateisystem des Wirtssystems ansetzt (Ticket `514ce5f5`)
+// ---------------------------------------------------------------------------
+//
+// Der Befund: der rechte Pane listete über ein Remote mit `type = local` ab
+// `/`, während links `home_path` griff. Die Umgehung lief **nicht** über einen
+// Pfad-Trick, sondern über die Wahl des Backends — ein `type=local`-Remote
+// zeigt auf das lokale Dateisystem, und dort wandte niemand `user_root` an.
+//
+// Die getroffene Entscheidung: `type=local` bleibt **für alle** erlaubt, aber
+// der Home-Pfad greift auch dort — kein Verbot, keine Admin-Ausnahme. Damit
+// bricht kein bestehender Eintrag weg; er zeigt nur noch das Home des
+// jeweiligen Nutzers.
+//
+// Durchsetzen kann das nur, wer weiss, **wo** ein Remote im Dateisystem
+// ansetzt. Genau das liefert dieser Abschnitt; die Grenze selbst zieht
+// `src/handlers/files.rs` mit `user_root` und `resolve_within_root` — denselben
+// beiden Funktionen wie der lokale Pane.
+
+/// Backends, die unmittelbar das Dateisystem des Wirtssystems ansprechen.
+const HOST_FILESYSTEM_BACKENDS: &[&str] = &["local"];
+
+/// Backends, die ein **anderes** Ziel umhüllen. Ihr Ziel steht in `remote =`
+/// und kann selbst ein Dateisystempfad (`remote = /etc`) oder ein
+/// `type=local`-Remote sein — dieselbe Lücke, nur eine Ebene tiefer. Deshalb
+/// wird die Kette verfolgt.
+const WRAPPING_BACKENDS: &[&str] = &["alias", "crypt", "chunker", "compress", "hasher", "cache"];
+
+/// Backends, die **mehrere** Ziele umhüllen (`upstreams =`). Sie setzen
+/// mehrere Bäume übereinander; welcher davon einen Pfad beantwortet, entscheidet
+/// rclone. Ein einzelner Ansatzpunkt lässt sich daraus nicht ableiten.
+const MULTI_WRAPPING_BACKENDS: &[&str] = &["union", "combine"];
+
+/// Obergrenze für die Tiefe der Umhüllungskette. Wer sie überschreitet, gilt
+/// als „erreicht das Wirtssystem an unbestimmter Stelle" — im Zweifel abweisen,
+/// nicht durchlassen.
+const MAX_WRAP_DEPTH: usize = 8;
+
+/// Wo ein Remote im Dateisystem des Wirtssystems ansetzt.
+///
+/// `None` als Ergebnis von [`host_reach_of_remote_at`] heisst: das Remote
+/// spricht kein lokales Dateisystem an (ein Netz-Backend). Dann gibt es hier
+/// nichts zu begrenzen — der Pfad geht unverändert an rclone, so wie bisher.
+#[derive(Clone, PartialEq, Eq)]
+pub enum HostReach {
+    /// `type = local`: der an rclone übergebene Pfad **ist** der Pfad im
+    /// Wirtssystem. Damit lässt sich die Grenze vollständig durchsetzen — der
+    /// Aufrufer übergibt einen bereits kanonisierten absoluten Pfad aus dem
+    /// Home des Nutzers.
+    Direct,
+    /// Das Remote hängt an einem festen Punkt im Wirtssystem (`alias`, `crypt`
+    /// … mit `remote = <pfad>`). Der übergebene Pfad ist relativ dazu, also
+    /// muss dieser Ansatzpunkt selbst im Home liegen.
+    Rooted(std::path::PathBuf),
+    /// Erreicht das Wirtssystem, aber der Ansatzpunkt ist nicht bestimmbar:
+    /// ein `union`/`combine` über mehrere Bäume, rclones On-the-fly-Syntax
+    /// (`:local:`) in der Konfiguration, ein Abschnitt ohne `type`, ein
+    /// Ringschluss, eine zu tiefe Kette. Hier ist keine Grenze durchsetzbar,
+    /// also wird abgewiesen.
+    Unbounded,
+}
+
+/// Ein `rclone.conf`-Abschnitt: Name und Schlüssel/Wert-Paare, so wie sie in
+/// der Datei stehen.
+///
+/// Bewusst ein eigener, minimaler Parser statt `Ini`: `Ini` normalisiert Namen
+/// und schluckt Doppelungen, hier wird über den Inhalt aber **entschieden**,
+/// und dann muss der Parser sehen, was rclone sieht.
+struct ConfSection {
+    name: String,
+    entries: Vec<(String, String)>,
+}
+
+fn parse_conf_sections(contents: &str) -> Vec<ConfSection> {
+    let mut sections: Vec<ConfSection> = Vec::new();
+
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+
+        if let Some(rest) = line.strip_prefix('[') {
+            if let Some(name) = rest.strip_suffix(']') {
+                let name = name.trim().to_string();
+                if !name.is_empty() {
+                    sections.push(ConfSection {
+                        name,
+                        entries: Vec::new(),
+                    });
+                }
+                continue;
+            }
+        }
+
+        if let Some((key, value)) = line.split_once('=') {
+            if let Some(section) = sections.last_mut() {
+                section
+                    .entries
+                    .push((key.trim().to_string(), value.trim().to_string()));
+            }
+        }
+    }
+
+    sections
+}
+
+/// Der Wert eines Schlüssels im **ersten** Abschnitt dieses Namens. rclone
+/// liest Namen ohne Rücksicht auf Gross-/Kleinschreibung, also hier auch.
+fn section_value<'a>(sections: &'a [ConfSection], name: &str, key: &str) -> Option<&'a str> {
+    sections
+        .iter()
+        .find(|section| section.name.eq_ignore_ascii_case(name))
+        .and_then(|section| {
+            section
+                .entries
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(key))
+                .map(|(_, v)| v.as_str())
+        })
+}
+
+/// Setzt `name` – direkt oder über eine Kette von umhüllenden Backends – im
+/// Dateisystem des Wirtssystems an, und wenn ja: wo?
+///
+/// Durchgehend **fail-closed**: was die Funktion nicht versteht (kein `type`,
+/// ein unbekannter Name, eine zu tiefe Kette, ein Ringschluss), ist
+/// [`HostReach::Unbounded`] und wird vom Aufrufer abgewiesen. Ein Irrtum in
+/// diese Richtung kostet eine Funktion, ein Irrtum in die andere das Home jedes
+/// Nutzers.
+fn host_reach(sections: &[ConfSection], name: &str) -> Option<HostReach> {
+    host_reach_inner(sections, name, Vec::new())
+}
+
+/// `chain` ist der Weg, über den dieser Abschnitt erreicht wurde – bewusst
+/// **je Zweig** eine eigene Liste und nicht eine gemeinsame.
+///
+/// Real passiert: mit einer geteilten Liste galt bei einem `union` über
+/// `cloud:a cloud:b` der zweite Zweig als Ringschluss, weil der erste `cloud`
+/// schon eingetragen hatte — ein harmloses Netz-Backend wurde dadurch als
+/// „unbestimmbar" abgewiesen. Die Tiefe ist auf [`MAX_WRAP_DEPTH`] begrenzt,
+/// also kostet das Kopieren nichts.
+fn host_reach_inner(
+    sections: &[ConfSection],
+    name: &str,
+    mut chain: Vec<String>,
+) -> Option<HostReach> {
+    if chain.len() > MAX_WRAP_DEPTH {
+        return Some(HostReach::Unbounded);
+    }
+
+    let lowered = name.to_ascii_lowercase();
+    if chain.contains(&lowered) {
+        // Ringschluss. rclone käme hier auch nicht weiter, aber „kommt nicht
+        // weiter" ist keine Aussage über die Grenze — also abweisen.
+        return Some(HostReach::Unbounded);
+    }
+    chain.push(lowered);
+
+    let Some(backend) = section_value(sections, name, "type") else {
+        // Kein Abschnitt oder kein `type`: unbekannte Form.
+        return Some(HostReach::Unbounded);
+    };
+    let backend = backend.trim().to_ascii_lowercase();
+
+    if backend.is_empty() {
+        return Some(HostReach::Unbounded);
+    }
+    if HOST_FILESYSTEM_BACKENDS.contains(&backend.as_str()) {
+        return Some(HostReach::Direct);
+    }
+
+    if WRAPPING_BACKENDS.contains(&backend.as_str()) {
+        let Some(target) = section_value(sections, name, "remote") else {
+            // Ein `alias` ohne `remote` steht in rclone für das
+            // Arbeitsverzeichnis – also das Wirtssystem, an unbestimmter Stelle.
+            return Some(HostReach::Unbounded);
+        };
+        return target_host_reach(sections, target, &chain);
+    }
+
+    if MULTI_WRAPPING_BACKENDS.contains(&backend.as_str()) {
+        let Some(upstreams) = section_value(sections, name, "upstreams") else {
+            return Some(HostReach::Unbounded);
+        };
+        let touches_host = upstreams.split_whitespace().any(|upstream| {
+            // `combine` schreibt `verzeichnis=remote:pfad`. Der Teil vor dem
+            // ersten `=` ist der Name im zusammengesetzten Baum, nicht das
+            // Ziel; ein Ziel selbst enthält kein `=`.
+            let target = upstream.split_once('=').map_or(upstream, |(_, rest)| rest);
+            target_host_reach(sections, target, &chain).is_some()
+        });
+        // Mehrere Bäume übereinander: welcher einen Pfad beantwortet,
+        // entscheidet rclone. Ein Ansatzpunkt ist daraus nicht ableitbar.
+        return touches_host.then_some(HostReach::Unbounded);
+    }
+
+    None
+}
+
+/// Ein rclone-Ziel, wie es in `remote =` oder `upstreams =` steht: entweder
+/// `name:pfad`, oder ein Dateisystempfad ohne Doppelpunkt, oder rclones
+/// On-the-fly-Syntax `:backend:pfad`.
+fn target_host_reach(
+    sections: &[ConfSection],
+    target: &str,
+    chain: &[String],
+) -> Option<HostReach> {
+    let target = target.trim();
+
+    if target.is_empty() {
+        // Leeres Ziel ist das Arbeitsverzeichnis des Prozesses.
+        return Some(HostReach::Unbounded);
+    }
+    if target.starts_with(':') {
+        // `:local:/etc` – ein nicht konfiguriertes Backend, genau die Lücke aus
+        // `5d31b2f7`. Hier steht sie in der Konfiguration statt in der Anfrage.
+        return Some(HostReach::Unbounded);
+    }
+
+    match target.split_once(':') {
+        // Kein Doppelpunkt: ein Pfad im Dateisystem des Wirtssystems. Ein
+        // relativer Pfad ist gegen das Arbeitsverzeichnis zu lesen und damit
+        // nicht verlässlich zu begrenzen.
+        None => absolute_or_unbounded(target),
+        Some((remote_name, sub_path)) => {
+            if remote_name.is_empty()
+                || remote_name.contains('/')
+                || remote_name.contains('\\')
+                || remote_name.contains(char::is_whitespace)
+            {
+                // Kein Remote-Name, den `validate_remote_name` durchliesse –
+                // also kein Remote, sondern ein Pfad.
+                return Some(HostReach::Unbounded);
+            }
+
+            match host_reach_inner(sections, remote_name, chain.to_vec())? {
+                // `hostfs:/unterordner` – der Unterordner ist ein Pfad im
+                // Wirtssystem. Ohne führendes `/` ist es das
+                // Arbeitsverzeichnis.
+                HostReach::Direct => absolute_or_unbounded(sub_path.trim()),
+                HostReach::Rooted(base) => match join_below(&base, sub_path.trim()) {
+                    Some(joined) => Some(HostReach::Rooted(joined)),
+                    None => Some(HostReach::Unbounded),
+                },
+                HostReach::Unbounded => Some(HostReach::Unbounded),
+            }
+        }
+    }
+}
+
+/// Ein absoluter Pfad ist ein bestimmbarer Ansatzpunkt, alles andere nicht.
+fn absolute_or_unbounded(path: &str) -> Option<HostReach> {
+    let path = std::path::PathBuf::from(path);
+    if path.is_absolute()
+        && path
+            .components()
+            .all(|c| !matches!(c, Component::ParentDir))
+    {
+        Some(HostReach::Rooted(path))
+    } else {
+        Some(HostReach::Unbounded)
+    }
+}
+
+/// Hängt einen Unterpfad **unter** eine Basis. `None`, wenn der Unterpfad
+/// nicht eindeutig darunter liegt.
+///
+/// `Path::join` mit einem absoluten Argument **ersetzt** die Basis — genau der
+/// Fehler, der hier eine Grenze aufheben würde. Ein führender Trenner wird
+/// deshalb übergangen: im Pfadraum eines umhüllenden Backends ist `/` dessen
+/// eigene Wurzel, nicht die des Wirtssystems.
+///
+/// Ein `..` führt dagegen zu `None`, statt still zu verschwinden. Wegwerfen
+/// wäre schlimmer als abweisen: rclone würde `..` **befolgen**, und die
+/// Analyse hätte dann einen Ansatzpunkt gemeldet, der nicht der wirkliche ist —
+/// eine Grenze, die am falschen Ort zieht.
+fn join_below(base: &Path, sub_path: &str) -> Option<std::path::PathBuf> {
+    let mut out = base.to_path_buf();
+    for component in Path::new(sub_path).components() {
+        match component {
+            Component::Normal(part) => out.push(part),
+            Component::RootDir | Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Wo setzt dieses Remote in der Konfiguration `config_path` im Dateisystem des
+/// Wirtssystems an? `Ok(None)` heisst: es tut es nicht.
+///
+/// Der Pfad muss **derselbe** sein, der anschliessend als `--config` an rclone
+/// geht. Wer gegen eine andere Datei prüft als rclone liest, prüft nichts —
+/// das war `5d31b2f7`.
+pub async fn host_reach_of_remote_at(
+    config_path: &Path,
+    name: &str,
+) -> anyhow::Result<Option<HostReach>> {
+    let contents = tokio::fs::read_to_string(config_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("rclone configuration is not readable: {}", e))?;
+
+    Ok(host_reach(&parse_conf_sections(&contents), name))
+}
+
+/// Dieselbe Frage gegen die **gemeinsame** Konfiguration.
+pub async fn host_reach_of_remote(name: &str) -> anyhow::Result<Option<HostReach>> {
+    host_reach_of_remote_at(&shared_config_path(), name).await
 }
 
 pub struct ConfigManager {
@@ -529,14 +843,7 @@ impl ConfigManager {
         }
 
         // Handle WebDAV subtypes and set appropriate type and vendor
-        let (actual_type, vendor) = match config_request.config_type.as_str() {
-            "webdav-nextcloud" => ("webdav", Some("nextcloud")),
-            "webdav-owncloud" => ("webdav", Some("owncloud")),
-            "webdav-sharepoint" => ("webdav", Some("sharepoint")),
-            "webdav-fastmail" => ("webdav", Some("fastmail")),
-            "webdav-other" => ("webdav", Some("other")),
-            _ => (config_request.config_type.as_str(), None),
-        };
+        let (actual_type, vendor) = rclone_type_and_vendor(&config_request.config_type);
 
         conf.set(&config_request.name, "type", Some(actual_type.to_string()));
 
@@ -777,14 +1084,7 @@ fn render_configs_ini(configs: &HashMap<String, RcloneConfig>) -> String {
 
     for config in configs.values() {
         // Handle WebDAV subtypes and set appropriate type and vendor
-        let (actual_type, vendor) = match config.config_type.as_str() {
-            "webdav-nextcloud" => ("webdav", Some("nextcloud")),
-            "webdav-owncloud" => ("webdav", Some("owncloud")),
-            "webdav-sharepoint" => ("webdav", Some("sharepoint")),
-            "webdav-fastmail" => ("webdav", Some("fastmail")),
-            "webdav-other" => ("webdav", Some("other")),
-            _ => (config.config_type.as_str(), None),
-        };
+        let (actual_type, vendor) = rclone_type_and_vendor(&config.config_type);
 
         conf.set(&config.name, "type", Some(actual_type.to_string()));
 
@@ -1200,6 +1500,234 @@ fn aes256_encrypt_block(
 mod tests {
     use super::*;
 
+    // -----------------------------------------------------------------------
+    // Ticket `514ce5f5`: wo setzt ein Remote im Wirtssystem an?
+    // -----------------------------------------------------------------------
+
+    fn reach_of(conf: &str, name: &str) -> Option<HostReach> {
+        host_reach(&parse_conf_sections(conf), name)
+    }
+
+    const REACH_CONF: &str = "\
+[hostfs]
+type = local
+
+[cloud]
+type = webdav
+url = https://example.org/dav
+
+[alias_absolut]
+type = alias
+remote = /srv/daten
+
+[alias_relativ]
+type = alias
+remote = daten
+
+[alias_auf_local]
+type = alias
+remote = hostfs:/srv/daten
+
+[alias_auf_local_ohne_pfad]
+type = alias
+remote = hostfs:
+
+[crypt_auf_alias]
+type = crypt
+remote = alias_absolut:tief/er
+
+[crypt_auf_cloud]
+type = crypt
+remote = cloud:verschluesselt
+
+[onthefly]
+type = alias
+remote = :local:/etc
+
+[alias_ohne_ziel]
+type = alias
+
+[sammlung]
+type = union
+upstreams = cloud:a cloud:b
+
+[sammlung_mit_loch]
+type = union
+upstreams = cloud:a hostfs:/etc
+
+[zusammengesetzt]
+type = combine
+upstreams = eins=cloud:a zwei=/srv
+";
+
+    /// Der gemeldete Befund: `type = local` spricht das Wirtssystem an, ein
+    /// Netz-Backend nicht. Wer nur das eine oder nur das andere erkennt,
+    /// begrenzt entweder zu wenig oder macht die App unbenutzbar.
+    #[test]
+    fn a_local_backend_is_direct_and_a_network_backend_is_nothing() {
+        assert!(reach_of(REACH_CONF, "hostfs") == Some(HostReach::Direct));
+        assert!(reach_of(REACH_CONF, "cloud").is_none());
+        assert!(reach_of(REACH_CONF, "crypt_auf_cloud").is_none());
+        assert!(reach_of(REACH_CONF, "sammlung").is_none());
+        // Gross-/Kleinschreibung spielt keine Rolle — rclone liest die Datei
+        // genauso.
+        assert!(reach_of(REACH_CONF, "HOSTFS") == Some(HostReach::Direct));
+    }
+
+    /// Die Umhüllung ist der eigentlich gefährliche Teil: `alias`, `crypt` und
+    /// Freunde tragen ihr Ziel in `remote =`, und das darf ein Pfad oder ein
+    /// `type=local`-Remote sein. Wer nur `type` ansieht, übersieht es.
+    #[test]
+    fn wrapping_backends_yield_the_point_they_hang_at() {
+        assert!(
+            reach_of(REACH_CONF, "alias_absolut")
+                == Some(HostReach::Rooted(std::path::PathBuf::from("/srv/daten")))
+        );
+        assert!(
+            reach_of(REACH_CONF, "alias_auf_local")
+                == Some(HostReach::Rooted(std::path::PathBuf::from("/srv/daten")))
+        );
+        // Die Kette wird zusammengesetzt, nicht abgebrochen.
+        assert!(
+            reach_of(REACH_CONF, "crypt_auf_alias")
+                == Some(HostReach::Rooted(std::path::PathBuf::from(
+                    "/srv/daten/tief/er"
+                )))
+        );
+    }
+
+    /// Alles, was der Ansatzpunkt nicht bestimmbar macht, ist `Unbounded` — und
+    /// der Aufrufer weist es ab. Ein Irrtum in diese Richtung kostet eine
+    /// Funktion, ein Irrtum in die andere das Home jedes Nutzers.
+    #[test]
+    fn the_unknown_is_unbounded() {
+        for name in [
+            // gar nicht konfiguriert
+            "erfunden",
+            // relativer Pfad: gegen das Arbeitsverzeichnis des Prozesses
+            "alias_relativ",
+            // `hostfs:` ohne Pfad ist ebenfalls das Arbeitsverzeichnis
+            "alias_auf_local_ohne_pfad",
+            // rclones On-the-fly-Syntax, in der Konfiguration statt im Namen
+            "onthefly",
+            // `alias` ohne `remote`
+            "alias_ohne_ziel",
+            // mehrere Bäume übereinander: welcher antwortet, entscheidet rclone
+            "sammlung_mit_loch",
+            "zusammengesetzt",
+        ] {
+            assert!(
+                reach_of(REACH_CONF, name) == Some(HostReach::Unbounded),
+                "{} muesste unbestimmbar sein, ist {:?}",
+                name,
+                reach_of(REACH_CONF, name).is_some()
+            );
+        }
+
+        // Abschnitt ohne `type`, und `type` leer.
+        assert!(reach_of("[leer]\nurl = https://x\n", "leer") == Some(HostReach::Unbounded));
+        assert!(reach_of("[leer]\ntype =\n", "leer") == Some(HostReach::Unbounded));
+    }
+
+    /// Ein Ringschluss und eine zu tiefe Kette dürfen den Prozess nicht in eine
+    /// Endlosschleife treiben — beides ist über `/api/configs` auslösbar.
+    #[test]
+    fn cycles_and_deep_chains_terminate_as_unbounded() {
+        assert!(reach_of("[a]\ntype = alias\nremote = a:/x\n", "a") == Some(HostReach::Unbounded));
+        assert!(
+            reach_of(
+                "[a]\ntype = alias\nremote = b:/x\n[b]\ntype = alias\nremote = a:/y\n",
+                "a"
+            ) == Some(HostReach::Unbounded)
+        );
+
+        let mut conf = String::new();
+        for step in 0..(MAX_WRAP_DEPTH + 4) {
+            conf.push_str(&format!(
+                "[a{}]\ntype = alias\nremote = a{}:/x\n",
+                step,
+                step + 1
+            ));
+        }
+        conf.push_str("[cloud]\ntype = webdav\n");
+        assert!(reach_of(&conf, "a0") == Some(HostReach::Unbounded));
+    }
+
+    /// `Path::join` mit einem absoluten Argument **ersetzt** die Basis. Genau
+    /// das würde hier eine Grenze aufheben, also tut `join_below` es nicht.
+    /// `Path::join` mit einem absoluten Argument **ersetzt** die Basis. Genau
+    /// das würde hier eine Grenze aufheben, also tut `join_below` es nicht —
+    /// und ein `..` wird abgewiesen statt weggeworfen: rclone würde es
+    /// befolgen, und ein weggeworfenes `..` hätte einen Ansatzpunkt gemeldet,
+    /// der nicht der wirkliche ist.
+    #[test]
+    fn a_subpath_can_never_replace_or_leave_its_base() {
+        let base = Path::new("/srv/daten");
+        assert_eq!(
+            join_below(base, "unten").as_deref(),
+            Some(Path::new("/srv/daten/unten"))
+        );
+        assert_eq!(
+            join_below(base, "/etc").as_deref(),
+            Some(Path::new("/srv/daten/etc")),
+            "ein absoluter Unterpfad darf die Basis nicht ersetzen"
+        );
+        assert_eq!(
+            join_below(base, "./tief/").as_deref(),
+            Some(Path::new("/srv/daten/tief"))
+        );
+        assert_eq!(join_below(base, "").as_deref(), Some(base));
+        assert_eq!(join_below(base, "../../etc"), None);
+        assert_eq!(join_below(base, "a/../b"), None);
+
+        // Und dasselbe über die Konfiguration, denn dort kommt es an: ein `..`
+        // in einer Kette macht den Ansatzpunkt unbestimmbar, nicht harmlos.
+        assert!(
+            reach_of(
+                "[a]\ntype = local\n[b]\ntype = alias\nremote = a:/srv\n[c]\ntype = crypt\nremote = b:../../etc\n",
+                "c"
+            ) == Some(HostReach::Unbounded)
+        );
+        assert!(
+            reach_of(
+                "[a]\ntype = local\n[b]\ntype = alias\nremote = a:/srv\n[c]\ntype = crypt\nremote = b:/unten\n",
+                "c"
+            ) == Some(HostReach::Rooted(std::path::PathBuf::from("/srv/unten")))
+        );
+    }
+
+    /// Gegenprobe zur Analyse selbst: gegen dieselbe Datei liefert die
+    /// Bestandsprüfung `ensure_configured_remote_at` für ein
+    /// `type=local`-Remote ein glattes `Ok` — genau der gemeldete Befund. Ohne
+    /// diesen Test belegen die obigen nicht, dass überhaupt etwas fehlte.
+    #[tokio::test]
+    async fn the_existing_check_says_nothing_about_the_backend() {
+        let dir = scratch_dir("514ce5f5-reach");
+        let conf = dir.join("rclone.conf");
+        std::fs::write(&conf, REACH_CONF).expect("conf schreibbar");
+
+        assert!(
+            ensure_configured_remote_at(&conf, "hostfs").await.is_ok(),
+            "die Bestandspruefung laesst ein type=local-Remote durch"
+        );
+        assert!(
+            host_reach_of_remote_at(&conf, "hostfs")
+                .await
+                .expect("lesbar")
+                == Some(HostReach::Direct)
+        );
+        assert!(host_reach_of_remote_at(&conf, "cloud")
+            .await
+            .expect("lesbar")
+            .is_none());
+
+        // Und der Riegel aus `5d31b2f7` steht davor und unabhängig davon.
+        assert!(ensure_configured_remote_at(&conf, ":local:").await.is_err());
+        assert!(ensure_configured_remote_at(&conf, "[evil]").await.is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn accepts_plain_remote_names() {
         for name in [
@@ -1264,7 +1792,11 @@ type = drive
 type = webdav
 url = https://example.org/[nicht]
 ";
-        assert_eq!(configured_remote_names(conf), vec!["gdrive", "MyBox"]);
+        let names: Vec<String> = parse_conf_sections(conf)
+            .into_iter()
+            .map(|section| section.name)
+            .collect();
+        assert_eq!(names, vec!["gdrive", "MyBox"]);
     }
 
     #[tokio::test]

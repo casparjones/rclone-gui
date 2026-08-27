@@ -3142,10 +3142,12 @@ mod tests {
 
         // Still valid 26 hours in — the old behaviour logged out at 24.
         let after = created_at + ChronoDuration::hours(26);
-        assert!(database::get_valid_session(&pool, &outcome.token.hash(), after)
-            .await
-            .expect("lookup")
-            .is_some());
+        assert!(
+            database::get_valid_session(&pool, &outcome.token.hash(), after)
+                .await
+                .expect("lookup")
+                .is_some()
+        );
 
         // And it cost a handful of writes, not one per request: with a 24 h
         // window renewed at half, twelve two-hour hops touch the row twice.
@@ -3200,10 +3202,12 @@ mod tests {
             .expect("login");
 
         let after = outcome.session.created_at + ChronoDuration::hours(25);
-        assert!(database::get_valid_session(&pool, &outcome.token.hash(), after)
-            .await
-            .expect("lookup")
-            .is_none());
+        assert!(
+            database::get_valid_session(&pool, &outcome.token.hash(), after)
+                .await
+                .expect("lookup")
+                .is_none()
+        );
         // And the renewal path cannot bring it back.
         assert!(database::renew_session(
             &pool,
@@ -3247,11 +3251,10 @@ mod tests {
                 .expect("lookup")
                 .unwrap_or_else(|| panic!("session gone after {minutes} min"));
 
-            if let SessionRefresh::Renewed { session, .. } = refresh_session(
-                &pool, &config, &raw, &session, now,
-            )
-            .await
-            .expect("refresh")
+            if let SessionRefresh::Renewed { session, .. } =
+                refresh_session(&pool, &config, &raw, &session, now)
+                    .await
+                    .expect("refresh")
             {
                 last_seen = session.expires_at;
             }
@@ -3438,7 +3441,10 @@ mod tests {
         };
         let cookie = set_cookie.expect("a renewal must refresh the cookie");
 
-        assert!(cookie.contains(&raw), "the cookie must carry the same token");
+        assert!(
+            cookie.contains(&raw),
+            "the cookie must carry the same token"
+        );
         assert!(cookie.contains("HttpOnly"));
         assert!(cookie.contains("SameSite=Lax"));
         assert!(cookie.contains("Secure"));

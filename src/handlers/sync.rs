@@ -81,10 +81,14 @@ pub enum JobStatus {
     /// Endzustand mit Begründung. Der Text ist reine Anzeige — **keine** Stelle
     /// im Code leitet daraus noch eine Entscheidung ab.
     Failed { reason: String },
-    /// Vom Nutzer abgebrochen. Noch nicht erzeugt; der Abbruch-Knopf ist ein
-    /// eigenes Ticket. Der Zustand steht hier, damit Terminal-Logik und
-    /// Serialisierung ihn von Anfang an mit abdecken.
-    #[allow(dead_code)]
+    /// Vom Nutzer abgebrochen.
+    ///
+    /// **Ein eigener Endzustand, kein Fehlschlag.** Dasselbe Argument wie bei
+    /// [`JobStatus::Partial`]: als `Failed` gemeldet wäre es ein Fehlalarm über
+    /// etwas, das der Nutzer selbst ausgelöst hat, und als `Completed` würde
+    /// verschwiegen, dass die Übertragung unvollständig ist. Was bis zum
+    /// Abbruch im Ziel geschrieben wurde, **bleibt dort liegen** — das ist
+    /// unvermeidbar, steht aber in der Antwort des Endpunkts und im Job-Log.
     Cancelled,
 }
 
@@ -603,11 +607,40 @@ pub fn classify_rsync_exit(code: Option<i32>) -> JobStatus {
 /// Der Aufruf steht in `start_sync_for` vor der Job-Anlage; ein abgelehnter
 /// Request hinterlässt weder Job noch Logdatei noch Prozess.
 async fn select_engine(sync_request: &SyncRequest) -> anyhow::Result<Arc<dyn SyncEngine>> {
+    select_engine_at(None, sync_request).await
+}
+
+/// Dieselbe Wahl, mit der Möglichkeit, die `rclone.conf` zu benennen.
+///
+/// `None` ist der produktive Fall und heisst „die gemeinsame Konfiguration",
+/// also wortgleich der Aufruf von vorher. Ein Pfad kommt **nur** aus den Tests:
+/// der Ort der gemeinsamen Konfiguration ist relativ zum Arbeitsverzeichnis,
+/// und ein Test darf weder das Arbeitsverzeichnis des Prozesses umstellen
+/// (prozessweit, mit allen anderen Tests im selben Prozess) noch in die echte
+/// `data/cfg/rclone.conf` schreiben.
+///
+/// Der Umweg ist der Preis dafür, dass die **Verdrahtung** geprüft werden kann
+/// und nicht nur `lookup_peer`. Genau das war die Lücke: das `?` hinter
+/// `lookup_peer` liess sich gegen `.unwrap_or(None)` tauschen — also der
+/// Rückfall auf ein gleichnamiges rclone-Remote einbauen — ohne dass ein Test
+/// fiel. Dagegen stehen jetzt
+/// `an_unusable_peer_never_falls_back_to_a_same_named_rclone_remote` und
+/// `a_valid_peer_wins_over_a_same_named_rclone_remote`.
+async fn select_engine_at(
+    config_path: Option<&std::path::Path>,
+    sync_request: &SyncRequest,
+) -> anyhow::Result<Arc<dyn SyncEngine>> {
     if let Some(target) = rsync_engine::lookup_peer(&sync_request.remote_name).await? {
         return Ok(Arc::new(rsync_engine::RsyncEngine::new(target)));
     }
 
-    crate::config_manager::ensure_configured_remote(&sync_request.remote_name).await?;
+    match config_path {
+        None => crate::config_manager::ensure_configured_remote(&sync_request.remote_name).await?,
+        Some(path) => {
+            crate::config_manager::ensure_configured_remote_at(path, &sync_request.remote_name)
+                .await?
+        }
+    }
     Ok(Arc::new(RcloneEngine))
 }
 
@@ -1100,6 +1133,87 @@ pub async fn cancel_target(job_id: &str) -> CancelTarget {
     match JOB_CANCELS.lock().await.get(job_id) {
         Some(flag) => CancelTarget::Running(Arc::clone(flag)),
         None => CancelTarget::Unknown,
+    }
+}
+
+/// `POST /api/sync/:job_id/cancel` — bricht einen laufenden Übertragungsjob ab.
+///
+/// **Die Besitzprüfung steht vor allem anderen.** [`job_access`] ist die eine
+/// Schleuse; es gibt hier keinen zweiten Weg an einen Job. Ein fremder und ein
+/// unbekannter Job antworten deshalb byte-gleich ([`JOB_UNAVAILABLE`]) **und**
+/// zeitgleich: für einen Unberechtigten passiert genau eine Suche in einer
+/// `HashMap` und dann die Rückgabe — kein Dateisystem, keine Datenbank. Genau
+/// das war an anderer Stelle der Fehler, wo die Pfadauflösung vor der Prüfung
+/// lief und die Dauer damit die *Dateiexistenz* verriet (Ticket `06955e97`).
+/// Deshalb wird das Job-Log erst **nach** der Prüfung angefasst.
+///
+/// **Idempotent.** Ein zweiter Abbruch und der Abbruch eines schon beendeten
+/// Jobs sind kein Fehler: der gewünschte Zustand ist erreicht, und ein Nutzer,
+/// der zweimal drückt, hat nichts falsch gemacht. Der Text unterscheidet die
+/// Fälle, das Ergebnis nicht.
+///
+/// **Nur Sync-Läufe.** Ein URL-Abruf hat seinen eigenen Endpunkt
+/// (`/api/download-url/:job_id/cancel`), weil er sein Log anders schreibt; ein
+/// Abruf über diese Route ist hier so unzugänglich wie ein fremder Job — also
+/// wieder dieselbe Antwort.
+///
+/// Was bis zum Abbruch im Ziel geschrieben wurde, bleibt liegen. Das lässt sich
+/// nicht vermeiden, und es steht deshalb in der Antwort und im Job-Log.
+pub async fn cancel_sync_for(
+    current: &CurrentUser,
+    job_id: String,
+) -> ResponseJson<ApiResponse<String>> {
+    if job_access(&job_id, current).await != Some(JobKind::Sync) {
+        return ResponseJson(ApiResponse::error(JOB_UNAVAILABLE));
+    }
+
+    match cancel_target(&job_id).await {
+        CancelTarget::Running(flag) => {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            info!("🛑 Abbruch angefordert für Job {}", job_id);
+            append_job_log(&job_id, CANCEL_LOG_LINE).await;
+            ResponseJson(ApiResponse::success(CANCEL_REQUESTED.to_string()))
+        }
+        // Schon in einem Endzustand — oder zwischen Schleuse und hier aus der
+        // Tabelle gefallen. Beides ist „nichts mehr zu tun" und kein Fehler.
+        CancelTarget::Finished | CancelTarget::Unknown => {
+            ResponseJson(ApiResponse::success(CANCEL_ALREADY_DONE.to_string()))
+        }
+    }
+}
+
+/// Antwort auf einen angenommenen Abbruch. Nennt ausdrücklich, dass im Ziel
+/// Geschriebenes liegen bleibt: das ist unvermeidbar, und es zu verschweigen
+/// wäre die schlechtere Hälfte davon.
+const CANCEL_REQUESTED: &str = "Abbruch angefordert. Was bis hierhin im Ziel geschrieben wurde, \
+                                bleibt dort liegen und wird nicht zurückgenommen.";
+
+/// Antwort, wenn nichts mehr abzubrechen war.
+const CANCEL_ALREADY_DONE: &str = "Dieser Job ist bereits beendet.";
+
+/// Die Zeile, die der Abbruch im Job-Log hinterlässt.
+const CANCEL_LOG_LINE: &str = "Abbruch angefordert (SIGTERM, danach SIGKILL). Bereits \
+                               übertragene Dateien bleiben im Ziel liegen.";
+
+/// Hängt eine Zeile an das Log eines Jobs.
+///
+/// `job_id` hat die Schleuse passiert, ist also ein Schlüssel aus der
+/// Jobtabelle und kein beliebiges Pfadsegment — dieselbe Begründung wie in
+/// `parse_latest_progress_from_log`. Ein Fehlschlag wird geloggt und nicht
+/// gemeldet: der Abbruch selbst ist längst angefordert, und ihn wegen eines
+/// nicht schreibbaren Logs als gescheitert zu melden wäre falsch.
+async fn append_job_log(job_id: &str, line: &str) {
+    use tokio::io::AsyncWriteExt;
+
+    let path = internal_log_path(job_id);
+    let entry = format!("{} {}\n", Utc::now().to_rfc3339(), line);
+    match fs::OpenOptions::new().append(true).open(&path).await {
+        Ok(mut file) => {
+            if let Err(e) = file.write_all(entry.as_bytes()).await {
+                debug!("⚠️ Job-Log {} nicht beschreibbar: {}", path, e);
+            }
+        }
+        Err(e) => debug!("⚠️ Job-Log {} nicht öffenbar: {}", path, e),
     }
 }
 
@@ -1623,6 +1737,53 @@ async fn delete_own_job(job_id: String) -> ResponseJson<ApiResponse<String>> {
     ResponseJson(ApiResponse::success("Job deleted successfully".to_string()))
 }
 
+/// Wie lange ein abgebrochenes Kind auf SIGTERM reagieren darf, bevor SIGKILL
+/// folgt.
+///
+/// **SIGTERM zuerst, nie SIGKILL sofort.** Ein hart getötetes rsync lässt seine
+/// verwaisten `.name.XXXXXX`-Dateien im Ziel liegen — im Spike mit 85 MB
+/// gemessen — und rsync nimmt sie nie wieder auf; rclone lässt Teildateien
+/// zurück. Auf SIGTERM räumen beide selbst auf. Zehn Sekunden ist derselbe Wert,
+/// den der Daemon in `rsyncd.rs` benutzt (`SIGTERM_GRACE`); ein längeres Fenster
+/// wäre für einen Nutzer, der auf „Abbrechen" gedrückt hat, nicht mehr
+/// erklärbar.
+const CANCEL_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Schickt `signal` an `pid`. `true`, wenn es zugestellt wurde.
+///
+/// Über `kill(1)` statt `libc::kill`: `libc` ist **keine** direkte Abhängigkeit
+/// dieses Crates, und `Cargo.toml` gehört nicht zu diesem Ticket. `kill` liegt
+/// auf dem Host in coreutils und im Image in busybox, ist also überall
+/// vorhanden, wo die Anwendung läuft — dieselbe Annahme, die sie über `rsync`
+/// selbst ohnehin macht. `Child::kill`/`start_kill` ist kein Ersatz: die
+/// schicken SIGKILL, also genau das Signal, das die verwaisten Temp-Dateien
+/// kostet.
+///
+/// Kein Risiko einer wiederverwendeten PID: der Aufrufer hält den `Child` und
+/// hat ihn noch nicht erfolgreich abgeräumt, das Kind ist also höchstens ein
+/// Zombie und seine PID bis dahin vergeben.
+///
+/// Dieselbe Begründung und derselbe Aufbau stehen als `send_signal` in
+/// `rsyncd.rs`. Dort ist die Funktion privat und die Datei gehört einem anderen
+/// Ticket; die zweite Kopie ist bewusst und im Bericht vermerkt.
+async fn send_signal(pid: u32, signal: &str) -> bool {
+    match Command::new("kill")
+        .arg(format!("-{}", signal))
+        .arg(pid.to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+    {
+        Ok(status) => status.success(),
+        Err(e) => {
+            warn!("Signal {} an PID {} nicht zustellbar: {}", signal, pid, e);
+            false
+        }
+    }
+}
+
 async fn execute_sync(
     job_id: String,
     sync_request: SyncRequest,
@@ -1729,23 +1890,59 @@ async fn execute_sync(
     // `wait()`, der andere für `start_kill()`), und das lässt der Borrow-Checker
     // nicht zu. `Child::wait` ist ausdrücklich abbruchsicher (Tokio-Doku), das
     // Wiederaufsetzen verliert den Exit-Status also nicht.
-    let mut cancelled = false;
+    // `Some(zeitpunkt)` heisst „SIGTERM ist raus"; `escalated`, dass SIGKILL
+    // gefolgt ist.
+    let mut cancelled: Option<std::time::Instant> = None;
+    let mut escalated = false;
     let status = loop {
         match tokio::time::timeout(std::time::Duration::from_millis(200), child.wait()).await {
             Ok(status) => break status,
-            Err(_) => {
-                if !cancelled && cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                    warn!("🛑 Job {} wird abgebrochen", job_id);
-                    // SIGKILL. Ein SIGTERM wäre bei rsync die freundlichere
-                    // Wahl, aber `tokio::process` kennt nur diesen Weg ohne
-                    // zusätzliche Abhängigkeit, und der Teiltransfer bleibt
-                    // dank `--partial` trotzdem verwertbar.
+            Err(_) => match cancelled {
+                // Erster Abbruch: SIGTERM.
+                None if cancel.load(std::sync::atomic::Ordering::Relaxed) => {
+                    warn!("🛑 Job {} wird abgebrochen (SIGTERM)", job_id);
+                    match child.id() {
+                        Some(pid) => {
+                            if !send_signal(pid, "TERM").await {
+                                // Konnte nicht zugestellt werden — dann sofort
+                                // hart, statt die Frist abzuwarten.
+                                warn!(
+                                    "🛑 Job {}: SIGTERM nicht zustellbar, sofort SIGKILL",
+                                    job_id
+                                );
+                                if let Err(e) = child.start_kill() {
+                                    warn!("🛑 Job {} liess sich nicht beenden: {}", job_id, e);
+                                }
+                                escalated = true;
+                            }
+                        }
+                        // Ohne PID gibt es nur den Weg über tokio, und der ist
+                        // SIGKILL. Kommt vor, wenn das Kind zwischen `wait()`
+                        // und hier schon geendet hat.
+                        None => {
+                            if let Err(e) = child.start_kill() {
+                                warn!("🛑 Job {} liess sich nicht beenden: {}", job_id, e);
+                            }
+                            escalated = true;
+                        }
+                    }
+                    cancelled = Some(std::time::Instant::now());
+                }
+                // Frist abgelaufen, das Kind lebt noch: jetzt hart.
+                Some(sent) if !escalated && sent.elapsed() >= CANCEL_GRACE => {
+                    warn!(
+                        "🛑 Job {} hat auf SIGTERM nach {}s nicht geendet, SIGKILL folgt. \
+                         Teildateien im Ziel können zurückbleiben.",
+                        job_id,
+                        CANCEL_GRACE.as_secs()
+                    );
                     if let Err(e) = child.start_kill() {
                         warn!("🛑 Job {} liess sich nicht beenden: {}", job_id, e);
                     }
-                    cancelled = true;
+                    escalated = true;
                 }
-            }
+                _ => {}
+            },
         }
     };
 
@@ -1758,7 +1955,7 @@ async fn execute_sync(
         // Ein abgebrochener Lauf ist `Cancelled` und nicht „durch ein Signal
         // beendet" — den Text hätte sonst der Nutzer verursacht und würde ihn
         // als Fehler der Anwendung lesen.
-        _ if cancelled => {
+        _ if cancelled.is_some() => {
             info!("🛑 Job {} abgebrochen", job_id);
             JobStatus::Cancelled
         }
@@ -4381,5 +4578,555 @@ mod tests {
         let _ = std::fs::remove_file(&pid_file);
         let _ = delete_job_for(&user_with_id(TEST_OWNER), id.clone()).await;
         let _ = fs::remove_file(internal_log_path(&id)).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Die Verdrahtung: eine unbrauchbare Gegenstelle fällt **nicht** auf
+    // rclone zurück (Ticket `ae3fdab2`)
+    //
+    // Der Bestand prüfte `lookup_peer` selbst — nicht, was `select_engine` mit
+    // seinem Ergebnis macht. Deshalb blieb `cargo test` grün, als ein Tester
+    // das `?` hinter `lookup_peer` gegen `.unwrap_or(None)` tauschte, also
+    // genau den Rückfall einbaute, den es nicht geben darf: der Push liefe dann
+    // in ein **gleichnamiges rclone-Remote**, und bei `type = local` landen die
+    // Daten im lokalen Dateisystem statt auf der Gegenstelle. Kein Fehler,
+    // keine Warnung, falsches Ziel.
+    //
+    // Jeder Test hier legt deshalb ein gleichnamiges rclone-Remote **daneben**.
+    // Ohne das wäre „kein Rückfall" nicht beobachtbar, sondern nur nicht
+    // beobachtet: `select_engine` würde auch mit Rückfall scheitern, nur mit
+    // der Meldung „Unknown remote".
+    // -----------------------------------------------------------------------
+
+    /// Aufbau für einen Verdrahtungstest: eigenes Peer-Verzeichnis mit CA und
+    /// eine `rclone.conf`, in der `PEER_NAME` als `local`-Remote steht.
+    ///
+    /// Gibt den Pfad des Peer-Verzeichnisses und den der Konfiguration zurück.
+    /// Serialisiert über [`rsync_engine::peers_env_lock`], weil
+    /// `RCLONE_GUI_PEERS_DIR` prozessweit wirkt.
+    fn wiring_fixture(case: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("wiring-ae3fdab2-{}", case));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("Peer-Verzeichnis");
+        std::fs::write(
+            dir.join("ca.crt"),
+            b"-----BEGIN CERTIFICATE-----\nnicht echt\n-----END CERTIFICATE-----\n",
+        )
+        .expect("CA");
+
+        // Das gleichnamige rclone-Remote. `type = local` ist der Fall, der weh
+        // tut: ein Rückfall würde die Daten in das lokale Dateisystem schieben.
+        let config = dir.join("rclone-ae3fdab2.conf");
+        std::fs::write(
+            &config,
+            format!("[{}]\ntype = local\nnounc = true\n", PEER_NAME),
+        )
+        .expect("rclone.conf");
+
+        std::env::set_var(rsync_engine::PEERS_DIR_ENV, &dir);
+        (dir, config)
+    }
+
+    /// Der Name, den Gegenstelle und rclone-Remote **teilen**.
+    const PEER_NAME: &str = "peer-ae3fdab2";
+
+    fn write_peer_file(dir: &std::path::Path, body: &str, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(format!("{}.json", PEER_NAME));
+        std::fs::write(&path, body).expect("Peer-Datei");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).expect("Modus");
+    }
+
+    /// Eine brauchbare Hinterlegung. Die CA liegt als `ca.crt` daneben.
+    const WIRING_PEER: &str = r#"{
+        "host": "localhost",
+        "port": 8740,
+        "module": "pair0123456789abcd",
+        "secret": "deadbeef",
+        "ca_cert": "ca.crt"
+    }"#;
+
+    fn wiring_request() -> SyncRequest {
+        let mut request = sync_request_for_test("/tmp");
+        request.remote_name = PEER_NAME.to_string();
+        request
+    }
+
+    /// **Der Riegel.** Fünf Arten kaputter Hinterlegung, jede mit dem
+    /// gleichnamigen rclone-`local`-Remote daneben. Keine davon darf eine
+    /// Engine liefern.
+    ///
+    /// Der Nachweis, dass dieser Test die Verdrahtung fährt und nicht nur
+    /// `lookup_peer`: mit `.unwrap_or(None)` statt `?` in
+    /// [`select_engine_at`] liefert jeder Durchgang `Ok(RcloneEngine)` und der
+    /// Test fällt durch.
+    ///
+    /// Ein synchroner Test mit eigener Runtime, nicht `#[tokio::test]`: die
+    /// Sperre um die Umgebungsvariable ist ein `std::sync::Mutex`, und ihn über
+    /// einen `await` zu halten ist genau das, was `clippy::await_holding_lock`
+    /// zu Recht meldet. Derselbe Aufbau wie in den Registry-Tests.
+    #[test]
+    fn an_unusable_peer_never_falls_back_to_a_same_named_rclone_remote() {
+        let _guard = rsync_engine::peers_env_lock().lock().expect("Sperre");
+        let (dir, config) = wiring_fixture("mode");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Runtime");
+
+        rt.block_on(async {
+            // 1. Datei für andere lesbar — sie trägt das Modul-Secret.
+            write_peer_file(&dir, WIRING_PEER, 0o644);
+            expect_no_engine(&config, "Modus 0644").await;
+
+            // 2. Kaputtes JSON.
+            write_peer_file(&dir, "{ kein json", 0o600);
+            expect_no_engine(&config, "kaputtes JSON").await;
+
+            // 3. Fehlende CA.
+            write_peer_file(
+                &dir,
+                &WIRING_PEER.replace("ca.crt", "gibtsnicht.crt"),
+                0o600,
+            );
+            expect_no_engine(&config, "fehlende CA").await;
+
+            // 4. CA absolut, ausserhalb des Peer-Verzeichnisses.
+            write_peer_file(
+                &dir,
+                &WIRING_PEER.replace("\"ca.crt\"", "\"/etc/hostname\""),
+                0o600,
+            );
+            expect_no_engine(&config, "CA absolut ausserhalb").await;
+
+            // 5. CA per Symlink aus dem Peer-Verzeichnis hinaus. Die Prüfung
+            //    kanonisiert, der Symlink ändert daran nichts.
+            let link = dir.join("weg.crt");
+            let _ = std::fs::remove_file(&link);
+            std::os::unix::fs::symlink("/etc/hostname", &link).expect("Symlink");
+            write_peer_file(&dir, &WIRING_PEER.replace("ca.crt", "weg.crt"), 0o600);
+            expect_no_engine(&config, "CA per Symlink hinaus").await;
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::remove_var(rsync_engine::PEERS_DIR_ENV);
+    }
+
+    /// Ein Durchgang: `select_engine_at` darf **keine** Engine liefern.
+    ///
+    /// Die Meldung nennt den Fall, damit ein Fehlschlag sagt, *welche* der fünf
+    /// Varianten durchgekommen ist — und sie nennt die Engine, weil `"rclone"`
+    /// genau der Rückfall ist, um den es geht.
+    async fn expect_no_engine(config: &std::path::Path, case: &str) {
+        match select_engine_at(Some(config), &wiring_request()).await {
+            Err(_) => {}
+            Ok(engine) => panic!(
+                "{}: durchgekommen als Engine {:?} — bei \"rclone\" ist es der Rückfall auf das \
+                 gleichnamige Remote, und der Push landet am falschen Ziel",
+                case,
+                engine.name()
+            ),
+        }
+    }
+
+    /// Der Positivfall, ohne den der Riegel oben auch von einem kaputten
+    /// `lookup_peer` erfüllt wäre: eine **gültige** Gegenstelle gewinnt gegen
+    /// das gleichnamige rclone-Remote.
+    #[test]
+    fn a_valid_peer_wins_over_a_same_named_rclone_remote() {
+        let _guard = rsync_engine::peers_env_lock().lock().expect("Sperre");
+        let (dir, config) = wiring_fixture("valid");
+        write_peer_file(&dir, WIRING_PEER, 0o600);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Runtime");
+
+        rt.block_on(async {
+            let engine = select_engine_at(Some(&config), &wiring_request())
+                .await
+                .expect("gültige Gegenstelle");
+            assert_eq!(engine.name(), "rsync", "das rclone-Remote hat gewonnen");
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::remove_var(rsync_engine::PEERS_DIR_ENV);
+    }
+
+    /// Gegenprobe zu beidem: **ohne** Peer-Datei entscheidet dieselbe
+    /// `rclone.conf` auf `rclone`. Damit steht fest, dass die Fehlschläge oben
+    /// aus der Peer-Prüfung kommen und nicht daraus, dass die Konfiguration im
+    /// Test gar nicht gelesen würde.
+    #[test]
+    fn without_a_peer_file_the_same_config_selects_rclone() {
+        let _guard = rsync_engine::peers_env_lock().lock().expect("Sperre");
+        let (dir, config) = wiring_fixture("norsync");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("Runtime");
+
+        rt.block_on(async {
+            let engine = select_engine_at(Some(&config), &wiring_request())
+                .await
+                .expect("rclone-Remote ist konfiguriert");
+            assert_eq!(engine.name(), "rclone");
+
+            // Und ein Name, der in keiner der beiden Quellen steht, wird
+            // abgelehnt — kein stiller Erfolg.
+            let mut unknown = wiring_request();
+            unknown.remote_name = "gibtsnicht-ae3fdab2".to_string();
+            assert!(select_engine_at(Some(&config), &unknown).await.is_err());
+        });
+
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::remove_var(rsync_engine::PEERS_DIR_ENV);
+    }
+
+    // -----------------------------------------------------------------------
+    // Der Restpuffer in `pump_stdout_progress` (Ticket `ae3fdab2`)
+    // -----------------------------------------------------------------------
+
+    /// Der **letzte** Fortschrittssatz kommt ohne Trennzeichen.
+    ///
+    /// `--info=progress2` trennt mit `\r`, nicht mit `\n`: endet der Prozess,
+    /// bevor er den nächsten Wagenrücklauf schreibt, steht der zuletzt
+    /// gemessene Stand als **unvollständige** letzte Zeile im Puffer. Nur der
+    /// Zweig hinter der Leseschleife holt ihn noch heraus.
+    ///
+    /// Vorgeführt: streicht man diesen Zweig, bleibt der Job auf dem vorletzten
+    /// Satz (3.000.000) stehen und dieser Test fällt durch.
+    ///
+    /// **Gefahren wird `pump_stdout_progress` direkt, nicht `execute_sync`.**
+    /// Nicht aus Bequemlichkeit: `execute_sync` startet den Leser als eigene
+    /// Task und wartet am Ende **nicht** auf sie. Eine Messung über
+    /// `execute_sync` misst deshalb ein Wettrennen und nicht den Zweig — sie
+    /// war zuerst so gebaut und schlug mit 3.000.000 fehl, obwohl der Zweig
+    /// vorhanden ist. Der Befund ist notiert; ihn zu beheben (auf die
+    /// Leser-Task warten) gehört nicht in dieses Ticket.
+    #[tokio::test]
+    async fn the_last_record_without_a_separator_still_counts() {
+        let id = format!("stdout-rest-ae3fdab2-{}", Uuid::new_v4());
+        insert_job(&id, JobStatus::Starting).await;
+
+        let engine: Arc<dyn SyncEngine> = Arc::new(StdoutEngine { script: "" });
+
+        // Zwei Sätze, getrennt durch `\r`; der letzte endet **ohne** jedes
+        // Trennzeichen. Zwei `printf`-Aufrufe, damit sie als zwei Schreibvorgänge
+        // in die Pipe gehen — so, wie rsync sie schreibt.
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(concat!(
+                r"printf '\r     3,000,000  27%%    2.76GB/s    0:00:01 (xfr#1, to-chk=4/6)';",
+                r"printf '\r     7,777,777  70%%    2.32GB/s    0:00:02 (xfr#3, to-chk=2/6)'"
+            ))
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("sh");
+        let stdout = child.stdout.take().expect("stdout");
+
+        pump_stdout_progress(stdout, id.clone(), SYNC_JOBS.clone(), engine).await;
+        let _ = child.wait().await;
+
+        {
+            let jobs = SYNC_JOBS.lock().await;
+            let stored = jobs.get(&id).expect("job");
+            assert_eq!(
+                stored.transferred, 7_777_777,
+                "der letzte Satz ohne Trennzeichen ist verloren gegangen"
+            );
+            assert_eq!(stored.total, 11_111_110);
+            assert_eq!(stored.progress, 70.0);
+        }
+
+        let _ = delete_job_for(&user_with_id(TEST_OWNER), id.clone()).await;
+        let _ = fs::remove_file(internal_log_path(&id)).await;
+    }
+
+    /// Gegenprobe: **derselbe** Aufbau, nur mit abschliessendem `\r` hinter dem
+    /// letzten Satz. Dann trägt ihn die Leseschleife, und der Restpuffer ist
+    /// leer. Ohne diese Gegenprobe wäre der Test darüber auch dann grün, wenn
+    /// die Leseschleife den letzten Satz ohnehin sähe — und würde den
+    /// Restpuffer-Zweig gar nicht absichern.
+    #[tokio::test]
+    async fn with_a_trailing_separator_the_read_loop_already_has_it() {
+        let id = format!("stdout-sep-ae3fdab2-{}", Uuid::new_v4());
+        insert_job(&id, JobStatus::Starting).await;
+
+        let engine: Arc<dyn SyncEngine> = Arc::new(StdoutEngine { script: "" });
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg(concat!(
+                r"printf '\r     3,000,000  27%%    2.76GB/s    0:00:01 (xfr#1, to-chk=4/6)';",
+                r"printf '\r     7,777,777  70%%    2.32GB/s    0:00:02 (xfr#3, to-chk=2/6)\r'"
+            ))
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("sh");
+        let stdout = child.stdout.take().expect("stdout");
+
+        pump_stdout_progress(stdout, id.clone(), SYNC_JOBS.clone(), engine).await;
+        let _ = child.wait().await;
+
+        {
+            let jobs = SYNC_JOBS.lock().await;
+            let stored = jobs.get(&id).expect("job");
+            assert_eq!(stored.transferred, 7_777_777);
+        }
+
+        let _ = delete_job_for(&user_with_id(TEST_OWNER), id.clone()).await;
+        let _ = fs::remove_file(internal_log_path(&id)).await;
+    }
+
+    // -----------------------------------------------------------------------
+    // Abbruch über den Endpunkt (Ticket `45130845`, Anforderungen aus `13927646`)
+    // -----------------------------------------------------------------------
+
+    /// Ein laufender Job, dessen Kind seine PID ablegt und auf SIGTERM
+    /// ordentlich aussteigt. Gibt PID-Datei, Marker-Datei und das Skript.
+    ///
+    /// Das Kind ist hier **absichtlich** eine Shell mit `trap` und nicht
+    /// `exec sleep`: nur so lässt sich beobachten, *welches* Signal ankam. Für
+    /// die Frage „ist der Prozess danach weg" gibt es den Bestandstest
+    /// `a_running_sync_is_killed_when_its_cancel_flag_is_set`, der mit `exec`
+    /// arbeitet, weil `rsync-ssl` mit `exec rsync` endet.
+    fn trapping_child(tag: &str) -> (std::path::PathBuf, std::path::PathBuf, &'static str) {
+        let unique = Uuid::new_v4();
+        let pid_file = std::env::temp_dir().join(format!("cancel-45130845-{}-{}.pid", tag, unique));
+        let marker = std::env::temp_dir().join(format!("cancel-45130845-{}-{}.term", tag, unique));
+        let script: &'static str = Box::leak(
+            format!(
+                "trap 'printf TERM > {marker}; exit 143' TERM; echo $$ > {pid}; \
+                 while true; do sleep 0.1; done",
+                marker = marker.display(),
+                pid = pid_file.display()
+            )
+            .into_boxed_str(),
+        );
+        (pid_file, marker, script)
+    }
+
+    /// Wartet, bis das Kind seine PID geschrieben hat.
+    async fn await_pid(pid_file: &std::path::Path) -> u32 {
+        for _ in 0..100 {
+            if let Ok(text) = std::fs::read_to_string(pid_file) {
+                if let Ok(parsed) = text.trim().parse::<u32>() {
+                    return parsed;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        panic!("Kindprozess ist nicht gestartet");
+    }
+
+    /// **Der Kern des Tickets.** Der Besitzer bricht über `cancel_sync_for` ab;
+    /// das Kind bekommt **SIGTERM** (nicht SIGKILL), der Job landet in
+    /// `Cancelled`, und der Prozess ist danach weg.
+    ///
+    /// Der Marker ist der Nachweis über das Signal: er entsteht **nur** im
+    /// `trap`-Zweig. Ein SIGKILL zuerst — der Zustand vor diesem Ticket — lässt
+    /// ihn nicht entstehen, und dieser Test fällt durch. Genau das kostet bei
+    /// rsync die verwaisten `.name.XXXXXX`-Dateien.
+    #[tokio::test]
+    async fn cancelling_sends_sigterm_and_the_process_is_gone_afterwards() {
+        let id = format!("cancel-45130845-{}", Uuid::new_v4());
+        let cancel = Arc::new(AtomicBool::new(false));
+        register_job(
+            job(&id, JobStatus::Starting),
+            TEST_OWNER,
+            JobKind::Sync,
+            Some(Arc::clone(&cancel)),
+        )
+        .await;
+
+        let (pid_file, marker, script) = trapping_child("term");
+        let engine: Arc<dyn SyncEngine> = Arc::new(StdoutEngine { script });
+
+        let id_clone = id.clone();
+        let flag_for_run = Arc::clone(&cancel);
+        let run = tokio::spawn(async move {
+            execute_sync(
+                id_clone,
+                sync_request_for_test("/tmp"),
+                SYNC_JOBS.clone(),
+                engine,
+                flag_for_run,
+            )
+            .await;
+        });
+
+        let pid = await_pid(&pid_file).await;
+
+        // Über den Endpunkt, nicht über die Flagge — die Verdrahtung ist der
+        // Punkt des Tickets.
+        let response = cancel_sync_for(&user_with_id(TEST_OWNER), id.clone()).await;
+        assert!(
+            response.0.success,
+            "Abbruch abgelehnt: {:?}",
+            response.0.error
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(20), run)
+            .await
+            .expect("Lauf endet nach dem Abbruch")
+            .expect("Lauf ohne Panik");
+
+        // Das Signal war SIGTERM. Der Marker entsteht nur im `trap`-Zweig.
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap_or_default(),
+            "TERM",
+            "das Kind hat kein SIGTERM gesehen — bei SIGKILL bleiben bei rsync \
+             verwaiste .name.XXXXXX-Dateien im Ziel liegen"
+        );
+
+        {
+            let jobs = SYNC_JOBS.lock().await;
+            let stored = jobs.get(&id).expect("job");
+            assert!(
+                matches!(stored.status, JobStatus::Cancelled),
+                "Status nach Abbruch: {}",
+                stored.status
+            );
+            // Ein eigener Endzustand: weder Erfolg noch Fehlschlag noch
+            // Teilerfolg — und trotzdem terminal, also löschbar.
+            assert!(!stored.status.is_success());
+            assert!(!stored.status.is_partial());
+            assert!(stored.status.is_terminal());
+            assert_eq!(stored.status.state(), "cancelled");
+            assert!(stored.end_time.is_some(), "end_time fehlt");
+        }
+
+        // Der Prozess ist weg. Gezielt über die gemerkte PID — niemals
+        // `pkill -f`, das trifft die Testserver aller parallel laufenden Agenten.
+        assert!(
+            !std::path::Path::new(&format!("/proc/{}", pid)).exists()
+                || std::fs::read_to_string(format!("/proc/{}/stat", pid))
+                    .map(|s| s.contains(" Z "))
+                    .unwrap_or(true),
+            "Kindprozess {} lebt nach dem Abbruch weiter",
+            pid
+        );
+
+        // Der Hinweis, dass im Ziel Geschriebenes liegen bleibt, steht in der
+        // Antwort **und** im Job-Log.
+        assert!(response
+            .0
+            .data
+            .as_deref()
+            .unwrap_or_default()
+            .contains("bleibt dort liegen"));
+        let log = fs::read_to_string(internal_log_path(&id))
+            .await
+            .unwrap_or_default();
+        assert!(log.contains("Abbruch angefordert"), "Log: {}", log);
+
+        let _ = std::fs::remove_file(&pid_file);
+        let _ = std::fs::remove_file(&marker);
+        let _ = delete_job_for(&user_with_id(TEST_OWNER), id.clone()).await;
+        let _ = fs::remove_file(internal_log_path(&id)).await;
+    }
+
+    /// **Nur der Besitzer.** Ein fremdes Konto und eine unbekannte ID bekommen
+    /// dieselbe Antwort — byte-gleich —, und der fremde Job läuft **weiter**:
+    /// die Flagge bleibt aus.
+    ///
+    /// Dass die beiden Fälle auch **zeitlich** nicht zu unterscheiden sind,
+    /// hängt am Aufbau und nicht an einer Messung: für einen Unberechtigten ist
+    /// [`job_access`] die erste und einzige Anweisung — eine `HashMap`-Suche,
+    /// danach die Rückgabe. Kein Dateisystem, keine Datenbank, kein zweiter
+    /// Zweig. Genau deshalb steht `append_job_log` **hinter** der Prüfung: an
+    /// anderer Stelle verriet die Dauer die Dateiexistenz, weil die
+    /// Pfadauflösung vorher lief.
+    #[tokio::test]
+    async fn a_stranger_cannot_cancel_and_gets_the_same_answer_as_for_an_unknown_job() {
+        let id = format!("cancel-foreign-45130845-{}", Uuid::new_v4());
+        let cancel = Arc::new(AtomicBool::new(false));
+        register_job(
+            job(&id, JobStatus::Running),
+            TEST_OWNER,
+            JobKind::Sync,
+            Some(Arc::clone(&cancel)),
+        )
+        .await;
+
+        let stranger = user_with_id("u-stranger-45130845");
+        let foreign = cancel_sync_for(&stranger, id.clone()).await;
+        let unknown = cancel_sync_for(&stranger, Uuid::new_v4().to_string()).await;
+
+        assert!(!foreign.0.success);
+        assert_eq!(foreign.0.error.as_deref(), Some(JOB_UNAVAILABLE));
+        // Byte-gleich, nicht nur „beides ein Fehler".
+        assert_eq!(foreign.0.error, unknown.0.error);
+        assert_eq!(foreign.0.success, unknown.0.success);
+        assert_eq!(foreign.0.data, unknown.0.data);
+
+        // Und der fremde Job läuft weiter.
+        assert!(
+            !cancel.load(std::sync::atomic::Ordering::SeqCst),
+            "ein fremdes Konto hat die Abbruchflagge gesetzt"
+        );
+
+        drop_job_for_test(&id).await;
+    }
+
+    /// Ein **URL-Abruf** ist über diese Route nicht abbrechbar — er hat seinen
+    /// eigenen Endpunkt. Und die Antwort ist wieder dieselbe, damit die Route
+    /// nicht verrät, welcher Art ein fremder Job ist.
+    #[tokio::test]
+    async fn a_url_fetch_is_not_cancellable_through_the_sync_route() {
+        let id = format!("cancel-fetch-45130845-{}", Uuid::new_v4());
+        let cancel = Arc::new(AtomicBool::new(false));
+        register_job(
+            job(&id, JobStatus::Running),
+            TEST_OWNER,
+            JobKind::UrlFetch,
+            Some(Arc::clone(&cancel)),
+        )
+        .await;
+
+        let response = cancel_sync_for(&user_with_id(TEST_OWNER), id.clone()).await;
+        assert!(!response.0.success);
+        assert_eq!(response.0.error.as_deref(), Some(JOB_UNAVAILABLE));
+        assert!(!cancel.load(std::sync::atomic::Ordering::SeqCst));
+
+        drop_job_for_test(&id).await;
+    }
+
+    /// **Idempotent.** Zweimal abbrechen und ein bereits beendeter Job laufen
+    /// beide sauber durch — kein Fehler.
+    #[tokio::test]
+    async fn a_second_cancel_and_a_finished_job_are_not_an_error() {
+        let id = format!("cancel-twice-45130845-{}", Uuid::new_v4());
+        let cancel = Arc::new(AtomicBool::new(false));
+        register_job(
+            job(&id, JobStatus::Running),
+            TEST_OWNER,
+            JobKind::Sync,
+            Some(Arc::clone(&cancel)),
+        )
+        .await;
+        let owner = user_with_id(TEST_OWNER);
+
+        let first = cancel_sync_for(&owner, id.clone()).await;
+        assert!(first.0.success);
+        assert!(cancel.load(std::sync::atomic::Ordering::SeqCst));
+
+        // Zweiter Versuch, während der Job noch als laufend in der Tabelle
+        // steht: dieselbe Antwort, kein Fehler.
+        let second = cancel_sync_for(&owner, id.clone()).await;
+        assert!(second.0.success);
+        assert_eq!(first.0.data, second.0.data);
+
+        // Und nach dem Endzustand: ebenfalls kein Fehler, nur ein anderer Text.
+        complete_job(&id, JobStatus::Cancelled).await;
+        let third = cancel_sync_for(&owner, id.clone()).await;
+        assert!(
+            third.0.success,
+            "Abbruch eines beendeten Jobs war ein Fehler"
+        );
+        assert_eq!(third.0.data.as_deref(), Some(CANCEL_ALREADY_DONE));
+
+        drop_job_for_test(&id).await;
     }
 }

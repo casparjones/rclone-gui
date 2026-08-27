@@ -168,7 +168,10 @@ mod tests {
         }
 
         assert_eq!(json["issuer"], "https://backup.example.org");
-        assert_eq!(json["token_endpoint"], "https://backup.example.org/oauth/token");
+        assert_eq!(
+            json["token_endpoint"],
+            "https://backup.example.org/oauth/token"
+        );
         assert_eq!(
             json["registration_endpoint"],
             "https://backup.example.org/oauth/register"
@@ -189,7 +192,10 @@ mod tests {
             doc.authorization_endpoint,
             format!("https://x.example{}", super::super::AUTHORIZATION_PATH)
         );
-        assert_eq!(super::super::DISCOVERY_PATH, "/.well-known/oauth-authorization-server");
+        assert_eq!(
+            super::super::DISCOVERY_PATH,
+            "/.well-known/oauth-authorization-server"
+        );
     }
 
     /// OAuth 2.1 forbids the implicit and password grants and PKCE `plain`.
@@ -207,7 +213,10 @@ mod tests {
                 "{forbidden} must not be an advertised response type"
             );
         }
-        assert_eq!(doc.code_challenge_methods_supported, vec!["S256".to_string()]);
+        assert_eq!(
+            doc.code_challenge_methods_supported,
+            vec!["S256".to_string()]
+        );
         assert!(
             !doc.token_endpoint_auth_methods_supported
                 .iter()

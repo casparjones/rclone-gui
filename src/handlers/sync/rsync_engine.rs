@@ -52,7 +52,7 @@ use super::{
 /// Verzeichnis mit den Gegenstellen (eine `<name>.json` je Peer).
 /// Über `RCLONE_GUI_PEERS_DIR` verlegbar, damit ein Test nicht im echten
 /// `data/` arbeiten muss.
-const PEERS_DIR_ENV: &str = "RCLONE_GUI_PEERS_DIR";
+pub(crate) const PEERS_DIR_ENV: &str = "RCLONE_GUI_PEERS_DIR";
 const DEFAULT_PEERS_DIR: &str = "data/peers";
 
 /// Verzeichnis für die kurzlebigen Password-Dateien. Eigenes Verzeichnis mit
@@ -139,6 +139,26 @@ struct PeerFile {
     secret: String,
     /// Pfad zur CA. Relativ wird gegen das Peer-Verzeichnis aufgelöst.
     ca_cert: String,
+}
+
+/// Die Sperre um `RCLONE_GUI_PEERS_DIR`.
+///
+/// `std::env::set_var` wirkt **prozessweit**, und `cargo test` fährt alle Tests
+/// in einem Prozess. Die Sperre steht deshalb hier und nicht im Testmodul: die
+/// Tests der Verdrahtung in `sync.rs` (`select_engine`) verlegen dasselbe
+/// Verzeichnis und müssen sich mit den Registry-Tests hier serialisieren. Zwei
+/// getrennte Sperren wären keine.
+#[cfg(test)]
+pub(crate) fn peers_env_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    let lock = LOCK.get_or_init(|| std::sync::Mutex::new(()));
+    // Vergiftung wieder abräumen. Ein Test, der **während** er die Sperre hält
+    // durchfällt, würde sonst jeden folgenden Test dieser Gruppe mit
+    // `PoisonError` mitreissen — aus einem Fehlschlag würden fünf, und der
+    // eigentliche Befund ginge in der Kaskade unter. Gemessen beim
+    // Mutationsnachweis zu `ae3fdab2`.
+    lock.clear_poison();
+    lock
 }
 
 /// Das Peer-Verzeichnis dieser Instanz.
@@ -1106,12 +1126,7 @@ mod tests {
         });
     }
 
-    /// `std::env::set_var` wirkt prozessweit; die Registry-Tests laufen
-    /// deshalb nacheinander.
-    fn env_lock() -> &'static std::sync::Mutex<()> {
-        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-        LOCK.get_or_init(|| std::sync::Mutex::new(()))
-    }
+    use super::peers_env_lock as env_lock;
 
     // -----------------------------------------------------------------------
     // Fortschritt

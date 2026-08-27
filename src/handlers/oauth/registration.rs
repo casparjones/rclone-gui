@@ -270,10 +270,9 @@ fn too_many() -> Response {
     )
         .into_response();
 
-    response.headers_mut().insert(
-        header::RETRY_AFTER,
-        header::HeaderValue::from_static("600"),
-    );
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, header::HeaderValue::from_static("600"));
 
     response
 }
@@ -308,10 +307,7 @@ pub async fn register(
     }
 
     if body.len() > MAX_BODY_BYTES {
-        return reject(
-            "invalid_client_metadata",
-            "registration body is too large",
-        );
+        return reject("invalid_client_metadata", "registration body is too large");
     }
 
     let request: RegistrationRequest = match serde_json::from_slice(&body) {
@@ -582,9 +578,7 @@ fn check_redirect_uri(uri: &str) -> Result<(), Invalid> {
 
     // Authority = everything up to the first `/`, `?`. It is checked before the
     // path, because `@` in a path is legal and `@` in an authority is userinfo.
-    let authority_end = rest
-        .find(['/', '?'])
-        .unwrap_or(rest.len());
+    let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
     if authority.is_empty() {
         return Err(invalid_uri("redirect_uri has no host"));
@@ -666,20 +660,20 @@ mod tests {
     #[test]
     fn a_redirect_uri_that_could_take_a_code_elsewhere_is_refused() {
         let bad = [
-            "http://peer.example.org/cb",       // plaintext to a remote host
-            "peer.example.org/cb",              // not absolute
-            "/cb",                              // relative
-            "ftp://peer.example.org/cb",        // unknown scheme
-            "javascript://x/%0aalert(1)",       // not http(s)
-            "data:text/html,<script>",          // not http(s)
-            "https://peer.example.org/cb#frag", // fragment
-            "https://user:pw@peer.example.org/cb", // userinfo
+            "http://peer.example.org/cb",           // plaintext to a remote host
+            "peer.example.org/cb",                  // not absolute
+            "/cb",                                  // relative
+            "ftp://peer.example.org/cb",            // unknown scheme
+            "javascript://x/%0aalert(1)",           // not http(s)
+            "data:text/html,<script>",              // not http(s)
+            "https://peer.example.org/cb#frag",     // fragment
+            "https://user:pw@peer.example.org/cb",  // userinfo
             "https://real.example@evil.example/cb", // spoofing shape
-            "https://*.example.org/cb",         // wildcard
-            "https://peer.example.org/c b",     // whitespace
+            "https://*.example.org/cb",             // wildcard
+            "https://peer.example.org/c b",         // whitespace
             "https://peer.example.org\\@evil.example/cb", // backslash confusion
-            "https://",                         // no host
-            "https:///cb",                      // no host
+            "https://",                             // no host
+            "https:///cb",                          // no host
         ];
         for uri in bad {
             let mut req = request();

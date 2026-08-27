@@ -235,9 +235,11 @@ pub async fn ensure_schema(pool: &Pool<Sqlite>) -> Result<()> {
 
     // The cap counts live clients on every registration, and revocation looks
     // clients up by the same column.
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_oauth_clients_is_revoked ON oauth_clients(is_revoked)")
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_oauth_clients_is_revoked ON oauth_clients(is_revoked)",
+    )
+    .execute(pool)
+    .await?;
 
     Ok(())
 }
@@ -365,8 +367,9 @@ pub async fn get_live_client(
     pool: &Pool<Sqlite>,
     client_id: &str,
 ) -> Result<Option<RegisteredClient>> {
-    let sql =
-        format!("SELECT {CLIENT_COLUMNS} FROM oauth_clients WHERE client_id = ? AND is_revoked = 0");
+    let sql = format!(
+        "SELECT {CLIENT_COLUMNS} FROM oauth_clients WHERE client_id = ? AND is_revoked = 0"
+    );
 
     let row = sqlx::query(&sql)
         .bind(client_id)
@@ -381,10 +384,9 @@ pub async fn get_live_client(
 /// For reporting only. **Not** for enforcing the cap — see the note on
 /// [`insert_client`] for why counting first is the bug this avoids.
 pub async fn count_live_clients(pool: &Pool<Sqlite>) -> Result<i64> {
-    let count: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM oauth_clients WHERE is_revoked = 0")
-            .fetch_one(pool)
-            .await?;
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM oauth_clients WHERE is_revoked = 0")
+        .fetch_one(pool)
+        .await?;
 
     Ok(count.0)
 }
@@ -407,11 +409,12 @@ pub async fn verify_client_secret(
 ) -> Result<bool> {
     let candidate_hash = hash_client_secret(candidate);
 
-    let stored: Option<(String,)> =
-        sqlx::query_as("SELECT client_secret_hash FROM oauth_clients WHERE client_id = ? AND is_revoked = 0")
-            .bind(client_id)
-            .fetch_optional(pool)
-            .await?;
+    let stored: Option<(String,)> = sqlx::query_as(
+        "SELECT client_secret_hash FROM oauth_clients WHERE client_id = ? AND is_revoked = 0",
+    )
+    .bind(client_id)
+    .fetch_optional(pool)
+    .await?;
 
     // A miss still runs a comparison, against a value of the same length, so
     // "no such client" and "wrong secret" take the same work.
@@ -428,10 +431,12 @@ pub async fn verify_client_secret(
 /// Removing the rsync module and cutting live transfers is the parent ticket's
 /// job — this only closes the OAuth half.
 pub async fn revoke_client(pool: &Pool<Sqlite>, client_id: &str) -> Result<bool> {
-    let result = sqlx::query("UPDATE oauth_clients SET is_revoked = 1 WHERE client_id = ? AND is_revoked = 0")
-        .bind(client_id)
-        .execute(pool)
-        .await?;
+    let result = sqlx::query(
+        "UPDATE oauth_clients SET is_revoked = 1 WHERE client_id = ? AND is_revoked = 0",
+    )
+    .bind(client_id)
+    .execute(pool)
+    .await?;
 
     Ok(result.rows_affected() > 0)
 }
@@ -485,8 +490,9 @@ mod tests {
     async fn a_registration_round_trips_and_the_secret_is_only_stored_hashed() {
         let pool = pool().await;
 
-        let Registered::Created(client, secret) =
-            insert_client(&pool, sample(), Utc::now()).await.expect("insert")
+        let Registered::Created(client, secret) = insert_client(&pool, sample(), Utc::now())
+            .await
+            .expect("insert")
         else {
             panic!("a fresh table is not at capacity");
         };
@@ -500,19 +506,20 @@ mod tests {
         assert!(!stored.is_revoked);
 
         // The plaintext must not be anywhere in the table.
-        let dump: Vec<(String,)> =
-            sqlx::query_as("SELECT client_secret_hash FROM oauth_clients")
-                .fetch_all(&pool)
-                .await
-                .expect("dump");
+        let dump: Vec<(String,)> = sqlx::query_as("SELECT client_secret_hash FROM oauth_clients")
+            .fetch_all(&pool)
+            .await
+            .expect("dump");
         assert_eq!(dump.len(), 1);
         assert_ne!(dump[0].0, secret.expose(), "the secret is stored in clear");
         assert_eq!(dump[0].0, secret.hash());
         assert_eq!(dump[0].0.len(), 64);
 
-        assert!(verify_client_secret(&pool, &client.client_id, secret.expose())
-            .await
-            .expect("verify"));
+        assert!(
+            verify_client_secret(&pool, &client.client_id, secret.expose())
+                .await
+                .expect("verify")
+        );
         assert!(
             !verify_client_secret(&pool, &client.client_id, "wrong")
                 .await
@@ -530,13 +537,16 @@ mod tests {
     #[tokio::test]
     async fn a_revoked_client_disappears_and_frees_its_slot() {
         let pool = pool().await;
-        let Registered::Created(client, secret) =
-            insert_client(&pool, sample(), Utc::now()).await.expect("insert")
+        let Registered::Created(client, secret) = insert_client(&pool, sample(), Utc::now())
+            .await
+            .expect("insert")
         else {
             panic!("not at capacity");
         };
 
-        assert!(revoke_client(&pool, &client.client_id).await.expect("revoke"));
+        assert!(revoke_client(&pool, &client.client_id)
+            .await
+            .expect("revoke"));
         assert!(
             get_live_client(&pool, &client.client_id)
                 .await
@@ -552,7 +562,9 @@ mod tests {
         );
         assert_eq!(count_live_clients(&pool).await.expect("count"), 0);
         assert!(
-            !revoke_client(&pool, &client.client_id).await.expect("revoke"),
+            !revoke_client(&pool, &client.client_id)
+                .await
+                .expect("revoke"),
             "revoking twice is a no-op, not a second success"
         );
     }
@@ -598,7 +610,9 @@ mod tests {
 
     async fn shared_pool(name: &str) -> Pool<Sqlite> {
         let url = format!("sqlite:file:{name}?mode=memory&cache=shared");
-        let pool = crate::database::connect(&url).await.expect("shared database");
+        let pool = crate::database::connect(&url)
+            .await
+            .expect("shared database");
         ensure_schema(&pool).await.expect("schema");
         pool
     }
@@ -640,7 +654,10 @@ mod tests {
             }
         }
 
-        assert_eq!(created, 1, "exactly one of {ATTEMPTS} may take the last slot");
+        assert_eq!(
+            created, 1,
+            "exactly one of {ATTEMPTS} may take the last slot"
+        );
         assert_eq!(refused, ATTEMPTS - 1);
         assert_eq!(
             count_live_clients(&pool).await.expect("count"),

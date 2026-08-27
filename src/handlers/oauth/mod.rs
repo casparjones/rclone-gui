@@ -40,12 +40,19 @@
 //!   * the plaintext secret exists in exactly one place, the response that
 //!     creates it, and lives in [`clients::ClientSecret`], which has a
 //!     hand-written redacting `Debug`, no `Display` and no `Serialize`.
-//!   * **no `derive(Debug)` anywhere in this module.** Not because the guard in
-//!     `tests/no_debug_leaks.rs` would catch every case — it matches on names,
-//!     and half the field names here (`redirect_uris`,
+//!   * **no `derive(Debug)` on anything that touches a credential or an
+//!     attacker-supplied body.** There is exactly one derived `Debug` in the
+//!     module — `registration::Invalid`, whose two fields are `&'static str`
+//!     chosen in this file — and it says so at the declaration. Everything
+//!     else either has a hand-written implementation
+//!     (`clients::ClientSecret`, `clients::NewClient`) or none at all.
+//!
+//!     Not relying on the guard in `tests/no_debug_leaks.rs` is deliberate: it
+//!     matches on names, and half the field names here (`redirect_uris`,
 //!     `token_endpoint_auth_method`) are innocent words that happen to contain
-//!     a suspicious stem — but because a module whose subject is credentials
-//!     has nothing to gain from a derived one.
+//!     a suspicious stem, while a field it *would* wave through could still
+//!     carry a token. Its exception list also lives in a file this ticket does
+//!     not own, so a trip would have been unfixable from here.
 //!
 //! ## Nothing here has a caller yet
 //!
@@ -337,7 +344,7 @@ mod tests {
     #[test]
     fn an_unusable_configured_value_falls_back_instead_of_being_half_honoured() {
         for bad in [
-            "backup.example.org",              // no scheme
+            "backup.example.org",               // no scheme
             "https://backup.example.org/oauth", // path
             "https://user:pw@backup.example.org",
             "https://backup.example.org?x=1",
@@ -377,13 +384,22 @@ mod tests {
     #[test]
     fn a_loopback_host_without_a_proxy_header_is_assumed_to_be_plain_http() {
         with_env(None, || {
-            assert_eq!(issuer(Some("127.0.0.1:8080"), None), "http://127.0.0.1:8080");
-            assert_eq!(issuer(Some("localhost:9000"), None), "http://localhost:9000");
+            assert_eq!(
+                issuer(Some("127.0.0.1:8080"), None),
+                "http://127.0.0.1:8080"
+            );
+            assert_eq!(
+                issuer(Some("localhost:9000"), None),
+                "http://localhost:9000"
+            );
             assert_eq!(issuer(Some("[::1]:9000"), None), "http://[::1]:9000");
             assert_eq!(issuer(Some("nas.local"), None), "http://nas.local");
             // Anything else gets https, because advertising http for a public
             // deployment is the worse of the two mistakes.
-            assert_eq!(issuer(Some("gui.example.org"), None), "https://gui.example.org");
+            assert_eq!(
+                issuer(Some("gui.example.org"), None),
+                "https://gui.example.org"
+            );
         });
     }
 
@@ -442,7 +458,17 @@ mod router_tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
-    use tower::ServiceExt;
+    // `tower::ServiceExt::oneshot` would be tidier, but `tower` is in this
+    // tree without its `util` feature and `Cargo.toml` belongs to another
+    // ticket. `tower::Service::call` needs no feature and is the same code
+    // path; `Router::poll_ready` is unconditionally ready, which is why it is
+    // sound to skip here.
+    use tower::Service;
+
+    async fn call(app: &Router, request: Request<Body>) -> axum::response::Response {
+        let mut app = app.clone();
+        app.call(request).await.expect("the router is infallible")
+    }
 
     async fn app() -> Router {
         let pool = crate::database::connect("sqlite::memory:")
@@ -470,18 +496,16 @@ mod router_tests {
 
     #[tokio::test]
     async fn discovery_answers_a_document_a_client_can_follow() {
-        let response = app()
-            .await
-            .oneshot(
-                Request::builder()
-                    .uri(DISCOVERY_PATH)
-                    .header("host", "gui.example.org")
-                    .header("x-forwarded-proto", "https")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
+        let response = call(
+            &app().await,
+            Request::builder()
+                .uri(DISCOVERY_PATH)
+                .header("host", "gui.example.org")
+                .header("x-forwarded-proto", "https")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
@@ -510,15 +534,16 @@ mod router_tests {
             .expect("in-memory database");
         let app = router(pool.clone()).await.expect("router");
 
-        let response = app
-            .oneshot(post_register(
+        let response = call(
+            &app,
+            post_register(
                 r#"{"client_name":"peer-b",
                     "redirect_uris":["https://peer-b.example.org/oauth/callback"],
                     "grant_types":["authorization_code","refresh_token"],
                     "scope":"browse rsync:write"}"#,
-            ))
-            .await
-            .expect("response");
+            ),
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::CREATED);
         let body = body_json(response).await;
@@ -542,24 +567,24 @@ mod router_tests {
                 .expect("verify"),
             "the secret handed out must authenticate the client"
         );
-        let stored: Vec<(String,)> =
-            sqlx::query_as("SELECT client_secret_hash FROM oauth_clients")
-                .fetch_all(&pool)
-                .await
-                .expect("dump");
+        let stored: Vec<(String,)> = sqlx::query_as("SELECT client_secret_hash FROM oauth_clients")
+            .fetch_all(&pool)
+            .await
+            .expect("dump");
         assert_eq!(stored.len(), 1);
-        assert_ne!(stored[0].0, secret, "the secret must not be stored in clear");
+        assert_ne!(
+            stored[0].0, secret,
+            "the secret must not be stored in clear"
+        );
     }
 
     #[tokio::test]
     async fn a_bad_redirect_uri_is_refused_with_the_rfc_error_code() {
-        let response = app()
-            .await
-            .oneshot(post_register(
-                r#"{"redirect_uris":["http://peer-b.example.org/cb"]}"#,
-            ))
-            .await
-            .expect("response");
+        let response = call(
+            &app().await,
+            post_register(r#"{"redirect_uris":["http://peer-b.example.org/cb"]}"#),
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(body_json(response).await["error"], "invalid_redirect_uri");
@@ -576,7 +601,10 @@ mod router_tests {
         );
         clients::ensure_schema(&state.pool).await.expect("schema");
         let app = Router::new()
-            .route(REGISTRATION_PATH, axum::routing::post(registration::register))
+            .route(
+                REGISTRATION_PATH,
+                axum::routing::post(registration::register),
+            )
             .with_state(state.clone());
 
         let mut created = 0usize;
@@ -592,12 +620,14 @@ mod router_tests {
                     r#"{"redirect_uris":["https://peer-b.example.org/cb"]}"#,
                 ))
                 .expect("request");
-            let response = app.clone().oneshot(request).await.expect("response");
+            let response = call(&app, request).await;
             match response.status() {
                 StatusCode::CREATED => created += 1,
                 StatusCode::TOO_MANY_REQUESTS => {
                     assert!(
-                        response.headers().contains_key(axum::http::header::RETRY_AFTER),
+                        response
+                            .headers()
+                            .contains_key(axum::http::header::RETRY_AFTER),
                         "a 429 must say when to come back"
                     );
                     refused += 1;
@@ -608,7 +638,9 @@ mod router_tests {
         assert_eq!(created, registration::RATE_PER_CLIENT);
         assert_eq!(refused, 5);
         assert_eq!(
-            clients::count_live_clients(&state.pool).await.expect("count"),
+            clients::count_live_clients(&state.pool)
+                .await
+                .expect("count"),
             registration::RATE_PER_CLIENT as i64,
             "a refused registration must not have reached the table"
         );
@@ -630,25 +662,26 @@ mod router_tests {
         );
         clients::ensure_schema(&state.pool).await.expect("schema");
         let app = Router::new()
-            .route(REGISTRATION_PATH, axum::routing::post(registration::register))
+            .route(
+                REGISTRATION_PATH,
+                axum::routing::post(registration::register),
+            )
             .with_state(state);
 
         // Burn the caller's bucket.
         for _ in 0..registration::RATE_PER_CLIENT {
-            let _ = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri(REGISTRATION_PATH)
-                        .header("x-forwarded-for", "203.0.113.9")
-                        .body(Body::from(
-                            r#"{"redirect_uris":["https://peer-b.example.org/cb"]}"#,
-                        ))
-                        .expect("request"),
-                )
-                .await
-                .expect("response");
+            let _ = call(
+                &app,
+                Request::builder()
+                    .method("POST")
+                    .uri(REGISTRATION_PATH)
+                    .header("x-forwarded-for", "203.0.113.9")
+                    .body(Body::from(
+                        r#"{"redirect_uris":["https://peer-b.example.org/cb"]}"#,
+                    ))
+                    .expect("request"),
+            )
+            .await;
         }
 
         let mut answers = Vec::new();
@@ -658,18 +691,16 @@ mod router_tests {
             "{}",
             r#"{"redirect_uris":["https://peer-b.example.org/cb"]}"#,
         ] {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method("POST")
-                        .uri(REGISTRATION_PATH)
-                        .header("x-forwarded-for", "203.0.113.9")
-                        .body(Body::from(body.to_string()))
-                        .expect("request"),
-                )
-                .await
-                .expect("response");
+            let response = call(
+                &app,
+                Request::builder()
+                    .method("POST")
+                    .uri(REGISTRATION_PATH)
+                    .header("x-forwarded-for", "203.0.113.9")
+                    .body(Body::from(body.to_string()))
+                    .expect("request"),
+            )
+            .await;
             let status = response.status();
             answers.push((status, body_json(response).await));
         }
@@ -685,13 +716,13 @@ mod router_tests {
     #[tokio::test]
     async fn an_oversized_body_is_refused() {
         let filler = "a".repeat(registration::MAX_BODY_BYTES);
-        let response = app()
-            .await
-            .oneshot(post_register(&format!(
+        let response = call(
+            &app().await,
+            post_register(&format!(
                 r#"{{"client_name":"{filler}","redirect_uris":["https://p.example/cb"]}}"#
-            )))
-            .await
-            .expect("response");
+            )),
+        )
+        .await;
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         assert_eq!(
